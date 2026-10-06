@@ -45,6 +45,22 @@ rill ramp(from: f32, to: f32, time: Time) -> f32 {
     return from + (to - from) * t
 }
 
+rill crush(x: sample, bits: f32 = 8, hold: Time = 0.5ms) -> sample {
+    state held: sample = 0
+    state left: Time = 0s
+  
+    // Lower the sample rate: grab a new value every `hold`, repeat it in between.
+    if left <= 0s {
+        held = x
+        left = left + hold
+    }
+    left = left - 1 / RATE
+  
+    // Lower the bit depth: snap to 2^bits levels.
+    let steps = pow(2, bits - 1)
+    return round(held * steps) / steps
+}
+
 // Entry point: the program runs `main` and plays what it returns.
 rill main() -> sample {
     // let lfo   = sine(360Hz) * 100Hz + 440Hz
@@ -57,5 +73,5 @@ rill main() -> sample {
     let ring = sine(440Hz) * sine(gradual)
 
     let voice = ring * 0.3
-    return voice
+    return voice |> crush()
 }

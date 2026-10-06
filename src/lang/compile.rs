@@ -11,7 +11,7 @@ use super::ast::*;
 use super::check::Checked;
 use super::diag::{Diagnostic, Span};
 use super::types::{Signature, Size, Type};
-use super::vm::{Code, EventBinding, EventCode, Instr, Operand};
+use super::vm::{Code, EventBinding, EventCode, Instr, Operand, TuningSpec};
 use crate::ops::{Op1, Op2};
 
 /// A compile-time value: one operand per channel.
@@ -20,6 +20,7 @@ pub enum CVal {
     Scalar(Operand),
     Frame(Vec<Operand>),
     Event(Vec<(String, Operand)>),
+    Tuning(TuningSpec),
 }
 
 impl CVal {
@@ -33,6 +34,7 @@ impl CVal {
             CVal::Scalar(o) => std::slice::from_ref(o),
             CVal::Frame(os) => os,
             CVal::Event(_) => &[],
+            CVal::Tuning(_) => &[],
         }
     }
 
@@ -41,6 +43,7 @@ impl CVal {
             CVal::Scalar(o) => *o,
             CVal::Frame(os) => os[0],
             CVal::Event(_) => Operand::Const(0.0),
+            CVal::Tuning(_) => Operand::Const(0.0),
         }
     }
 
@@ -56,6 +59,7 @@ impl CVal {
                     .map(|((name, _), op)| (name.clone(), op))
                     .collect(),
             ),
+            CVal::Tuning(t) => CVal::Tuning(t.clone()),
         }
     }
 }
@@ -262,6 +266,19 @@ impl Compiler<'_> {
         }
         let dst = self.reg()?;
         self.emit(Instr::Op2 { op, dst, a, b });
+        Ok(Operand::Reg(dst))
+    }
+
+    fn tune(&mut self, tuning: &TuningSpec, pitch: Operand) -> CResult<Operand> {
+        if let Operand::Const(pitch) = pitch {
+            return Ok(Operand::Const(tuning.frequency(pitch)));
+        }
+        let dst = self.reg()?;
+        self.emit(Instr::Tune {
+            tuning: tuning.clone(),
+            dst,
+            pitch,
+        });
         Ok(Operand::Reg(dst))
     }
 
@@ -520,6 +537,9 @@ impl Compiler<'_> {
                 if let Some(b) = self.lookup(name) {
                     return Ok(b.val.clone());
                 }
+                if let Some(p) = super::check::pitch_literal(name) {
+                    return Ok(CVal::Scalar(Operand::Const(p)));
+                }
                 constant(name, self.sample_rate)
                     .map(|c| CVal::Scalar(Operand::Const(c)))
                     .ok_or_else(|| internal(e.span, &format!("unknown name `{name}`")))
@@ -683,6 +703,12 @@ impl Compiler<'_> {
 
     fn call(&mut self, e: &Expr, callee: &Ident, args: &[Arg]) -> CResult<CVal> {
         let name = callee.name.as_str();
+        if let Some(binding) = self.lookup(name)
+            && let CVal::Tuning(tuning) = binding.val.clone()
+        {
+            let vals = args.iter().map(|a| self.expr(&a.value)).collect::<CResult<Vec<_>>>()?;
+            return self.apply_tuning(&tuning, &vals[0]);
+        }
         // User definitions shadow built-ins.
         if let Some((def, sig)) = self.defs.get(name) {
             if sig.rate != (1, 1) {
@@ -720,6 +746,20 @@ impl Compiler<'_> {
             return self.call_lifted(def, sig, filled);
         }
         self.builtin(e, name, args)
+    }
+
+    fn apply_tuning(&mut self, tuning: &TuningSpec, pitch: &CVal) -> CResult<CVal> {
+        match pitch {
+            CVal::Scalar(pitch) => Ok(CVal::Scalar(self.tune(tuning, *pitch)?)),
+            CVal::Frame(pitches) => {
+                let mut out = Vec::with_capacity(pitches.len());
+                for &pitch in pitches {
+                    out.push(self.tune(tuning, pitch)?);
+                }
+                Ok(CVal::Frame(out))
+            }
+            _ => Err(internal(self.span, "tuning applied to a non-pitch value")),
+        }
     }
 
     /// Inline `def`, once per channel if a scalar parameter got a frame.
@@ -760,6 +800,38 @@ impl Compiler<'_> {
             return self.map1(op, &vals[0]);
         }
         match (name, vals.as_slice()) {
+            ("equal", [steps]) => Ok(CVal::Tuning(TuningSpec::Equal {
+                steps: const_operand(steps, e.span)?,
+                a4: 440.0,
+            })),
+            ("equal", [steps, a4]) => Ok(CVal::Tuning(TuningSpec::Equal {
+                steps: const_operand(steps, e.span)?,
+                a4: const_operand(a4, e.span)?,
+            })),
+            ("just", [root]) => Ok(CVal::Tuning(TuningSpec::Just {
+                root: const_operand(root, e.span)?,
+                a4: 440.0,
+            })),
+            ("just", [root, a4]) => Ok(CVal::Tuning(TuningSpec::Just {
+                root: const_operand(root, e.span)?,
+                a4: const_operand(a4, e.span)?,
+            })),
+            ("pythagorean", [root]) => Ok(CVal::Tuning(TuningSpec::Pythagorean {
+                root: const_operand(root, e.span)?,
+                a4: 440.0,
+            })),
+            ("pythagorean", [root, a4]) => Ok(CVal::Tuning(TuningSpec::Pythagorean {
+                root: const_operand(root, e.span)?,
+                a4: const_operand(a4, e.span)?,
+            })),
+            ("meantone", [root]) => Ok(CVal::Tuning(TuningSpec::Meantone {
+                root: const_operand(root, e.span)?,
+                a4: 440.0,
+            })),
+            ("meantone", [root, a4]) => Ok(CVal::Tuning(TuningSpec::Meantone {
+                root: const_operand(root, e.span)?,
+                a4: const_operand(a4, e.span)?,
+            })),
             ("f32" | "sample", [x]) => Ok(x.clone()),
             ("pow", [x, y]) => self.zip2(Op2::Pow, x, y),
             ("min", [x, y]) => self.zip2(Op2::Min, x, y),
@@ -784,6 +856,16 @@ fn event_fields_for(param: &str) -> &'static [&'static str] {
         "note" => &["pitch", "velocity", "release"],
         "control" => &["channel", "index"],
         _ => &["pitch", "velocity", "release", "channel", "index"],
+    }
+}
+
+fn const_operand(value: &CVal, span: Span) -> CResult<f32> {
+    match value {
+        CVal::Scalar(Operand::Const(v)) => Ok(*v),
+        _ => Err(Diagnostic::error(
+            span,
+            "this tuning parameter must be a constant",
+        )),
     }
 }
 

@@ -186,9 +186,7 @@ fn parse_rill_event(input: &str) -> Result<ScheduledRillEvent, String> {
             }
             values.push(EventValue {
                 name: name.to_owned(),
-                value: value
-                    .parse::<f32>()
-                    .map_err(|_| format!("`{value}` is not a number"))?,
+                value: parse_event_value(value)?,
             });
         }
     }
@@ -196,6 +194,12 @@ fn parse_rill_event(input: &str) -> Result<ScheduledRillEvent, String> {
         name: name.to_owned(),
         time_seconds,
         values,
+    })
+}
+
+fn parse_event_value(input: &str) -> Result<f32, String> {
+    input.parse::<f32>().or_else(|_| {
+        rill::lang::check::pitch_literal(input).ok_or_else(|| format!("`{input}` is not a number or pitch"))
     })
 }
 

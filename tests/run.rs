@@ -199,7 +199,8 @@ fn rill_events_run_handlers_at_sample_offsets() {
         rill main() -> sample {
             state pitch: Hz = 440Hz
             on note_on(note) {
-                pitch = note.pitch
+                let tuning = equal(12)
+                pitch = note.pitch |> tuning
             }
             return pitch / 1Hz
         }
@@ -208,7 +209,7 @@ fn rill_events_run_handlers_at_sample_offsets() {
     let mut out = [0.0f32; 6];
     let values = [EventValue {
         name: "pitch".to_owned(),
-        value: 660.0,
+        value: rill::lang::check::pitch_literal("E5").unwrap(),
     }];
     engine.render_interleaved_with_rill_events(
         &mut out,
@@ -219,7 +220,46 @@ fn rill_events_run_handlers_at_sample_offsets() {
             values: &values,
         }],
     );
-    assert_eq!(out, [440.0, 440.0, 660.0, 660.0, 660.0, 660.0]);
+    for x in &out[..2] {
+        assert!((*x - 440.0).abs() < 1e-4);
+    }
+    for x in &out[2..] {
+        assert!((*x - 659.255).abs() < 0.01);
+    }
+}
+
+#[test]
+fn pitch_literals_and_callable_tunings_resolve_to_hz() {
+    let src = "
+        rill main() -> [sample; 4] {
+            let equal12 = equal(12)
+            let just_c = just(C)
+            let pyth_c = pythagorean(C)
+            return [
+                (A4 |> equal12) / 1Hz,
+                ((A4 + 12st) |> equal12) / 1Hz,
+                (E4 |> just_c) / 1Hz,
+                (E4 |> pyth_c) / 1Hz,
+            ]
+        }
+    ";
+    let out = render_with(src, 4, 1, Blocks::Fixed(1));
+    assert!((out[0] - 440.0).abs() < 1e-4);
+    assert!((out[1] - 880.0).abs() < 1e-4);
+    assert!((out[2] - 327.03195).abs() < 0.01);
+    assert!((out[3] - 331.119).abs() < 0.01);
+
+    let src = "
+        rill main() -> [sample; 3] {
+            let tuning = equal(12, a4: 432Hz)
+            let tuned = [A4, C5, E5] |> tuning
+            return [tuned[0] / 1Hz, tuned[1] / 1Hz, tuned[2] / 1Hz]
+        }
+    ";
+    let out = render_with(src, 3, 1, Blocks::Fixed(1));
+    assert!((out[0] - 432.0).abs() < 1e-4);
+    assert!((out[1] - 513.738).abs() < 0.01);
+    assert!((out[2] - 647.269).abs() < 0.01);
 }
 
 // ---- rill bodies --------------------------------------------------------

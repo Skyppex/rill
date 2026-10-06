@@ -65,6 +65,14 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         "clamp" => vec![sig(&[("x", s()), ("lo", s()), ("hi", s())], s())],
         // Per-tick multiplier that decays by 60 dB over `time`.
         "decay" => vec![sig(&[("time", Type::Time)], Type::Sample)],
+        "equal" => vec![
+            sig(&[("steps", Type::I32)], Type::Tuning),
+            sig(&[("steps", Type::I32), ("a4", Type::Hz)], Type::Tuning),
+        ],
+        "just" | "pythagorean" | "meantone" => vec![
+            sig(&[("root", Type::Pitch)], Type::Tuning),
+            sig(&[("root", Type::Pitch), ("a4", Type::Hz)], Type::Tuning),
+        ],
         "f32" => vec![sig(&[("x", t())], Type::F32)],
         "i32" => vec![sig(&[("x", t())], Type::I32)],
         "sample" => vec![sig(&[("x", t())], Type::Sample)],
@@ -75,7 +83,8 @@ pub fn lookup(name: &str) -> Vec<Signature> {
 /// Every built-in function name, for suggestions.
 pub const FUNCTIONS: &[&str] = &[
     "sin", "cos", "tan", "tanh", "exp", "log", "sqrt", "abs", "floor", "ceil", "round", "wrap",
-    "pow", "min", "max", "sum", "clamp", "decay", "f32", "i32", "sample",
+    "pow", "min", "max", "sum", "clamp", "decay", "equal", "just", "pythagorean", "meantone",
+    "f32", "i32", "sample",
 ];
 
 #[cfg(test)]

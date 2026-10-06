@@ -12,7 +12,7 @@ rill main() -> sample {
 
 rill live_control(depth: Hz = 0.5Hz, gain: sample = 0.25) -> sample {
     // Preserve the last note's pitch and release so events can shape the tone.
-    state pitch: Hz = 440Hz
+    state pitch: Pitch = A4
     state release: sample = 0.0
     state cc_gain: sample = 0.0
 
@@ -37,7 +37,8 @@ rill live_control(depth: Hz = 0.5Hz, gain: sample = 0.25) -> sample {
 
     // A slow LFO modulates a band-limited tone.
     let tremolo = sine(depth) * 0.3
-    let tuned = pitch + tremolo * 120Hz
+    let tuning = equal(12, a4: 440Hz)
+    let tuned = (pitch |> tuning) + tremolo * 120Hz
     let voice = sine(tuned) * (gain + cc_gain + release * 0.5)
     return voice
 }

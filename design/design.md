@@ -190,6 +190,6 @@ The goal of the first milestone is hearing a sine wave from Rill source in real 
 - [x] **M2 — Parser and checker.** Parse `fn`, `rill`, `state`, `let`, `|>`, unit literals; type-check `sample` and `[sample; N]`.
 - [x] **M3 — Graph builder.** Top-level code builds a graph; per-block interpreter runs it. Lifting over channels works.
 - [x] **M4 — Live control.** `rill_set_param`, parameter smoothing, sample-accurate events with block splitting.
-- [ ] **M5 — Pitch layer.** `Pitch`, `Interval`, chord literals, 12-TET and just tuning, constant folding.
+- [x] **M5 — Pitch layer.** `Pitch`, `Interval`, chord literals, 12-TET and just tuning, constant folding.
 - [ ] **M6 — Hot reload.** Swap graphs with a crossfade while audio plays.
-- [ ] **M7 — Embedded spike.** Run a fixed patch on a microcontroller through the C API.
+- [ ] **M100 — Embedded spike.** Run a fixed patch on a microcontroller through the C API.

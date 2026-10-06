@@ -239,16 +239,15 @@ impl Checker {
                 "i32" => Type::I32,
                 "bool" => Type::Bool,
                 "Hz" => Type::Hz,
+                "Pitch" => Type::Pitch,
+                "Tuning" => Type::Tuning,
                 "Time" => Type::Time,
                 "Interval" => Type::Interval,
-                "Pitch" | "Chord" | "Tuning" => {
-                    let e = self.error(id.span, format!("`{}` is not supported yet", id.name));
-                    self.report(e);
-                    Type::Error
-                }
                 other => {
-                    const KNOWN: [&str; 7] =
-                        ["sample", "f32", "i32", "bool", "Hz", "Time", "Interval"];
+                    const KNOWN: [&str; 9] = [
+                        "sample", "f32", "i32", "bool", "Hz", "Pitch", "Tuning", "Time",
+                        "Interval",
+                    ];
                     let mut e = self.error(id.span, format!("unknown type `{other}`"));
                     if let Some(s) = suggest(other, KNOWN) {
                         e = e.with_help(format!("did you mean `{s}`?"));
@@ -551,6 +550,9 @@ impl Checker {
                 if let Some(var) = self.lookup(name) {
                     return var.ty.clone();
                 }
+                if pitch_literal(name).is_some() {
+                    return Type::Pitch;
+                }
                 if let Some(t) = builtins::constant(name) {
                     return t.clone();
                 }
@@ -771,6 +773,12 @@ impl Checker {
     fn call(&mut self, span: Span, callee: &Ident, args: &[Arg]) -> Type {
         let arg_types: Vec<Type> = args.iter().map(|a| self.expr(&a.value)).collect();
         let name = callee.name.as_str();
+
+        if let Some(var) = self.lookup(name)
+            && var.ty == Type::Tuning
+        {
+            return self.tuning_call(span, callee, args, arg_types);
+        }
 
         if let Some(var) = self.lookup(name) {
             let d = self.error(
@@ -1009,6 +1017,39 @@ impl Checker {
         }
     }
 
+    fn tuning_call(
+        &mut self,
+        span: Span,
+        callee: &Ident,
+        args: &[Arg],
+        arg_types: Vec<Type>,
+    ) -> Type {
+        let name = &callee.name;
+        if args.len() != 1 {
+            let d = self.error(
+                span,
+                format!("tuning `{name}` takes one pitch argument, but {} were given", args.len()),
+            );
+            self.report(d);
+            return Type::Error;
+        }
+        match &arg_types[0] {
+            Type::Pitch => Type::Hz,
+            Type::Frame(elem, n) if **elem == Type::Pitch => Type::Frame(Box::new(Type::Hz), n.clone()),
+            Type::Error | Type::Never => Type::Error,
+            other => {
+                let d = mismatch(
+                    args[0].value.span,
+                    &format!("argument of tuning `{name}`"),
+                    &Type::Pitch,
+                    other,
+                );
+                self.report(d);
+                Type::Error
+            }
+        }
+    }
+
     /// Known before audio starts: literals, built-in constants, size
     /// parameters, and built-in functions of those.
     fn is_const(&self, e: &Expr) -> bool {
@@ -1019,7 +1060,7 @@ impl Checker {
             ExprKind::Frame(xs) => xs.iter().all(|x| self.is_const(x)),
             ExprKind::Name(n) => match self.lookup(n) {
                 Some(v) => v.kind == VarKind::Size,
-                None => builtins::constant(n).is_some(),
+                None => builtins::constant(n).is_some() || pitch_literal(n).is_some(),
             },
             ExprKind::Call { callee, args, .. } => {
                 let name = callee.name.as_str();
@@ -1287,6 +1328,31 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
 
     let (pa, pb) = (a.is_plain(), b.is_plain());
     let (da, db) = (a.is_dimensioned(), b.is_dimensioned());
+    if matches!(
+        (op, a, b),
+        (BinOp::Add | BinOp::Sub, Type::Pitch, Type::Interval)
+            | (BinOp::Add, Type::Interval, Type::Pitch)
+    ) {
+        return Ok(Type::Pitch);
+    }
+    if matches!((op, a, b), (BinOp::Sub, Type::Pitch, Type::Pitch)) {
+        return Ok(Type::Interval);
+    }
+    if matches!(
+        (op, a, b),
+        (BinOp::Add | BinOp::Sub, Type::Interval, Type::Interval)
+    ) {
+        return Ok(Type::Interval);
+    }
+    if matches!(
+        (op, a, b),
+        (BinOp::Mul, Type::Interval, p) | (BinOp::Mul, p, Type::Interval) if p.is_plain()
+    ) {
+        return Ok(Type::Interval);
+    }
+    if matches!((op, a, b), (BinOp::Div, Type::Interval, p) if p.is_plain()) {
+        return Ok(Type::Interval);
+    }
     if !(pa || da) || !(pb || db) {
         return fail();
     }
@@ -1319,11 +1385,44 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
 
 fn event_field_type(name: &str) -> Option<Type> {
     match name {
-        "pitch" => Some(Type::Hz),
+        "pitch" => Some(Type::Pitch),
         "velocity" | "release" => Some(Type::Sample),
         "channel" | "index" => Some(Type::I32),
         _ => None,
     }
+}
+
+pub fn pitch_literal(name: &str) -> Option<f32> {
+    let bytes = name.as_bytes();
+    let letter = *bytes.first()? as char;
+    let base = match letter {
+        'C' => 0,
+        'D' => 2,
+        'E' => 4,
+        'F' => 5,
+        'G' => 7,
+        'A' => 9,
+        'B' => 11,
+        _ => return None,
+    };
+    let mut i = 1usize;
+    let accidental = match bytes.get(i).copied() {
+        Some(b's') | Some(b'#') => {
+            i += 1;
+            1
+        }
+        Some(b'b') => {
+            i += 1;
+            -1
+        }
+        _ => 0,
+    };
+    let octave = if i == bytes.len() {
+        4
+    } else {
+        name[i..].parse::<i32>().ok()?
+    };
+    Some(((octave + 1) * 12 + base + accidental) as f32)
 }
 
 /// Check that `entry` names a rill that can run as a whole program: it

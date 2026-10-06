@@ -212,7 +212,10 @@ impl Lexer<'_> {
                 continue;
             }
             if c.is_ascii_alphabetic() || c == b'_' {
-                while self.peek(0).is_ascii_alphanumeric() || self.peek(0) == b'_' {
+                while self.peek(0).is_ascii_alphanumeric()
+                    || self.peek(0) == b'_'
+                    || self.peek(0) == b'#'
+                {
                     self.pos += 1;
                 }
                 let kind = match &self.src[start..self.pos] {

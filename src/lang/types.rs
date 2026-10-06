@@ -15,6 +15,8 @@ pub enum Type {
     I32,
     Bool,
     Hz,
+    Pitch,
+    Tuning,
     Time,
     Interval,
     /// Dynamically shaped payload passed to an `on event(...)` handler.
@@ -59,6 +61,8 @@ impl fmt::Display for Type {
             Type::I32 => f.write_str("i32"),
             Type::Bool => f.write_str("bool"),
             Type::Hz => f.write_str("Hz"),
+            Type::Pitch => f.write_str("Pitch"),
+            Type::Tuning => f.write_str("Tuning"),
             Type::Time => f.write_str("Time"),
             Type::Interval => f.write_str("Interval"),
             Type::Event => f.write_str("event"),
@@ -88,7 +92,7 @@ impl Type {
 
     /// Numbers that carry a unit.
     pub fn is_dimensioned(&self) -> bool {
-        matches!(self, Type::Hz | Type::Time | Type::Interval)
+        matches!(self, Type::Hz | Type::Time | Type::Interval | Type::Pitch)
     }
 
     pub fn is_scalar(&self) -> bool {

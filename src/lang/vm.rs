@@ -32,6 +32,11 @@ pub enum Instr {
         dst: u16,
         src: Operand,
     },
+    Tune {
+        tuning: TuningSpec,
+        dst: u16,
+        pitch: Operand,
+    },
     /// `dst = if cond { a } else { b }`
     Select {
         dst: u16,
@@ -47,6 +52,74 @@ pub enum Instr {
     Jump {
         target: u32,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TuningSpec {
+    Equal { steps: f32, a4: f32 },
+    Just { root: f32, a4: f32 },
+    Pythagorean { root: f32, a4: f32 },
+    Meantone { root: f32, a4: f32 },
+}
+
+impl TuningSpec {
+    pub fn frequency(&self, pitch: f32) -> f32 {
+        match *self {
+            TuningSpec::Equal { steps, a4 } => {
+                let step = ((pitch - 69.0) * steps / 12.0).round();
+                a4 * 2.0f32.powf(step / steps)
+            }
+            TuningSpec::Just { root, a4 } => ratio_tuning(pitch, root, a4, JUST_RATIOS),
+            TuningSpec::Pythagorean { root, a4 } => {
+                ratio_tuning(pitch, root, a4, PYTHAGOREAN_RATIOS)
+            }
+            TuningSpec::Meantone { root, a4 } => ratio_tuning(pitch, root, a4, MEANTONE_RATIOS),
+        }
+    }
+}
+
+const JUST_RATIOS: [f32; 12] = [
+    1.0,
+    16.0 / 15.0,
+    9.0 / 8.0,
+    6.0 / 5.0,
+    5.0 / 4.0,
+    4.0 / 3.0,
+    45.0 / 32.0,
+    3.0 / 2.0,
+    8.0 / 5.0,
+    5.0 / 3.0,
+    9.0 / 5.0,
+    15.0 / 8.0,
+];
+
+const PYTHAGOREAN_RATIOS: [f32; 12] = [
+    1.0,
+    256.0 / 243.0,
+    9.0 / 8.0,
+    32.0 / 27.0,
+    81.0 / 64.0,
+    4.0 / 3.0,
+    729.0 / 512.0,
+    3.0 / 2.0,
+    128.0 / 81.0,
+    27.0 / 16.0,
+    16.0 / 9.0,
+    243.0 / 128.0,
+];
+
+const MEANTONE_RATIOS: [f32; 12] = [
+    1.0, 1.069984, 1.118034, 1.196279, 1.25, 1.33748, 1.397542, 1.495349, 1.6, 1.67185,
+    1.788854, 1.869186,
+];
+
+fn ratio_tuning(pitch: f32, root: f32, a4: f32, ratios: [f32; 12]) -> f32 {
+    let degree = (pitch - root).floor();
+    let frac = pitch - pitch.floor();
+    let octave = (degree / 12.0).floor();
+    let index = degree.rem_euclid(12.0) as usize;
+    let root_hz = a4 / 2.0f32.powf((69.0 - root) / 12.0);
+    root_hz * 2.0f32.powf(octave) * ratios[index] * 2.0f32.powf(frac / 12.0)
 }
 
 /// One compiled instance, ready to be turned into a [`Program`] node.
@@ -107,6 +180,7 @@ impl Code {
                 }
                 Instr::Op1 { op: o, dst, x } => format!("r{dst} = {} {}", o.name(), op(x)),
                 Instr::Copy { dst, src } => format!("r{dst} = {}", op(src)),
+                Instr::Tune { dst, pitch, .. } => format!("r{dst} = tune {}", op(pitch)),
                 Instr::Select { dst, cond, a, b } => {
                     format!("r{dst} = select {} {} {}", op(cond), op(a), op(b))
                 }
@@ -182,6 +256,9 @@ impl Node for Program {
                         regs[dst as usize] = op.apply(val(regs, x), rate);
                     }
                     Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
+                    Instr::Tune { tuning, dst, pitch } => {
+                        regs[dst as usize] = tuning.frequency(val(regs, pitch));
+                    }
                     Instr::Select { dst, cond, a, b } => {
                         regs[dst as usize] = if val(regs, cond) != 0.0 {
                             val(regs, a)
@@ -258,6 +335,9 @@ impl Node for Program {
                     regs[dst as usize] = op.apply(val(regs, x), _sample_rate);
                 }
                 Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
+                Instr::Tune { tuning, dst, pitch } => {
+                    regs[dst as usize] = tuning.frequency(val(regs, pitch));
+                }
                 Instr::Select { dst, cond, a, b } => {
                     regs[dst as usize] = if val(regs, cond) != 0.0 {
                         val(regs, a)

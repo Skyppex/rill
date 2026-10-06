@@ -1,0 +1,25 @@
+event note_on(note)
+event note_off(note)
+
+rill sine(freq: Hz) -> sample {
+    state phase: f32 = 0
+    phase = wrap(phase + freq / RATE)
+    return sin(phase * TAU)
+}
+
+rill main() -> sample {
+    state pitch = A4
+    state gain = 0.0
+    let tuning = equal(12, a4: 440Hz) // optional named parameter. can just do equal(12, 440Hz)
+
+    on note_on(note) {
+        pitch = note.pitch // note.pitch becomes this type of pitch instead of a frequency
+        gain = note.velocity // i'm sure there is some sort of conversion needed here. i just don't know what that would me :)
+    }
+
+    on note_off(note) {
+        gain = 0.0
+    }
+
+    return (pitch |> tuning |> sine) * gain
+}

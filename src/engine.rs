@@ -5,7 +5,7 @@ use std::fmt;
 use crate::denormal::FlushDenormals;
 use crate::format::OutSample;
 use crate::graph::{Graph, Input, Output};
-use crate::node::{Context, Inputs, Node, Outputs, Port};
+use crate::node::{Context, Event, EventValue, Inputs, Node, Outputs, Port};
 
 /// What the host promises the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +51,24 @@ pub enum BuildError {
     },
     /// The graph has a loop. Lists the node names along it.
     Cycle(Vec<&'static str>),
+}
+
+/// A timestamped live-parameter change, relative to one render call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamEvent<'a> {
+    /// Frame offset inside the render call. Events at offset 0 are applied
+    /// before the first sample; events at `frames` are applied after it.
+    pub frame_offset: usize,
+    pub name: &'a str,
+    pub value: f32,
+}
+
+/// A timestamped rill event, relative to one render call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RillEvent<'a> {
+    pub frame_offset: usize,
+    pub name: &'a str,
+    pub values: &'a [EventValue],
 }
 
 impl fmt::Display for BuildError {
@@ -105,6 +123,8 @@ pub struct Engine {
     buffers: Vec<Box<[f32]>>,
     /// Source for each output channel.
     outputs: Vec<Port>,
+    /// Live controls by public name and scheduled node slot.
+    controls: Vec<(String, usize)>,
     position: u64,
 }
 
@@ -181,10 +201,14 @@ impl Engine {
 
         let mut ports = Vec::new();
         let mut port_ranges = Vec::with_capacity(order.len());
+        let mut controls = Vec::new();
         for &i in &order {
             let start = ports.len();
             ports.extend(entries[i].inputs.iter().map(resolve));
             port_ranges.push((start, ports.len()));
+            if let Some(name) = &entries[i].control {
+                controls.push((name.clone(), port_ranges.len() - 1));
+            }
         }
         let outputs = outputs.iter().map(resolve).collect();
 
@@ -206,6 +230,7 @@ impl Engine {
             ports,
             buffers,
             outputs,
+            controls,
             position: 0,
         })
     }
@@ -232,7 +257,13 @@ impl Engine {
         let state: usize = self.nodes.iter().map(|n| size_of_val(&**n)).sum();
         let wiring = self.ports.len() * size_of::<Port>()
             + self.port_ranges.len() * size_of::<(usize, usize)>()
-            + self.outputs.len() * size_of::<Port>();
+            + self.outputs.len() * size_of::<Port>()
+            + self.controls.len() * size_of::<(String, usize)>()
+            + self
+                .controls
+                .iter()
+                .map(|(name, _)| name.len())
+                .sum::<usize>();
         size_of::<Self>() + buffers + state + wiring
     }
 
@@ -244,20 +275,63 @@ impl Engine {
         self.position = 0;
     }
 
+    /// Names of live controls exposed by the graph.
+    pub fn params(&self) -> impl Iterator<Item = &str> {
+        self.controls.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// Set a live parameter by name. Returns `false` if the graph exposes no
+    /// such parameter.
+    pub fn set_param(&mut self, name: &str, value: f32) -> bool {
+        let Some((_, node)) = self.controls.iter().find(|(n, _)| n == name) else {
+            return false;
+        };
+        self.nodes[*node].set_control_value(value, self.config.sample_rate as f32)
+    }
+
+    pub fn send_event(&mut self, name: &str, values: &[EventValue]) -> bool {
+        let event = Event { name, values };
+        let mut handled = false;
+        for node in &mut self.nodes {
+            handled |= node.handle_event(&event, self.config.sample_rate as f32);
+        }
+        handled
+    }
+
     /// Render into planar output, one slice per channel. All slices must be
     /// the same length; that length is the frame count.
     pub fn render_planar(&mut self, out: &mut [&mut [f32]]) {
+        self.render_planar_with_events(out, &[]);
+    }
+
+    /// Render into planar output while applying sorted parameter events at
+    /// exact sample offsets inside this call.
+    pub fn render_planar_with_events(&mut self, out: &mut [&mut [f32]], events: &[ParamEvent<'_>]) {
         assert_eq!(out.len(), self.config.out_channels, "channel count");
         let frames = out.first().map_or(0, |c| c.len());
         assert!(
             out.iter().all(|c| c.len() == frames),
             "channels differ in length"
         );
+        assert_events_sorted(events);
 
         let _ftz = FlushDenormals::new();
-        let mut done = 0;
+        let mut done = 0usize;
+        let mut event = 0usize;
         while done < frames {
-            let n = (frames - done).min(self.config.max_frames);
+            while event < events.len() && events[event].frame_offset == done {
+                self.set_param(events[event].name, events[event].value);
+                event += 1;
+            }
+            let next_event = events
+                .get(event)
+                .map_or(frames, |e| e.frame_offset.min(frames));
+            let n = (frames - done)
+                .min(self.config.max_frames)
+                .min(next_event.saturating_sub(done));
+            if n == 0 {
+                continue;
+            }
             self.process_block(n);
             for (channel, port) in out.iter_mut().zip(&self.outputs) {
                 let dst = &mut channel[done..done + n];
@@ -270,25 +344,87 @@ impl Engine {
             }
             done += n;
         }
+        while event < events.len() && events[event].frame_offset == frames {
+            self.set_param(events[event].name, events[event].value);
+            event += 1;
+        }
     }
 
     /// Render into an interleaved host buffer, converting to `T`. Trailing
     /// samples that do not make up a whole frame are zeroed.
     pub fn render_interleaved<T: OutSample>(&mut self, out: &mut [T]) {
-        self.render_interleaved_with(out, T::from_f32);
+        self.render_interleaved_with_events(out, T::from_f32, &[]);
     }
 
     /// [`Engine::render_interleaved`] with a caller-supplied conversion, for
     /// sample types this crate does not know about.
     pub fn render_interleaved_with<T: Copy>(&mut self, out: &mut [T], convert: impl Fn(f32) -> T) {
+        self.render_interleaved_with_events(out, convert, &[]);
+    }
+
+    /// [`Engine::render_interleaved_with`] plus sample-accurate parameter
+    /// events. Events must be sorted by `frame_offset`.
+    pub fn render_interleaved_with_events<T: Copy>(
+        &mut self,
+        out: &mut [T],
+        convert: impl Fn(f32) -> T,
+        events: &[ParamEvent<'_>],
+    ) {
+        self.render_interleaved_with_param_and_rill_events(out, convert, events, &[]);
+    }
+
+    pub fn render_interleaved_with_rill_events<T: Copy>(
+        &mut self,
+        out: &mut [T],
+        convert: impl Fn(f32) -> T,
+        events: &[RillEvent<'_>],
+    ) {
+        self.render_interleaved_with_param_and_rill_events(out, convert, &[], events);
+    }
+
+    pub fn render_interleaved_with_param_and_rill_events<T: Copy>(
+        &mut self,
+        out: &mut [T],
+        convert: impl Fn(f32) -> T,
+        param_events: &[ParamEvent<'_>],
+        rill_events: &[RillEvent<'_>],
+    ) {
         let channels = self.config.out_channels;
         let frames = out.len() / channels;
         out[frames * channels..].fill(convert(0.0));
+        assert_events_sorted(param_events);
+        assert_rill_events_sorted(rill_events);
 
         let _ftz = FlushDenormals::new();
-        let mut done = 0;
+        let mut done = 0usize;
+        let mut param_event = 0usize;
+        let mut rill_event = 0usize;
         while done < frames {
-            let n = (frames - done).min(self.config.max_frames);
+            while param_event < param_events.len() && param_events[param_event].frame_offset == done
+            {
+                self.set_param(
+                    param_events[param_event].name,
+                    param_events[param_event].value,
+                );
+                param_event += 1;
+            }
+            while rill_event < rill_events.len() && rill_events[rill_event].frame_offset == done {
+                self.send_event(rill_events[rill_event].name, rill_events[rill_event].values);
+                rill_event += 1;
+            }
+            let next_param_event = param_events
+                .get(param_event)
+                .map_or(frames, |e| e.frame_offset.min(frames));
+            let next_rill_event = rill_events
+                .get(rill_event)
+                .map_or(frames, |e| e.frame_offset.min(frames));
+            let n = (frames - done)
+                .min(self.config.max_frames)
+                .min(next_param_event.saturating_sub(done))
+                .min(next_rill_event.saturating_sub(done));
+            if n == 0 {
+                continue;
+            }
             self.process_block(n);
             let dst = &mut out[done * channels..(done + n) * channels];
             for (c, port) in self.outputs.iter().enumerate() {
@@ -308,6 +444,17 @@ impl Engine {
                 }
             }
             done += n;
+        }
+        while param_event < param_events.len() && param_events[param_event].frame_offset == frames {
+            self.set_param(
+                param_events[param_event].name,
+                param_events[param_event].value,
+            );
+            param_event += 1;
+        }
+        while rill_event < rill_events.len() && rill_events[rill_event].frame_offset == frames {
+            self.send_event(rill_events[rill_event].name, rill_events[rill_event].values);
+            rill_event += 1;
         }
     }
 
@@ -397,6 +544,24 @@ fn schedule(entries: &[crate::graph::Entry], outputs: &[Input]) -> Result<Vec<us
         }
     }
     Ok(order)
+}
+
+fn assert_events_sorted(events: &[ParamEvent<'_>]) {
+    assert!(
+        events
+            .windows(2)
+            .all(|w| w[0].frame_offset <= w[1].frame_offset),
+        "parameter events must be sorted by frame_offset"
+    );
+}
+
+fn assert_rill_events_sorted(events: &[RillEvent<'_>]) {
+    assert!(
+        events
+            .windows(2)
+            .all(|w| w[0].frame_offset <= w[1].frame_offset),
+        "rill events must be sorted by frame_offset"
+    );
 }
 
 #[cfg(test)]

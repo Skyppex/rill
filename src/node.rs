@@ -11,6 +11,19 @@ pub struct Context {
     pub position: u64,
 }
 
+/// One control event delivered between samples.
+#[derive(Clone, Copy, Debug)]
+pub struct Event<'a> {
+    pub name: &'a str,
+    pub values: &'a [EventValue],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventValue {
+    pub name: String,
+    pub value: f32,
+}
+
 /// One input as seen from inside [`Node::process`].
 #[derive(Clone, Copy, Debug)]
 pub enum Signal<'a> {
@@ -129,4 +142,14 @@ pub trait Node: Send {
 
     /// Return to the state the node had when it was built.
     fn reset(&mut self) {}
+
+    /// Update a live control value. Nodes that are not controls ignore it.
+    fn set_control_value(&mut self, _value: f32, _sample_rate: f32) -> bool {
+        false
+    }
+
+    /// Handle a timestamped event delivered between samples.
+    fn handle_event(&mut self, _event: &Event<'_>, _sample_rate: f32) -> bool {
+        false
+    }
 }

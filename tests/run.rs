@@ -2,7 +2,7 @@
 
 use rill::lang;
 use rill::offline::{self, Blocks};
-use rill::{Config, Engine, Graph};
+use rill::{Config, Engine, EventValue, Graph, ParamEvent, RillEvent};
 
 const RATE: u32 = 48_000;
 
@@ -154,6 +154,72 @@ fn constant_programs_fold_to_nothing() {
     );
     assert_eq!(graph(&src, 1).len(), 0);
     close(&render(&src, 4), &[0.5; 4], 1e-6);
+}
+
+#[test]
+fn entry_parameters_are_live_controls() {
+    let src = "rill main(gain: sample = 0.25) -> sample { return gain }";
+    let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
+    assert_eq!(engine.params().collect::<Vec<_>>(), vec!["gain"]);
+
+    let mut out = [0.0f32; 4];
+    engine.render_planar(&mut [&mut out]);
+    close(&out, &[0.25; 4], 1e-6);
+
+    assert!(engine.set_param("gain", 0.75));
+    assert!(!engine.set_param("missing", 1.0));
+
+    let mut ramp = [0.0f32; 240];
+    engine.render_planar(&mut [&mut ramp]);
+    assert!(ramp[0] > 0.25 && ramp[0] < 0.75);
+    assert!((ramp[239] - 0.75).abs() < 1e-6);
+}
+
+#[test]
+fn parameter_events_split_blocks_at_sample_offsets() {
+    let src = "rill main(gain: sample = 0) -> sample { return gain }";
+    let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
+    let mut out = [0.0f32; 12];
+    engine.render_planar_with_events(
+        &mut [&mut out],
+        &[ParamEvent {
+            frame_offset: 4,
+            name: "gain",
+            value: 1.0,
+        }],
+    );
+    assert_eq!(&out[..4], &[0.0; 4]);
+    assert!(out[4] > 0.0);
+    assert!(out[5] > out[4]);
+}
+
+#[test]
+fn rill_events_run_handlers_at_sample_offsets() {
+    let src = "
+        rill main() -> sample {
+            state pitch: Hz = 440Hz
+            on note_on(note) {
+                pitch = note.pitch
+            }
+            return pitch / 1Hz
+        }
+    ";
+    let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
+    let mut out = [0.0f32; 6];
+    let values = [EventValue {
+        name: "pitch".to_owned(),
+        value: 660.0,
+    }];
+    engine.render_interleaved_with_rill_events(
+        &mut out,
+        |x| x,
+        &[RillEvent {
+            frame_offset: 2,
+            name: "note_on",
+            values: &values,
+        }],
+    );
+    assert_eq!(out, [440.0, 440.0, 660.0, 660.0, 660.0, 660.0]);
 }
 
 // ---- rill bodies --------------------------------------------------------

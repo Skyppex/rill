@@ -19,6 +19,6 @@ pub mod ops;
 pub mod patches;
 pub mod wav;
 
-pub use engine::{BuildError, Config, Engine};
+pub use engine::{BuildError, Config, Engine, ParamEvent, RillEvent};
 pub use graph::{Graph, Input, NodeId};
-pub use node::{Context, Inputs, Node, Signal};
+pub use node::{Context, Event, EventValue, Inputs, Node, Signal};

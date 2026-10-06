@@ -1,0 +1,50 @@
+// Live control example highlighting parameters, smoothing and events.
+// The entry rill exposes `depth` (LFO speed) and `gain` as realtime controls.
+rill sine(freq: Hz) -> sample {
+    state phase: f32 = 0
+    phase = wrap(phase + freq / RATE)
+    return sin(phase * TAU)
+}
+
+rill main() -> sample {
+    return live_control()
+}
+
+rill live_control(depth: Hz = 0.5Hz, gain: sample = 0.25) -> sample {
+    // Preserve the last note's pitch and release so events can shape the tone.
+    state pitch: Hz = 440Hz
+    state release: sample = 0.0
+    state cc_gain: sample = 0.0
+
+    on note_on(note) {
+        // Update pitch + release immediately when a note starts.
+        pitch = note.pitch
+        release = note.velocity
+    }
+
+    on note_off(note) {
+        // Let release carry the last velocity so the entry rill can smooth it away.
+        release = note.release
+    }
+
+    // Map an incoming MIDI control change into the gain parameter.
+    on control_change(control, cc) {
+        // `control.channel` and `control.index` describe the MIDI source.
+        if control.index == 74 { // typically brightness
+            cc_gain = cc / 127.0
+        }
+    }
+
+    // A slow LFO modulates a band-limited tone.
+    let tremolo = sine(depth) * 0.3
+    let tuned = pitch + tremolo * 120Hz
+    let voice = sine(tuned) * (gain + cc_gain + release * 0.5)
+    return voice
+}
+
+// Sample-accurate event handlers.
+event note_on(note)
+event note_off(note)
+
+// Map an incoming MIDI control change into the gain parameter.
+event control_change(control, cc)

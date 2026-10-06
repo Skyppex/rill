@@ -116,6 +116,12 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    EventHandler {
+        name: Ident,
+        params: Vec<Ident>,
+        body: Block,
+        span: Span,
+    },
     Expr(Expr),
 }
 
@@ -125,7 +131,8 @@ impl Stmt {
             Stmt::Let { span, .. }
             | Stmt::State { span, .. }
             | Stmt::Assign { span, .. }
-            | Stmt::Return { span, .. } => *span,
+            | Stmt::Return { span, .. }
+            | Stmt::EventHandler { span, .. } => *span,
             Stmt::Expr(e) => e.span,
         }
     }
@@ -168,6 +175,7 @@ pub enum ExprKind {
     /// `[a, b]`
     Frame(Vec<Expr>),
     Index(Box<Expr>, Box<Expr>),
+    Field(Box<Expr>, Ident),
 }
 
 #[derive(Clone, Debug, PartialEq)]

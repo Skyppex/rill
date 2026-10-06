@@ -51,7 +51,8 @@ pub fn parse(src: &str, tokens: Vec<Token>) -> Result<Program, Vec<Diagnostic>> 
     let mut items = Vec::new();
     while !p.at(TokenKind::Eof) {
         match p.item() {
-            Ok(item) => items.push(item),
+            Ok(Some(item)) => items.push(item),
+            Ok(None) => {}
             Err(err) => {
                 p.errors.push(err);
                 p.recover();
@@ -162,12 +163,16 @@ impl Parser<'_> {
         self.nest = 0;
     }
 
-    fn item(&mut self) -> PResult<Item> {
+    fn item(&mut self) -> PResult<Option<Item>> {
         if self.eat(TokenKind::Fn).is_some() {
-            return Ok(Item::Fn(self.def("fn")?));
+            return Ok(Some(Item::Fn(self.def("fn")?)));
         }
         if self.eat(TokenKind::Rill).is_some() {
-            return Ok(Item::Rill(self.def("rill")?));
+            return Ok(Some(Item::Rill(self.def("rill")?)));
+        }
+        if self.at_ident("event") {
+            self.skip_event_decl()?;
+            return Ok(None);
         }
         Err(self
             .unexpected("`fn` or `rill`")
@@ -308,6 +313,9 @@ impl Parser<'_> {
 
     fn stmt(&mut self) -> PResult<Stmt> {
         let start = self.peek().span;
+        if self.at_ident("on") && self.peek_at(1).kind == TokenKind::Ident {
+            return self.skip_event_handler();
+        }
         let stmt = match self.peek().kind {
             TokenKind::Let | TokenKind::State => {
                 let is_state = self.bump().kind == TokenKind::State;
@@ -369,6 +377,68 @@ impl Parser<'_> {
             });
         }
         Ok(stmt)
+    }
+
+    fn at_ident(&self, name: &str) -> bool {
+        self.at(TokenKind::Ident) && self.text(self.peek()) == name
+    }
+
+    fn skip_event_decl(&mut self) -> PResult<()> {
+        self.bump(); // event
+        self.ident("after `event`")?;
+        if self.eat(TokenKind::LParen).is_some() {
+            self.skip_balanced(TokenKind::LParen, TokenKind::RParen)?;
+        }
+        if self.eat(TokenKind::Semi).is_none()
+            && !self.at(TokenKind::Eof)
+            && !self.peek().newline_before
+        {
+            return Err(self.unexpected("a line break or `;` after the event declaration"));
+        }
+        Ok(())
+    }
+
+    fn skip_event_handler(&mut self) -> PResult<Stmt> {
+        let start = self.bump().span; // on
+        let name = self.ident("after `on`")?;
+        let mut params = Vec::new();
+        if self.eat(TokenKind::LParen).is_some() {
+            self.nest += 1;
+            while !self.at(TokenKind::RParen) {
+                params.push(self.ident("as an event parameter")?);
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RParen, "to close the event parameter list")?;
+            self.nest -= 1;
+        }
+        let body = self.block()?;
+        Ok(Stmt::EventHandler {
+            name,
+            params,
+            body,
+            span: self.span_from(start),
+        })
+    }
+
+    fn skip_balanced(&mut self, open: TokenKind, close: TokenKind) -> PResult<()> {
+        let mut depth = 1u32;
+        while depth > 0 {
+            let t = self.bump();
+            if same_kind(&t.kind, &TokenKind::Eof) {
+                return Err(Diagnostic::error(
+                    t.span,
+                    format!("this {} is never closed", open.describe()),
+                ));
+            }
+            if same_kind(&t.kind, &open) {
+                depth += 1;
+            } else if same_kind(&t.kind, &close) {
+                depth -= 1;
+            }
+        }
+        Ok(())
     }
 
     /// True if the next token continues the current expression rather than
@@ -457,14 +527,22 @@ impl Parser<'_> {
 
     fn postfix(&mut self) -> PResult<Expr> {
         let mut e = self.primary()?;
-        while self.at(TokenKind::LBracket) && !self.peek().newline_before {
-            self.bump();
-            self.nest += 1;
-            let index = self.expr()?;
-            self.expect(TokenKind::RBracket, "to close the index")?;
-            self.nest -= 1;
-            let span = self.span_from(e.span);
-            e = self.expr_node(ExprKind::Index(Box::new(e), Box::new(index)), span);
+        while !self.peek().newline_before {
+            if self.at(TokenKind::LBracket) {
+                self.bump();
+                self.nest += 1;
+                let index = self.expr()?;
+                self.expect(TokenKind::RBracket, "to close the index")?;
+                self.nest -= 1;
+                let span = self.span_from(e.span);
+                e = self.expr_node(ExprKind::Index(Box::new(e), Box::new(index)), span);
+            } else if self.eat(TokenKind::Dot).is_some() {
+                let field = self.ident("after `.`")?;
+                let span = e.span.to(field.span);
+                e = self.expr_node(ExprKind::Field(Box::new(e), field), span);
+            } else {
+                break;
+            }
         }
         Ok(e)
     }

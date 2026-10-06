@@ -11,7 +11,7 @@ use super::ast::*;
 use super::check::Checked;
 use super::diag::{Diagnostic, Span};
 use super::types::{Signature, Size, Type};
-use super::vm::{Code, Instr, Operand};
+use super::vm::{Code, EventBinding, EventCode, Instr, Operand};
 use crate::ops::{Op1, Op2};
 
 /// A compile-time value: one operand per channel.
@@ -19,6 +19,7 @@ use crate::ops::{Op1, Op2};
 pub enum CVal {
     Scalar(Operand),
     Frame(Vec<Operand>),
+    Event(Vec<(String, Operand)>),
 }
 
 impl CVal {
@@ -31,6 +32,7 @@ impl CVal {
         match self {
             CVal::Scalar(o) => std::slice::from_ref(o),
             CVal::Frame(os) => os,
+            CVal::Event(_) => &[],
         }
     }
 
@@ -38,6 +40,7 @@ impl CVal {
         match self {
             CVal::Scalar(o) => *o,
             CVal::Frame(os) => os[0],
+            CVal::Event(_) => Operand::Const(0.0),
         }
     }
 
@@ -46,6 +49,13 @@ impl CVal {
         match self {
             CVal::Scalar(_) => CVal::Scalar(ops[0]),
             CVal::Frame(_) => CVal::Frame(ops),
+            CVal::Event(fields) => CVal::Event(
+                fields
+                    .iter()
+                    .zip(ops)
+                    .map(|((name, _), op)| (name.clone(), op))
+                    .collect(),
+            ),
         }
     }
 }
@@ -97,6 +107,7 @@ pub fn compile_instance(
         types,
         sample_rate,
         code: Vec::new(),
+        events: Vec::new(),
         regs: 0,
         state_init: Vec::new(),
         state_regs: HashSet::new(),
@@ -142,9 +153,42 @@ pub fn compile_instance(
         input_regs,
         output: out.operands().to_vec(),
         state_init: c.state_init,
+        events: c.events,
     })
 }
 
+/// Evaluate one parameter default at build time.
+pub fn default_value(
+    defs: &Defs,
+    types: &[Type],
+    sample_rate: f32,
+    def: &Def,
+    param: usize,
+) -> Result<CVal, Diagnostic> {
+    let default = def.params[param].default.as_ref().ok_or_else(|| {
+        internal(
+            def.params[param].name.span,
+            &format!("`{}` has no default", def.params[param].name.name),
+        )
+    })?;
+    let mut c = Compiler {
+        defs,
+        types,
+        sample_rate,
+        code: Vec::new(),
+        events: Vec::new(),
+        regs: 0,
+        state_init: Vec::new(),
+        state_regs: HashSet::new(),
+        scopes: vec![HashMap::new()],
+        rets: Vec::new(),
+        depth: 0,
+        span: def.name.span,
+    };
+    c.expr(default)
+}
+
+#[derive(Clone)]
 struct Binding {
     val: CVal,
     /// `state`, which can be assigned to.
@@ -170,6 +214,7 @@ struct Compiler<'a> {
     types: &'a [Type],
     sample_rate: f32,
     code: Vec<Instr>,
+    events: Vec<EventCode>,
     regs: u16,
     state_init: Vec<(u16, f32)>,
     state_regs: HashSet<u16>,
@@ -332,7 +377,7 @@ impl Compiler<'_> {
             }
         }
         for (p, a) in sig.params.iter().zip(args) {
-            self.bind(&p.name, a, false);
+            self.bind(&p.name, a, sig.kind == super::types::DefKind::Rill);
         }
 
         self.rets.push(Ret {
@@ -341,10 +386,20 @@ impl Compiler<'_> {
             depth: self.depth,
             direct: None,
         });
-        let (value, diverged) = self.block(&def.body)?;
+        let (value, diverged) = self.block_in_current_scope(&def.body)?;
         if !diverged && let Some(v) = value {
             // A fn's trailing expression is its result.
             self.ret(v)?;
+        }
+        if matches!(sig.kind, super::types::DefKind::Rill) {
+            for stmt in &def.body.stmts {
+                if let Stmt::EventHandler {
+                    name, params, body, ..
+                } = stmt
+                {
+                    self.event_handler(name, params, body)?;
+                }
+            }
         }
         let ret = self.rets.pop().expect("pushed above");
         for at in ret.patches {
@@ -380,6 +435,12 @@ impl Compiler<'_> {
     /// every path through it returned.
     fn block(&mut self, b: &Block) -> CResult<(Option<CVal>, bool)> {
         self.scopes.push(HashMap::new());
+        let result = self.block_in_current_scope(b);
+        self.scopes.pop();
+        result
+    }
+
+    fn block_in_current_scope(&mut self, b: &Block) -> CResult<(Option<CVal>, bool)> {
         let mut value = None;
         let mut diverged = false;
         for s in &b.stmts {
@@ -387,7 +448,6 @@ impl Compiler<'_> {
             value = v;
             diverged |= d;
         }
-        self.scopes.pop();
         Ok(if diverged {
             (None, true)
         } else {
@@ -431,10 +491,9 @@ impl Compiler<'_> {
                     _ => return Err(internal(target.span, "assignment to a non-state name")),
                 };
                 for (d, &src) in dsts.iter().zip(v.operands()) {
-                    let Operand::Reg(dst) = *d else {
-                        unreachable!()
-                    };
-                    self.emit(Instr::Copy { dst, src });
+                    if let Operand::Reg(dst) = *d {
+                        self.emit(Instr::Copy { dst, src });
+                    }
                 }
                 Ok((None, false))
             }
@@ -443,6 +502,7 @@ impl Compiler<'_> {
                 self.ret(v)?;
                 Ok((None, true))
             }
+            Stmt::EventHandler { .. } => Ok((None, false)),
             Stmt::Expr(e) => {
                 let v = self.expr(e)?;
                 Ok((Some(v), self.types[e.id as usize] == Type::Never))
@@ -515,7 +575,61 @@ impl Compiler<'_> {
                 }
                 Ok(CVal::Scalar(Operand::Reg(dst)))
             }
+            ExprKind::Field(base, field) => {
+                let CVal::Event(fields) = self.expr(base)? else {
+                    return Err(internal(e.span, "field access on a non-event value"));
+                };
+                fields
+                    .iter()
+                    .find(|(name, _)| name == &field.name)
+                    .map(|(_, op)| CVal::Scalar(*op))
+                    .ok_or_else(|| {
+                        internal(field.span, &format!("unknown event field `{}`", field.name))
+                    })
+            }
         }
+    }
+
+    fn event_handler(&mut self, name: &Ident, params: &[Ident], body: &Block) -> CResult<()> {
+        let saved_code = std::mem::take(&mut self.code);
+        let saved_scopes = self.scopes.clone();
+        self.scopes.push(HashMap::new());
+        let mut bindings = Vec::new();
+        for param in params {
+            if param.name == "cc" {
+                let reg = self.reg()?;
+                self.bind(&param.name, CVal::Scalar(Operand::Reg(reg)), false);
+                bindings.push(EventBinding::Scalar {
+                    name: param.name.clone(),
+                    reg,
+                });
+            } else {
+                let mut fields = Vec::new();
+                for field in event_fields_for(&param.name) {
+                    let reg = self.reg()?;
+                    fields.push(((*field).to_owned(), Operand::Reg(reg)));
+                    bindings.push(EventBinding::Field {
+                        path: format!("{}.{}", param.name, field),
+                        fallback: (*field).to_owned(),
+                        reg,
+                    });
+                }
+                self.bind(&param.name, CVal::Event(fields), false);
+            }
+        }
+        let (_, diverged) = self.block(body)?;
+        if diverged {
+            return Err(internal(name.span, "event handlers cannot return"));
+        }
+        let instrs = std::mem::take(&mut self.code);
+        self.scopes = saved_scopes;
+        self.code = saved_code;
+        self.events.push(EventCode {
+            name: name.name.clone(),
+            bindings,
+            instrs,
+        });
+        Ok(())
     }
 
     fn if_expr(
@@ -662,6 +776,14 @@ impl Compiler<'_> {
                 format!("`{name}` cannot be used here"),
             )),
         }
+    }
+}
+
+fn event_fields_for(param: &str) -> &'static [&'static str] {
+    match param {
+        "note" => &["pitch", "velocity", "release"],
+        "control" => &["channel", "index"],
+        _ => &["pitch", "velocity", "release", "channel", "index"],
     }
 }
 

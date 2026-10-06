@@ -5,7 +5,7 @@
 //! Jumps only go forward, so every tick finishes in at most `instrs.len()`
 //! steps: there are no loops at run time.
 
-use crate::node::{Context, Inputs, Node, Outputs};
+use crate::node::{Context, Event, Inputs, Node, Outputs};
 use crate::ops::{Op1, Op2};
 
 /// An instruction operand.
@@ -60,6 +60,27 @@ pub struct Code {
     pub output: Vec<Operand>,
     /// Registers that are `state`, with their initial values.
     pub state_init: Vec<(u16, f32)>,
+    pub events: Vec<EventCode>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EventCode {
+    pub name: String,
+    pub bindings: Vec<EventBinding>,
+    pub instrs: Vec<Instr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum EventBinding {
+    Scalar {
+        name: String,
+        reg: u16,
+    },
+    Field {
+        path: String,
+        fallback: String,
+        reg: u16,
+    },
 }
 
 impl Code {
@@ -73,8 +94,11 @@ impl Code {
         let mut s = String::new();
         let _ = writeln!(
             s,
-            "; {} regs, inputs {:?}, state {:?}",
-            self.regs, self.input_regs, self.state_init
+            "; {} regs, inputs {:?}, state {:?}, events {}",
+            self.regs,
+            self.input_regs,
+            self.state_init,
+            self.events.len()
         );
         for (pc, i) in self.instrs.iter().enumerate() {
             let line = match i {
@@ -184,5 +208,71 @@ impl Node for Program {
         for &(r, v) in &self.code.state_init {
             self.regs[r as usize] = v;
         }
+    }
+
+    fn handle_event(&mut self, event: &Event<'_>, _sample_rate: f32) -> bool {
+        let Some(handler) = self
+            .code
+            .events
+            .iter()
+            .find(|handler| handler.name == event.name)
+        else {
+            return false;
+        };
+        let regs = &mut self.regs[..];
+        let val = |regs: &[f32], o: Operand| match o {
+            Operand::Reg(r) => regs[r as usize],
+            Operand::Const(c) => c,
+        };
+        let event_value = |name: &str| {
+            event
+                .values
+                .iter()
+                .find(|value| value.name == name)
+                .map(|value| value.value)
+        };
+        for binding in &handler.bindings {
+            match binding {
+                EventBinding::Scalar { name, reg } => {
+                    regs[*reg as usize] = event_value(name).unwrap_or(0.0);
+                }
+                EventBinding::Field {
+                    path,
+                    fallback,
+                    reg,
+                } => {
+                    regs[*reg as usize] = event_value(path)
+                        .or_else(|| event_value(fallback))
+                        .unwrap_or(0.0);
+                }
+            }
+        }
+        let mut pc = 0;
+        while let Some(instr) = handler.instrs.get(pc) {
+            pc += 1;
+            match *instr {
+                Instr::Op2 { op, dst, a, b } => {
+                    regs[dst as usize] = op.apply(val(regs, a), val(regs, b));
+                }
+                Instr::Op1 { op, dst, x } => {
+                    regs[dst as usize] = op.apply(val(regs, x), _sample_rate);
+                }
+                Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
+                Instr::Select { dst, cond, a, b } => {
+                    regs[dst as usize] = if val(regs, cond) != 0.0 {
+                        val(regs, a)
+                    } else {
+                        val(regs, b)
+                    };
+                }
+                Instr::JumpUnless { cond, target } => {
+                    if val(regs, cond) == 0.0 {
+                        pc = target as usize;
+                    }
+                }
+                Instr::Jump { target } => pc = target as usize,
+            }
+        }
+        true
     }
 }

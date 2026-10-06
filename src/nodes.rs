@@ -2,6 +2,83 @@
 
 use crate::node::{Context, Inputs, Node, Outputs, Signal};
 
+/// Live entry-rill parameter with short linear smoothing.
+#[derive(Clone, Copy, Debug)]
+pub struct Param {
+    initial: f32,
+    current: f32,
+    target: f32,
+    step: f32,
+    remaining: usize,
+    smoothing_ms: f32,
+}
+
+impl Param {
+    pub fn new(initial: f32) -> Self {
+        Param {
+            initial,
+            current: initial,
+            target: initial,
+            step: 0.0,
+            remaining: 0,
+            smoothing_ms: 5.0,
+        }
+    }
+
+    pub fn with_smoothing_ms(initial: f32, smoothing_ms: f32) -> Self {
+        Param {
+            smoothing_ms,
+            ..Param::new(initial)
+        }
+    }
+}
+
+impl Node for Param {
+    fn name(&self) -> &'static str {
+        "param"
+    }
+
+    fn inputs(&self) -> usize {
+        0
+    }
+
+    fn process(&mut self, _ctx: &Context, _inputs: &Inputs, out: &mut Outputs) {
+        let out = out.mono();
+        for y in out {
+            if self.remaining > 0 {
+                self.current += self.step;
+                self.remaining -= 1;
+                if self.remaining == 0 {
+                    self.current = self.target;
+                    self.step = 0.0;
+                }
+            }
+            *y = self.current;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.current = self.initial;
+        self.target = self.initial;
+        self.step = 0.0;
+        self.remaining = 0;
+    }
+
+    fn set_control_value(&mut self, value: f32, sample_rate: f32) -> bool {
+        self.target = value;
+        let frames = (sample_rate * self.smoothing_ms / 1000.0).round() as usize;
+        if frames == 0 {
+            self.current = value;
+            self.step = 0.0;
+            self.remaining = 0;
+        } else {
+            self.remaining = frames;
+            self.step = (self.target - self.current) / frames as f32;
+        }
+        true
+    }
+}
+
 /// Sine oscillator. Input 0 is the frequency in Hz.
 #[derive(Clone, Debug, Default)]
 pub struct Sine {

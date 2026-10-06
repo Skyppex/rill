@@ -42,6 +42,7 @@ impl From<NodeId> for Input {
 pub(crate) struct Entry {
     pub(crate) node: Box<dyn Node>,
     pub(crate) inputs: Vec<Input>,
+    pub(crate) control: Option<String>,
 }
 
 /// Where the graph sends audio.
@@ -88,7 +89,15 @@ impl Graph {
         self.entries.push(Entry {
             node: Box::new(node),
             inputs: inputs.into_iter().collect(),
+            control: None,
         });
+        id
+    }
+
+    /// Add a live parameter control.
+    pub fn param(&mut self, name: impl Into<String>, initial: f32) -> NodeId {
+        let id = self.node(crate::nodes::Param::new(initial), []);
+        self.entries[id.0].control = Some(name.into());
         id
     }
 

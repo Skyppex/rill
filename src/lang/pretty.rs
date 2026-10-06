@@ -265,6 +265,18 @@ impl Printer<'_> {
                 vec![self.expr(value)],
             ),
             Stmt::Return { value, .. } => Node::new(kw("return"), vec![self.expr(value)]),
+            Stmt::EventHandler {
+                name, params, body, ..
+            } => {
+                let mut label = kw("on").plain(" ").callable(&name.name).plain("(");
+                for (i, param) in params.iter().enumerate() {
+                    if i > 0 {
+                        label = label.plain(", ");
+                    }
+                    label = label.ident(&param.name);
+                }
+                Node::new(label.plain(")"), vec![self.block(prop("body"), body)])
+            }
             Stmt::Expr(e) => self.expr(e),
         }
     }
@@ -339,6 +351,10 @@ impl Printer<'_> {
             ExprKind::Index(base, index) => Node::new(
                 typed(prop("index")),
                 vec![self.expr(base), self.expr(index)],
+            ),
+            ExprKind::Field(base, field) => Node::new(
+                typed(prop("field").plain(" .").ident(&field.name)),
+                vec![self.expr(base)],
             ),
         }
     }

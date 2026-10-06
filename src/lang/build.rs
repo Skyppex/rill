@@ -8,7 +8,7 @@
 
 use super::ast::Program;
 use super::check::{Checked, check_entry};
-use super::compile::{ArgSpec, Defs, compile_instance};
+use super::compile::{ArgSpec, CVal, Defs, compile_instance, default_value};
 use super::diag::Diagnostic;
 use super::types::Type;
 use super::vm::{Operand, Program as ProgramNode};
@@ -29,7 +29,23 @@ pub fn build(
     let defs = Defs::new(program, checked);
     let (def, sig) = defs.get(entry).expect("checked by check_entry");
 
-    let args = vec![ArgSpec::Default; sig.params.len()];
+    let mut args = Vec::with_capacity(sig.params.len());
+    let mut defaults = Vec::with_capacity(sig.params.len());
+    for i in 0..sig.params.len() {
+        let value = default_value(&defs, &checked.types, config.sample_rate as f32, def, i)
+            .map_err(|d| vec![d])?;
+        let CVal::Scalar(Operand::Const(value)) = value else {
+            return Err(vec![Diagnostic::error(
+                def.params[i].name.span,
+                format!(
+                    "`{}` must have a constant scalar default",
+                    sig.params[i].name
+                ),
+            )]);
+        };
+        defaults.push(value);
+        args.push(ArgSpec::Stream(None));
+    }
     let code = compile_instance(
         &defs,
         &checked.types,
@@ -64,7 +80,13 @@ pub fn build(
             })
             .collect(),
         false => {
-            let id = graph.node(ProgramNode::new(code), []);
+            let params = sig
+                .params
+                .iter()
+                .zip(defaults)
+                .map(|(p, value)| graph.param(p.name.clone(), value).into())
+                .collect::<Vec<Input>>();
+            let id = graph.node(ProgramNode::new(code), params);
             (0..channels).map(|c| id.channel(c)).collect()
         }
     };

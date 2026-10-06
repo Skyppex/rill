@@ -45,6 +45,7 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
         place: Place::Fn,
         current: None,
         ret: Type::Unit,
+        in_event: false,
         calls: HashMap::new(),
         def_order: Vec::new(),
     };
@@ -115,6 +116,7 @@ struct Checker {
     place: Place,
     current: Option<String>,
     ret: Type,
+    in_event: bool,
     /// Caller -> (callee, call site), user definitions only.
     calls: HashMap<String, Vec<(String, Span)>>,
     def_order: Vec<String>,
@@ -449,7 +451,10 @@ impl Checker {
             Stmt::Assign { target, value, .. } => {
                 let t = self.expr(value);
                 match self.lookup(&target.name).cloned() {
-                    Some(var) if var.kind == VarKind::State => {
+                    Some(var)
+                        if var.kind == VarKind::State
+                            || (self.in_event && var.kind == VarKind::Param) =>
+                    {
                         if !coerces(&t, &var.ty) {
                             let e =
                                 mismatch(value.span, &format!("`{}`", target.name), &var.ty, &t);
@@ -478,6 +483,32 @@ impl Checker {
                     self.report(e);
                 }
                 (Type::Never, true)
+            }
+            Stmt::EventHandler {
+                name: _,
+                params,
+                body,
+                ..
+            } => {
+                if self.place != Place::Rill {
+                    let e = self.error(s.span(), "event handlers are only allowed in rills");
+                    self.report(e);
+                    return (Type::Unit, false);
+                }
+                self.scopes.push(HashMap::new());
+                for param in params {
+                    let ty = if param.name == "cc" {
+                        Type::Sample
+                    } else {
+                        Type::Event
+                    };
+                    self.bind(&param.name, ty, VarKind::Let);
+                }
+                let saved = std::mem::replace(&mut self.in_event, true);
+                let (_, diverged) = self.block(body, false);
+                self.in_event = saved;
+                self.scopes.pop();
+                (Type::Unit, diverged)
             }
             Stmt::Expr(e) => {
                 let t = self.expr(e);
@@ -701,6 +732,23 @@ impl Checker {
                         self.report(d);
                         Type::Error
                     }
+                }
+            }
+            ExprKind::Field(base, field) => {
+                let base_ty = self.expr(base);
+                if base_ty == Type::Event {
+                    event_field_type(&field.name).unwrap_or_else(|| {
+                        let e =
+                            self.error(field.span, format!("unknown event field `{}`", field.name));
+                        self.report(e);
+                        Type::Error
+                    })
+                } else if base_ty.is_wild() {
+                    Type::Error
+                } else {
+                    let e = self.error(base.span, format!("cannot read fields from `{base_ty}`"));
+                    self.report(e);
+                    Type::Error
                 }
             }
         }
@@ -980,7 +1028,10 @@ impl Checker {
                     && !builtins::lookup(name).is_empty()
                     && args.iter().all(|a| self.is_const(&a.value))
             }
-            ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Index(..) => false,
+            ExprKind::If { .. }
+            | ExprKind::Block(_)
+            | ExprKind::Index(..)
+            | ExprKind::Field(..) => false,
         }
     }
 
@@ -1263,6 +1314,15 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
             _ => fail(),
         },
         _ => unreachable!("not an arithmetic operator"),
+    }
+}
+
+fn event_field_type(name: &str) -> Option<Type> {
+    match name {
+        "pitch" => Some(Type::Hz),
+        "velocity" | "release" => Some(Type::Sample),
+        "channel" | "index" => Some(Type::I32),
+        _ => None,
     }
 }
 

@@ -17,6 +17,8 @@ pub enum Type {
     Hz,
     Time,
     Interval,
+    /// Dynamically shaped payload passed to an `on event(...)` handler.
+    Event,
     /// An unsuffixed number literal not yet pinned to `sample`, `f32` or
     /// `i32`. It becomes whichever plain numeric type it meets.
     Num,
@@ -59,6 +61,7 @@ impl fmt::Display for Type {
             Type::Hz => f.write_str("Hz"),
             Type::Time => f.write_str("Time"),
             Type::Interval => f.write_str("Interval"),
+            Type::Event => f.write_str("event"),
             Type::Num => f.write_str("number"),
             Type::Frame(elem, size) => write!(f, "[{elem}; {size}]"),
             Type::Unit => f.write_str("()"),

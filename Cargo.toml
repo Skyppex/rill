@@ -3,5 +3,18 @@ name = "rill"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["device"]
+# Real-time output through the system audio device (cpal). Without it the
+# crate still builds the engine and the offline WAV renderer.
+device = ["dep:cpal", "dep:anyhow"]
+# Talk to PulseAudio directly instead of going through ALSA (useful on WSLg).
+pulseaudio = ["device", "cpal/pulseaudio"]
+
 [dependencies]
+anyhow = { version = "1", optional = true }
 clap = { version = "4.6.7", features = ["derive"] }
+cpal = { version = "0.18.2", optional = true }
+
+[dev-dependencies]
+hound = "3.5.1"

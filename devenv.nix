@@ -8,6 +8,8 @@
   # https://devenv.sh/packages/
   packages = with pkgs; [
     alejandra
+    pkg-config
+    alsa-lib # cpal's ALSA backend
   ];
 
   # https://devenv.sh/languages/

@@ -6,16 +6,22 @@
   cargo-check = naersk.buildPackage {
     inherit src;
     mode = "check";
+    nativeBuildInputs = [pkgs.pkg-config];
+    buildInputs = [pkgs.alsa-lib];
   };
 
   cargo-test = naersk.buildPackage {
     inherit src;
     mode = "test";
+    nativeBuildInputs = [pkgs.pkg-config];
+    buildInputs = [pkgs.alsa-lib];
   };
 
   cargo-clippy = naersk.buildPackage {
     inherit src;
     mode = "clippy";
+    nativeBuildInputs = [pkgs.pkg-config];
+    buildInputs = [pkgs.alsa-lib];
   };
 
   cargo-fmt =

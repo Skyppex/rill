@@ -46,6 +46,7 @@
           src = self;
           naersk = naerskLib;
           pkgConfig = pkgs.pkg-config;
+          alsaLib = pkgs.alsa-lib;
           inherit release;
         };
 
@@ -70,6 +71,8 @@
           toolchain
           nixd
           alejandra
+          pkg-config
+          alsa-lib
         ];
         env.RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
       };

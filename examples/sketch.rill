@@ -35,6 +35,28 @@ rill sine(freq: Hz) -> sample {
     return sin(phase * TAU)
 }
 
+// Generator: no audio input.
+rill saw(freq: Hz) -> sample {
+    state phase: f32 = 0
+    phase = wrap(phase + freq / RATE)
+    return phase * 2 - 1
+}
+
+// Generator: no audio input.
+rill square(freq: Hz) -> sample {
+    state phase: f32 = 0
+    phase = wrap(phase + freq / RATE)
+    return if phase < 0.5 { 1 } else { -1 }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    return a + (b - a) * t
+}
+
+rill wavetable(left: sample, right: sample, t: f32) -> sample {
+    return lerp(left, right, t)
+}
+
 rill ramp(from: f32, to: f32, time: Time) -> f32 {
     state elapsed = 0s
 
@@ -63,15 +85,11 @@ rill crush(x: sample, bits: f32 = 8, hold: Time = 0.5ms) -> sample {
 
 // Entry point: the program runs `main` and plays what it returns.
 rill main() -> sample {
-    // let lfo   = sine(360Hz) * 100Hz + 440Hz
-    // let voice1 = sine(lfo)
-    // let voice2 = sine(lfo * (3/2))
-    // let voice3 = sine(lfo * (5/4))
+    let lfo   = sine(0.5Hz) * 0.5 + 0.5
+    let voice1 = sine(440Hz)
+    let voice2 = square(440Hz)
 
-    let tremolo = sine(440Hz) * (sine(8Hz) * 0.5 + 1)
-    let gradual = ramp(0, 100, 5s) * 1Hz
-    let ring = sine(440Hz) * sine(gradual)
+    let voice = wavetable(voice1, voice2, lfo)
 
-    let voice = ring * 0.3
-    return voice |> crush()
+    return voice * 0.05
 }

@@ -1,0 +1,405 @@
+//! Tree view of a checked program, for `rill check ast`.
+//!
+//! ```text
+//! rill peak -> sample
+//! ├─ param x: sample
+//! ├─ param release: Time
+//! │  └─ 300ms : Time
+//! └─ body
+//!    ├─ state level: sample
+//!    │  └─ 0 : number
+//!    ...
+//! ```
+//!
+//! Every expression is followed by the type the checker gave it.
+//!
+//! Colours use only the 16 base ANSI slots, so they follow the terminal
+//! theme: keywords 13, tree labels such as `param` and `body` 14, names of
+//! fns and rills 11, other identifiers 14, types 11, operators 9, and
+//! constants 3.
+
+use super::ast::*;
+use super::check::Checked;
+use super::diag::Span;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Style {
+    Plain,
+    /// A word of the Rill language itself, like `rill` or `return`.
+    Keyword,
+    /// A label the tree adds, like `param`, `body` or `binary`.
+    Property,
+    Ident,
+    /// The name of a fn, rill or built-in function.
+    Callable,
+    Op,
+    Type,
+    Value,
+}
+
+impl Style {
+    fn ansi(self) -> Option<&'static str> {
+        match self {
+            Style::Plain => None,
+            Style::Keyword => Some("\x1b[95m"),
+            Style::Property => Some("\x1b[96m"),
+            Style::Ident => Some("\x1b[96m"),
+            Style::Callable => Some("\x1b[93m"),
+            Style::Op => Some("\x1b[91m"),
+            Style::Type => Some("\x1b[93m"),
+            Style::Value => Some("\x1b[33m"),
+        }
+    }
+}
+
+const RESET: &str = "\x1b[0m";
+
+/// A line of the tree, as styled pieces.
+#[derive(Default)]
+struct Label(Vec<(Style, String)>);
+
+impl Label {
+    fn push(mut self, style: Style, text: impl Into<String>) -> Label {
+        self.0.push((style, text.into()));
+        self
+    }
+
+    fn kw(self, text: impl Into<String>) -> Label {
+        self.push(Style::Keyword, text)
+    }
+
+    fn prop(self, text: impl Into<String>) -> Label {
+        self.push(Style::Property, text)
+    }
+
+    fn callable(self, text: impl Into<String>) -> Label {
+        self.push(Style::Callable, text)
+    }
+
+    fn ident(self, text: impl Into<String>) -> Label {
+        self.push(Style::Ident, text)
+    }
+
+    fn op(self, text: impl Into<String>) -> Label {
+        self.push(Style::Op, text)
+    }
+
+    fn ty(self, text: impl Into<String>) -> Label {
+        self.push(Style::Type, text)
+    }
+
+    fn value(self, text: impl Into<String>) -> Label {
+        self.push(Style::Value, text)
+    }
+
+    fn plain(self, text: impl Into<String>) -> Label {
+        self.push(Style::Plain, text)
+    }
+
+    fn write(&self, color: bool, out: &mut String) {
+        for (style, text) in &self.0 {
+            match style.ansi().filter(|_| color) {
+                Some(code) => {
+                    out.push_str(code);
+                    out.push_str(text);
+                    out.push_str(RESET);
+                }
+                None => out.push_str(text),
+            }
+        }
+    }
+}
+
+fn kw(text: &str) -> Label {
+    Label::default().kw(text)
+}
+
+fn prop(text: &str) -> Label {
+    Label::default().prop(text)
+}
+
+struct Node {
+    label: Label,
+    children: Vec<Node>,
+}
+
+impl Node {
+    fn leaf(label: Label) -> Node {
+        Node {
+            label,
+            children: Vec::new(),
+        }
+    }
+
+    fn new(label: Label, children: Vec<Node>) -> Node {
+        Node { label, children }
+    }
+}
+
+/// Render `program` as a tree annotated with the types in `checked`, with
+/// ANSI colours if `color` is set.
+pub fn tree(src: &str, program: &Program, checked: &Checked, color: bool) -> String {
+    let p = Printer { src, checked };
+    let mut out = String::new();
+    for (i, item) in program.items.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        render(&p.item(item), "", "", color, &mut out);
+    }
+    out
+}
+
+fn render(node: &Node, first: &str, rest: &str, color: bool, out: &mut String) {
+    out.push_str(first);
+    node.label.write(color, out);
+    out.push('\n');
+    let last = node.children.len().saturating_sub(1);
+    for (i, child) in node.children.iter().enumerate() {
+        let (branch, cont) = if i == last {
+            ("└─ ", "   ")
+        } else {
+            ("├─ ", "│  ")
+        };
+        render(
+            child,
+            &format!("{rest}{branch}"),
+            &format!("{rest}{cont}"),
+            color,
+            out,
+        );
+    }
+}
+
+struct Printer<'a> {
+    src: &'a str,
+    checked: &'a Checked,
+}
+
+impl Printer<'_> {
+    fn text(&self, span: Span) -> &str {
+        &self.src[span.start as usize..span.end as usize]
+    }
+
+    fn item(&self, item: &Item) -> Node {
+        match item {
+            Item::Fn(d) => self.def("fn", d),
+            Item::Rill(d) => self.def("rill", d),
+            Item::Stmt(s) => self.stmt(s),
+        }
+    }
+
+    fn def(&self, keyword: &str, d: &Def) -> Node {
+        let mut label = kw(keyword).plain(" ").callable(&d.name.name);
+        if !d.generics.is_empty() {
+            label = label.plain("<");
+            for (i, g) in d.generics.iter().enumerate() {
+                if i > 0 {
+                    label = label.plain(", ");
+                }
+                label = label.ty(&g.name);
+            }
+            label = label.plain(">");
+        }
+        label = label
+            .plain(" ")
+            .op("->")
+            .plain(" ")
+            .ty(self.text(d.ret.span()));
+        if let Some(rate) = &d.rate {
+            label = label.plain(" ").op("@").plain(" ").kw("rate");
+            if rate.den != 1 {
+                label = label
+                    .plain(" ")
+                    .op("/")
+                    .plain(" ")
+                    .value(rate.den.to_string());
+            } else if rate.num != 1 {
+                label = label
+                    .plain(" ")
+                    .op("*")
+                    .plain(" ")
+                    .value(rate.num.to_string());
+            }
+        }
+
+        let mut children: Vec<Node> = d
+            .params
+            .iter()
+            .map(|p| {
+                let label = prop("param")
+                    .plain(" ")
+                    .ident(&p.name.name)
+                    .plain(": ")
+                    .ty(self.text(p.ty.span()));
+                match &p.default {
+                    Some(e) => Node::new(label, vec![self.expr(e)]),
+                    None => Node::leaf(label),
+                }
+            })
+            .collect();
+        children.push(self.block(prop("body"), &d.body));
+        Node::new(label, children)
+    }
+
+    fn block(&self, label: Label, b: &Block) -> Node {
+        Node::new(label, b.stmts.iter().map(|s| self.stmt(s)).collect())
+    }
+
+    fn stmt(&self, s: &Stmt) -> Node {
+        let annotated = |keyword: &str, name: &Ident, ty: &Option<TypeExpr>| {
+            let label = kw(keyword).plain(" ").ident(&name.name);
+            match ty {
+                Some(t) => label.plain(": ").ty(self.text(t.span())),
+                None => label,
+            }
+        };
+        match s {
+            Stmt::Let {
+                name, ty, value, ..
+            } => Node::new(annotated("let", name, ty), vec![self.expr(value)]),
+            Stmt::State { name, ty, init, .. } => {
+                Node::new(annotated("state", name, ty), vec![self.expr(init)])
+            }
+            Stmt::Assign { target, value, .. } => Node::new(
+                prop("assign").plain(" ").ident(&target.name),
+                vec![self.expr(value)],
+            ),
+            Stmt::Return { value, .. } => Node::new(kw("return"), vec![self.expr(value)]),
+            Stmt::Expr(e) => self.expr(e),
+        }
+    }
+
+    fn expr(&self, e: &Expr) -> Node {
+        let ty = self.checked.types[e.id as usize].to_string();
+        let typed = |label: Label| label.plain(" : ").ty(&ty);
+        match &e.kind {
+            ExprKind::Number { .. } | ExprKind::Bool(_) => {
+                Node::leaf(typed(Label::default().value(self.text(e.span))))
+            }
+            ExprKind::Name(name) if super::builtins::constant(name).is_some() => {
+                Node::leaf(typed(Label::default().value(name)))
+            }
+            ExprKind::Name(name) => Node::leaf(typed(Label::default().ident(name))),
+            ExprKind::Unary(op, x) => {
+                let symbol = match op {
+                    UnOp::Neg => "-",
+                    UnOp::Plus => "+",
+                    UnOp::Not => "!",
+                };
+                Node::new(
+                    typed(prop("unary").plain(" ").op(symbol)),
+                    vec![self.expr(x)],
+                )
+            }
+            ExprKind::Binary(op, a, b) => Node::new(
+                typed(prop("binary").plain(" ").op(op.symbol())),
+                vec![self.expr(a), self.expr(b)],
+            ),
+            ExprKind::Call {
+                callee,
+                args,
+                piped,
+            } => {
+                let mut label = prop("call").plain(" ").callable(&callee.name);
+                if *piped {
+                    label = label.plain(" (").prop("piped").plain(")");
+                }
+                let children = args
+                    .iter()
+                    .map(|a| {
+                        let mut node = self.expr(&a.value);
+                        if let Some(name) = &a.name {
+                            let mut prefixed = Label::default().ident(&name.name).plain(": ");
+                            prefixed.0.append(&mut node.label.0);
+                            node.label = prefixed;
+                        }
+                        node
+                    })
+                    .collect();
+                Node::new(typed(label), children)
+            }
+            ExprKind::If { cond, then, els } => {
+                let mut children = vec![
+                    Node::new(prop("cond"), vec![self.expr(cond)]),
+                    self.block(prop("then"), then),
+                ];
+                if let Some(els) = els {
+                    children.push(match &els.kind {
+                        ExprKind::Block(b) => self.block(kw("else"), b),
+                        _ => Node::new(kw("else"), vec![self.expr(els)]),
+                    });
+                }
+                Node::new(typed(kw("if")), children)
+            }
+            ExprKind::Block(b) => self.block(typed(prop("block")), b),
+            ExprKind::Frame(elems) => Node::new(
+                typed(prop("frame")),
+                elems.iter().map(|x| self.expr(x)).collect(),
+            ),
+            ExprKind::Index(base, index) => Node::new(
+                typed(prop("index")),
+                vec![self.expr(base), self.expr(index)],
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: &str = "\
+rill peak(x: sample, release: Time = 300ms) -> sample {
+    state level: sample = 0
+    level = if abs(x) > level { abs(x) } else { level * decay(release) }
+    return level
+}
+let y = [0.5, 1] |> peak(release: 10ms)
+out(y[0])
+";
+
+    #[test]
+    fn renders_a_typed_tree() {
+        let (program, checked) = crate::lang::compile(SRC).unwrap();
+        let expected = "\
+rill peak -> sample
+├─ param x: sample
+├─ param release: Time
+│  └─ 300ms : Time
+└─ body
+   ├─ state level: sample
+   │  └─ 0 : number
+   ├─ assign level
+   │  └─ if : sample
+   │     ├─ cond
+   │     │  └─ binary > : bool
+   │     │     ├─ call abs : sample
+   │     │     │  └─ x : sample
+   │     │     └─ level : sample
+   │     ├─ then
+   │     │  └─ call abs : sample
+   │     │     └─ x : sample
+   │     └─ else
+   │        └─ binary * : sample
+   │           ├─ level : sample
+   │           └─ call decay : sample
+   │              └─ release : Time
+   └─ return
+      └─ level : sample
+
+let y
+└─ call peak (piped) : [sample; 2]
+   ├─ frame : [number; 2]
+   │  ├─ 0.5 : number
+   │  └─ 1 : number
+   └─ release: 10ms : Time
+
+call out : ()
+└─ index : sample
+   ├─ y : [sample; 2]
+   └─ 0 : number
+";
+        assert_eq!(tree(SRC, &program, &checked, false), expected);
+    }
+}

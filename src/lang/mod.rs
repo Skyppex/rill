@@ -20,6 +20,7 @@ pub mod check;
 pub mod diag;
 pub mod lexer;
 pub mod parser;
+pub mod pretty;
 pub mod types;
 
 pub use check::Checked;

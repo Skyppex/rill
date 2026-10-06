@@ -33,6 +33,52 @@ impl PatchArgs {
     }
 }
 
+#[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+struct CheckArgs {
+    #[command(subcommand)]
+    view: Option<CheckView>,
+    /// Source file.
+    #[arg(required = true)]
+    file: Option<PathBuf>,
+    /// Print the signature of every fn and rill.
+    #[arg(long)]
+    signatures: bool,
+}
+
+#[derive(Subcommand)]
+enum CheckView {
+    /// Check, then print the syntax tree with every expression's type.
+    Ast {
+        /// Source file.
+        file: PathBuf,
+        /// Colour the tree. `auto` colours only when writing to a terminal
+        /// and `NO_COLOR` is unset.
+        #[arg(long, value_enum, default_value_t = Color::Auto)]
+        color: Color,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Color {
+    Auto,
+    Always,
+    Never,
+}
+
+impl Color {
+    fn enabled(self) -> bool {
+        use std::io::IsTerminal;
+        match self {
+            Color::Always => true,
+            Color::Never => false,
+            Color::Auto => {
+                std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Format {
     F32,
@@ -61,13 +107,7 @@ enum Command {
     #[cfg(feature = "device")]
     Devices,
     /// Parse and type-check a Rill source file.
-    Check {
-        /// Source file.
-        file: PathBuf,
-        /// Print the signature of every fn and rill.
-        #[arg(long)]
-        signatures: bool,
-    },
+    Check(CheckArgs),
     /// Render a patch to a WAV file through a simulated audio callback.
     Render {
         /// Output file.
@@ -150,36 +190,29 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Command::Check { file, signatures } => {
-            let src = std::fs::read_to_string(&file)
-                .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-            let name = file.display().to_string();
-            match rill::lang::compile(&src) {
-                Ok((_, checked)) => {
-                    for w in &checked.warnings {
-                        eprint!("{}", w.render(&name, &src));
-                    }
-                    if signatures {
-                        for sig in &checked.signatures {
-                            println!("{sig}");
-                        }
-                    }
-                    let count = |k| checked.signatures.iter().filter(|s| s.kind == k).count();
-                    println!(
-                        "{name}: ok ({} fn, {} rill)",
-                        count(rill::lang::types::DefKind::Fn),
-                        count(rill::lang::types::DefKind::Rill)
-                    );
-                }
-                Err(diags) => {
-                    for d in &diags {
-                        eprint!("{}", d.render(&name, &src));
-                    }
-                    let errors = diags.iter().filter(|d| d.is_error()).count();
-                    return Err(format!("{name}: {errors} error(s)").into());
-                }
+        Command::Check(args) => match args.view {
+            Some(CheckView::Ast { file, color }) => {
+                let (src, program, checked) = check_file(&file)?;
+                let tree = rill::lang::pretty::tree(&src, &program, &checked, color.enabled());
+                print!("{tree}");
             }
-        }
+            None => {
+                let file = args.file.expect("required by clap");
+                let (_, _, checked) = check_file(&file)?;
+                if args.signatures {
+                    for sig in &checked.signatures {
+                        println!("{sig}");
+                    }
+                }
+                let count = |k| checked.signatures.iter().filter(|s| s.kind == k).count();
+                println!(
+                    "{}: ok ({} fn, {} rill)",
+                    file.display(),
+                    count(rill::lang::types::DefKind::Fn),
+                    count(rill::lang::types::DefKind::Rill)
+                );
+            }
+        },
         Command::Render {
             out,
             patch,
@@ -213,4 +246,29 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Parse and check `file`, printing diagnostics to stderr. Fails if there
+/// were any errors.
+fn check_file(
+    file: &std::path::Path,
+) -> Result<(String, rill::lang::ast::Program, rill::lang::Checked), Box<dyn std::error::Error>> {
+    let src = std::fs::read_to_string(file)
+        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let name = file.display().to_string();
+    match rill::lang::compile(&src) {
+        Ok((program, checked)) => {
+            for w in &checked.warnings {
+                eprint!("{}", w.render(&name, &src));
+            }
+            Ok((src, program, checked))
+        }
+        Err(diags) => {
+            for d in &diags {
+                eprint!("{}", d.render(&name, &src));
+            }
+            let errors = diags.iter().filter(|d| d.is_error()).count();
+            Err(format!("{name}: {errors} error(s)").into())
+        }
+    }
 }

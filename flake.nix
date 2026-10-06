@@ -45,8 +45,7 @@
         import ./default.nix {
           src = self;
           naersk = naerskLib;
-          pkgConfig = pkgs.pkg-config;
-          alsaLib = pkgs.alsa-lib;
+          inherit pkgs;
           inherit release;
         };
 

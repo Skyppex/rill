@@ -40,8 +40,11 @@ impl Signal<'_> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Port {
     Const(f32),
-    /// Index into the engine's buffer list.
-    Buffer(usize),
+    /// Channel of a node's output: `buffers[node][offset..offset + frames]`.
+    Buffer {
+        node: usize,
+        offset: usize,
+    },
 }
 
 /// The inputs of the node currently being processed.
@@ -56,7 +59,9 @@ impl<'a> Inputs<'a> {
     pub fn get(&self, index: usize) -> Signal<'a> {
         match self.ports[index] {
             Port::Const(v) => Signal::Const(v),
-            Port::Buffer(b) => Signal::Buffer(&self.buffers[b][..self.frames]),
+            Port::Buffer { node, offset } => {
+                Signal::Buffer(&self.buffers[node][offset..offset + self.frames])
+            }
         }
     }
 
@@ -66,6 +71,39 @@ impl<'a> Inputs<'a> {
 
     pub fn is_empty(&self) -> bool {
         self.ports.is_empty()
+    }
+}
+
+/// The output channels of the node currently being processed.
+pub struct Outputs<'a> {
+    pub(crate) buf: &'a mut [f32],
+    /// Distance between channels in `buf` (the engine's `max_frames`).
+    pub(crate) stride: usize,
+    pub(crate) frames: usize,
+}
+
+impl Outputs<'_> {
+    /// Channel `c`, exactly `frames` long.
+    #[inline(always)]
+    pub fn channel(&mut self, c: usize) -> &mut [f32] {
+        let start = c * self.stride;
+        &mut self.buf[start..start + self.frames]
+    }
+
+    /// Channel 0, for single-output nodes.
+    #[inline(always)]
+    pub fn mono(&mut self) -> &mut [f32] {
+        self.channel(0)
+    }
+
+    /// Write frame `i` of channel `c`.
+    #[inline(always)]
+    pub fn set(&mut self, c: usize, i: usize, value: f32) {
+        self.buf[c * self.stride + i] = value;
+    }
+
+    pub fn frames(&self) -> usize {
+        self.frames
     }
 }
 
@@ -81,8 +119,13 @@ pub trait Node: Send {
     /// Number of inputs the node expects.
     fn inputs(&self) -> usize;
 
-    /// Fill `out` (exactly `ctx.frames` long) from `inputs`.
-    fn process(&mut self, ctx: &Context, inputs: &Inputs, out: &mut [f32]);
+    /// Number of output channels.
+    fn outputs(&self) -> usize {
+        1
+    }
+
+    /// Fill every output channel (`ctx.frames` long) from `inputs`.
+    fn process(&mut self, ctx: &Context, inputs: &Inputs, out: &mut Outputs);
 
     /// Return to the state the node had when it was built.
     fn reset(&mut self) {}

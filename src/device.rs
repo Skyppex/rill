@@ -93,8 +93,14 @@ fn host(name: Option<&str>) -> anyhow::Result<cpal::Host> {
     Ok(cpal::host_from_id(id)?)
 }
 
-/// Freeze `graph` for the default output device and start playing it.
-pub fn play(graph: Graph, options: &Options) -> anyhow::Result<Playback> {
+/// Build a graph for the default output device and start playing it.
+///
+/// `make_graph` receives the device's configuration, since a graph depends on
+/// the sample rate and channel count it will run at.
+pub fn play(
+    make_graph: impl FnOnce(&Config) -> anyhow::Result<Graph>,
+    options: &Options,
+) -> anyhow::Result<Playback> {
     let host = host(options.host.as_deref())?;
     let device = host
         .default_output_device()
@@ -124,7 +130,7 @@ pub fn play(graph: Graph, options: &Options) -> anyhow::Result<Playback> {
         max_frames: options.max_frames.unwrap_or(1024),
         out_channels: usize::from(stream_config.channels),
     };
-    let engine = Engine::new(graph, config)?;
+    let engine = Engine::new(make_graph(&config)?, config)?;
 
     let stream = match format {
         SampleFormat::F32 => build::<f32>(&device, stream_config, engine),

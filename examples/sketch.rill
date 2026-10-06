@@ -36,6 +36,13 @@ rill sine(freq: Hz) -> sample {
 }
 
 // Top level: build the graph and send it to the device.
-let lfo   = sine(0.5Hz) * 20Hz + 440Hz
-let voice = sine(lfo) * 0.3
+// let lfo   = sine(360Hz) * 100Hz + 440Hz
+// let voice1 = sine(lfo)
+// let voice2 = sine(lfo * (3/2))
+// let voice3 = sine(lfo * (5/4))
+
+let tremolo = sine(440Hz) * (sine(8Hz) * 0.5 + 1)
+let ring = sine(440Hz) * sine(200Hz)
+
+let voice = tremolo * 0.3
 out(voice)

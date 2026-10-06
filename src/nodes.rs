@@ -1,6 +1,6 @@
 //! Built-in nodes.
 
-use crate::node::{Context, Inputs, Node, Signal};
+use crate::node::{Context, Inputs, Node, Outputs, Signal};
 
 /// Sine oscillator. Input 0 is the frequency in Hz.
 #[derive(Clone, Debug, Default)]
@@ -43,7 +43,8 @@ impl Node for Sine {
         1
     }
 
-    fn process(&mut self, ctx: &Context, inputs: &Inputs, out: &mut [f32]) {
+    fn process(&mut self, ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
+        let out = out.mono();
         let rate = f64::from(ctx.sample_rate);
         match inputs.get(0) {
             Signal::Const(freq) => {
@@ -78,8 +79,8 @@ impl Node for Gain {
         2
     }
 
-    fn process(&mut self, _ctx: &Context, inputs: &Inputs, out: &mut [f32]) {
-        binary(inputs.get(0), inputs.get(1), out, |a, b| a * b);
+    fn process(&mut self, _ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
+        binary(inputs.get(0), inputs.get(1), out.mono(), |a, b| a * b);
     }
 }
 
@@ -96,8 +97,8 @@ impl Node for Add {
         2
     }
 
-    fn process(&mut self, _ctx: &Context, inputs: &Inputs, out: &mut [f32]) {
-        binary(inputs.get(0), inputs.get(1), out, |a, b| a + b);
+    fn process(&mut self, _ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
+        binary(inputs.get(0), inputs.get(1), out.mono(), |a, b| a + b);
     }
 }
 
@@ -122,5 +123,74 @@ fn binary(a: Signal, b: Signal, out: &mut [f32], op: impl Fn(f32, f32) -> f32) {
             }
         }
         (Signal::Const(a), Signal::Const(b)) => out.fill(op(a, b)),
+    }
+}
+
+/// Any two-operand [`Op2`](crate::ops::Op2), per frame.
+#[derive(Clone, Copy, Debug)]
+pub struct Binary(pub crate::ops::Op2);
+
+impl Node for Binary {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn inputs(&self) -> usize {
+        2
+    }
+
+    fn process(&mut self, _ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
+        let op = self.0;
+        binary(inputs.get(0), inputs.get(1), out.mono(), |a, b| {
+            op.apply(a, b)
+        });
+    }
+}
+
+/// Any one-operand [`Op1`](crate::ops::Op1), per frame.
+#[derive(Clone, Copy, Debug)]
+pub struct Unary(pub crate::ops::Op1);
+
+impl Node for Unary {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn inputs(&self) -> usize {
+        1
+    }
+
+    fn process(&mut self, ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
+        let (op, rate) = (self.0, ctx.sample_rate);
+        let out = out.mono();
+        match inputs.get(0) {
+            Signal::Const(x) => out.fill(op.apply(x, rate)),
+            Signal::Buffer(x) => {
+                for (y, &x) in out.iter_mut().zip(x) {
+                    *y = op.apply(x, rate);
+                }
+            }
+        }
+    }
+}
+
+/// `if cond { a } else { b }` per frame. Inputs: cond, a, b.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Select;
+
+impl Node for Select {
+    fn name(&self) -> &'static str {
+        "select"
+    }
+
+    fn inputs(&self) -> usize {
+        3
+    }
+
+    fn process(&mut self, _ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
+        let (cond, a, b) = (inputs.get(0), inputs.get(1), inputs.get(2));
+        for (i, y) in out.mono().iter_mut().enumerate() {
+            *y = if cond.at(i) != 0.0 { a.at(i) } else { b.at(i) };
+        }
     }
 }

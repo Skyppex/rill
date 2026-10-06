@@ -76,3 +76,27 @@ fn rendering_does_not_allocate() {
     // Sanity check that the allocator is actually being observed.
     assert!(allocations_during(|| drop(std::hint::black_box(vec![0u8; 16]))) > 0);
 }
+
+#[test]
+fn compiled_rill_programs_do_not_allocate() {
+    for name in ["sketch", "stereo"] {
+        let path = format!("{}/examples/{name}.rill", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(path).unwrap();
+        let config = Config {
+            sample_rate: 48_000,
+            max_frames: 64,
+            out_channels: 2,
+        };
+        let (graph, _) = rill::lang::load(&src, &config).unwrap();
+        let mut engine = Engine::new(graph, config).unwrap();
+        let mut out = vec![0.0f32; 2 * 1000];
+        let count = allocations_during(|| {
+            for _ in 0..5 {
+                engine.render_interleaved(&mut out);
+            }
+            engine.reset();
+        });
+        assert_eq!(count, 0, "{name}");
+        assert!(out.iter().any(|&x| x != 0.0), "{name} rendered silence");
+    }
+}

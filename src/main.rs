@@ -15,21 +15,55 @@ struct Cli {
 }
 
 #[derive(clap::Args)]
-struct PatchArgs {
-    /// Which built-in patch to run.
-    #[arg(long, default_value = "sine", value_parser = clap::builder::PossibleValuesParser::new(patches::NAMES))]
-    patch: String,
-    /// Oscillator frequency in Hz.
-    #[arg(long, default_value_t = 440.0)]
+struct SourceArgs {
+    /// Rill source file to run.
+    #[arg(required_unless_present = "patch", conflicts_with = "patch")]
+    source: Option<PathBuf>,
+    /// Run a built-in patch instead of a source file.
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(patches::NAMES))]
+    patch: Option<String>,
+    /// Oscillator frequency in Hz, for `--patch`.
+    #[arg(long, default_value_t = 440.0, requires = "patch")]
     freq: f32,
-    /// Output gain.
-    #[arg(long, default_value_t = 0.3)]
+    /// Output gain, for `--patch`.
+    #[arg(long, default_value_t = 0.3, requires = "patch")]
     gain: f32,
 }
 
-impl PatchArgs {
-    fn graph(&self) -> Graph {
-        patches::by_name(&self.patch, self.freq, self.gain).expect("validated by clap")
+impl SourceArgs {
+    fn name(&self) -> String {
+        match (&self.source, &self.patch) {
+            (Some(path), _) => path.display().to_string(),
+            (None, Some(patch)) => format!("patch `{patch}`"),
+            (None, None) => unreachable!("required by clap"),
+        }
+    }
+
+    /// Build the graph for an engine with `config`, printing any
+    /// diagnostics.
+    fn graph(&self, config: &Config) -> Result<Graph, String> {
+        let Some(path) = &self.source else {
+            let patch = self.patch.as_deref().expect("required by clap");
+            return Ok(patches::by_name(patch, self.freq, self.gain).expect("validated by clap"));
+        };
+        let src = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let name = path.display().to_string();
+        match rill::lang::load(&src, config) {
+            Ok((graph, warnings)) => {
+                for w in &warnings {
+                    eprint!("{}", w.render(&name, &src));
+                }
+                Ok(graph)
+            }
+            Err(diags) => {
+                for d in &diags {
+                    eprint!("{}", d.render(&name, &src));
+                }
+                let errors = diags.iter().filter(|d| d.is_error()).count();
+                Err(format!("{name}: {errors} error(s)"))
+            }
+        }
     }
 }
 
@@ -88,11 +122,11 @@ enum Format {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Play a patch on the default audio device.
+    /// Play a Rill file (or a built-in patch) on the default audio device.
     #[cfg(feature = "device")]
     Play {
         #[command(flatten)]
-        patch: PatchArgs,
+        source: SourceArgs,
         /// Stop after this many seconds instead of waiting for Enter.
         #[arg(long)]
         seconds: Option<f32>,
@@ -108,12 +142,14 @@ enum Command {
     Devices,
     /// Parse and type-check a Rill source file.
     Check(CheckArgs),
-    /// Render a patch to a WAV file through a simulated audio callback.
+    /// Render a Rill file (or a built-in patch) to a WAV file through a
+    /// simulated audio callback.
     Render {
-        /// Output file.
-        out: PathBuf,
         #[command(flatten)]
-        patch: PatchArgs,
+        source: SourceArgs,
+        /// Output file.
+        #[arg(short, long)]
+        out: PathBuf,
         #[arg(long, default_value_t = 2.0)]
         seconds: f32,
         #[arg(long, default_value_t = 48_000)]
@@ -149,7 +185,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         #[cfg(feature = "device")]
         Command::Play {
-            patch,
+            source,
             seconds,
             host,
             buffer,
@@ -159,14 +195,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 buffer_frames: buffer,
                 max_frames: None,
             };
-            let playback = rill::device::play(patch.graph(), &options)?;
+            let playback = rill::device::play(
+                |config| source.graph(config).map_err(anyhow::Error::msg),
+                &options,
+            )?;
             let buffer = match playback.buffer_frames {
                 Some(frames) => format!("{frames}-frame buffer"),
                 None => "default buffer".to_owned(),
             };
             println!(
-                "playing `{}` on {} ({} Hz, {} ch, {}, {buffer})",
-                patch.patch,
+                "playing {} on {} ({} Hz, {} ch, {}, {buffer})",
+                source.name(),
                 playback.device,
                 playback.config.sample_rate,
                 playback.config.out_channels,
@@ -214,8 +253,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Command::Render {
+            source,
             out,
-            patch,
             seconds,
             rate,
             channels,
@@ -233,7 +272,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 max_frames: block,
                 out_channels: usize::from(channels),
             };
-            let mut engine = Engine::new(patch.graph(), config)?;
+            let mut engine = Engine::new(source.graph(&config)?, config)?;
             let frames = (seconds * rate as f32).round() as usize;
             let samples = offline::render(&mut engine, frames, &Blocks::Fixed(block));
             let format = match format {
@@ -242,7 +281,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Format::I24 => WavFormat::Pcm24,
             };
             wav::write_file(&out, rate, channels, format, &samples)?;
-            println!("wrote {frames} frames to {}", out.display());
+            println!(
+                "rendered {} to {} ({frames} frames)",
+                source.name(),
+                out.display()
+            );
         }
     }
     Ok(())

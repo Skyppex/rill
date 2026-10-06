@@ -10,13 +10,21 @@ use crate::node::Node;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) usize);
 
+impl NodeId {
+    /// Output channel `c` of this node.
+    pub fn channel(self, c: usize) -> Input {
+        Input::Port(self, c)
+    }
+}
+
 /// What feeds a node input or a device output channel.
 ///
 /// A constant is a stream that never changes, so every input accepts either.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Input {
     Const(f32),
-    Node(NodeId),
+    /// An output channel of a node.
+    Port(NodeId, usize),
 }
 
 impl From<f32> for Input {
@@ -27,7 +35,7 @@ impl From<f32> for Input {
 
 impl From<NodeId> for Input {
     fn from(id: NodeId) -> Self {
-        Input::Node(id)
+        Input::Port(id, 0)
     }
 }
 

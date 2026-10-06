@@ -185,7 +185,7 @@ The goal of the first milestone is hearing a sine wave from Rill source in real 
 
 - [x] **M1 — Hello, sine.** Hard-coded graph runtime in Rust with `cpal`: a sine node, a gain node, output to the device. Plus a fake-callback loop that renders to WAV for tests.
 - [x] **M2 — Parser and checker.** Parse `fn`, `rill`, `state`, `let`, `|>`, unit literals; type-check `sample` and `[sample; N]`.
-- [ ] **M3 — Graph builder.** Top-level code builds a graph; per-block interpreter runs it. Lifting over channels works.
+- [x] **M3 — Graph builder.** Top-level code builds a graph; per-block interpreter runs it. Lifting over channels works.
 - [ ] **M4 — Live control.** `rill_set_param`, parameter smoothing, sample-accurate events with block splitting.
 - [ ] **M5 — Pitch layer.** `Pitch`, `Interval`, chord literals, 12-TET and just tuning, constant folding.
 - [ ] **M6 — Hot reload.** Swap graphs with a crossfade while audio plays.

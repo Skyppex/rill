@@ -15,6 +15,7 @@ pub mod lang;
 pub mod node;
 pub mod nodes;
 pub mod offline;
+pub mod ops;
 pub mod patches;
 pub mod wav;
 

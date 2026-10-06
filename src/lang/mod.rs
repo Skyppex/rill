@@ -15,13 +15,16 @@
 //! ```
 
 pub mod ast;
+pub mod build;
 pub mod builtins;
 pub mod check;
+pub mod compile;
 pub mod diag;
 pub mod lexer;
 pub mod parser;
 pub mod pretty;
 pub mod types;
+pub mod vm;
 
 pub use check::Checked;
 pub use diag::{Diagnostic, Severity, Span};
@@ -30,6 +33,19 @@ pub use diag::{Diagnostic, Severity, Span};
 pub fn parse(src: &str) -> Result<ast::Program, Vec<Diagnostic>> {
     let tokens = lexer::lex(src).map_err(|e| vec![e])?;
     parser::parse(src, tokens)
+}
+
+/// Parse, check and build `src` into a graph for an engine with `config`.
+/// On success, also returns any warnings.
+pub fn load(
+    src: &str,
+    config: &crate::Config,
+) -> Result<(crate::Graph, Vec<Diagnostic>), Vec<Diagnostic>> {
+    let (program, checked) = compile(src)?;
+    let built = build::build(&program, &checked, config)?;
+    let mut warnings = checked.warnings;
+    warnings.extend(built.warnings);
+    Ok((built.graph, warnings))
 }
 
 /// Parse and type-check `src`.

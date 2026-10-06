@@ -5,7 +5,7 @@ use std::fmt;
 use crate::denormal::FlushDenormals;
 use crate::format::OutSample;
 use crate::graph::{Graph, Input, Output};
-use crate::node::{Context, Inputs, Node, Port};
+use crate::node::{Context, Inputs, Node, Outputs, Port};
 
 /// What the host promises the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +38,12 @@ pub enum BuildError {
     },
     /// An input refers to a node that is not in this graph.
     UnknownNode(usize),
+    /// An input refers to an output channel the node does not have.
+    UnknownChannel {
+        node: &'static str,
+        channel: usize,
+        outputs: usize,
+    },
     /// `out_channels` got a different number of streams than the engine has.
     ChannelMismatch {
         expected: usize,
@@ -57,6 +63,14 @@ impl fmt::Display for BuildError {
                 got,
             } => write!(f, "`{node}` takes {expected} input(s) but was given {got}"),
             BuildError::UnknownNode(i) => write!(f, "input refers to unknown node #{i}"),
+            BuildError::UnknownChannel {
+                node,
+                channel,
+                outputs,
+            } => write!(
+                f,
+                "input refers to channel {channel} of `{node}`, which has {outputs} output(s)"
+            ),
             BuildError::ChannelMismatch { expected, got } => {
                 write!(
                     f,
@@ -86,7 +100,8 @@ pub struct Engine {
     /// `ports[port_ranges[i].0..port_ranges[i].1]` are node `i`'s inputs.
     port_ranges: Vec<(usize, usize)>,
     ports: Vec<Port>,
-    /// One block-sized buffer per node, same order as `nodes`.
+    /// One buffer per node, same order as `nodes`, holding each output
+    /// channel at a stride of `max_frames`.
     buffers: Vec<Box<[f32]>>,
     /// Source for each output channel.
     outputs: Vec<Port>,
@@ -118,13 +133,20 @@ impl Engine {
                     got: entry.inputs.len(),
                 });
             }
-            for input in &entry.inputs {
-                if let Input::Node(id) = input
-                    && id.0 >= entries.len()
-                {
-                    return Err(BuildError::UnknownNode(id.0));
-                }
+        }
+        let check_port = |input: &Input| match *input {
+            Input::Port(id, _) if id.0 >= entries.len() => Err(BuildError::UnknownNode(id.0)),
+            Input::Port(id, channel) if channel >= entries[id.0].node.outputs() => {
+                Err(BuildError::UnknownChannel {
+                    node: entries[id.0].node.name(),
+                    channel,
+                    outputs: entries[id.0].node.outputs(),
+                })
             }
+            _ => Ok(()),
+        };
+        for entry in &entries {
+            entry.inputs.iter().try_for_each(check_port)?;
         }
 
         let outputs: Vec<Input> = match output {
@@ -140,13 +162,7 @@ impl Engine {
                 chs
             }
         };
-        for input in &outputs {
-            if let Input::Node(id) = input
-                && id.0 >= entries.len()
-            {
-                return Err(BuildError::UnknownNode(id.0));
-            }
-        }
+        outputs.iter().try_for_each(check_port)?;
 
         let order = schedule(&entries, &outputs)?;
 
@@ -157,7 +173,10 @@ impl Engine {
         }
         let resolve = |input: &Input| match *input {
             Input::Const(v) => Port::Const(v),
-            Input::Node(id) => Port::Buffer(slot[id.0]),
+            Input::Port(id, channel) => Port::Buffer {
+                node: slot[id.0],
+                offset: channel * config.max_frames,
+            },
         };
 
         let mut ports = Vec::new();
@@ -175,8 +194,9 @@ impl Engine {
             .map(|&i| entries[i].take().expect("scheduled twice").node)
             .collect::<Vec<_>>();
 
-        let buffers = (0..nodes.len())
-            .map(|_| vec![0.0; config.max_frames].into_boxed_slice())
+        let buffers = nodes
+            .iter()
+            .map(|n| vec![0.0; n.outputs() * config.max_frames].into_boxed_slice())
             .collect();
 
         Ok(Engine {
@@ -208,7 +228,7 @@ impl Engine {
     /// host can size its arena from it.
     pub fn memory_bytes(&self) -> usize {
         use std::mem::size_of;
-        let buffers = self.buffers.len() * self.config.max_frames * size_of::<f32>();
+        let buffers: usize = self.buffers.iter().map(|b| size_of_val(&**b)).sum();
         let state: usize = self.nodes.iter().map(|n| size_of_val(&**n)).sum();
         let wiring = self.ports.len() * size_of::<Port>()
             + self.port_ranges.len() * size_of::<(usize, usize)>()
@@ -243,7 +263,9 @@ impl Engine {
                 let dst = &mut channel[done..done + n];
                 match *port {
                     Port::Const(v) => dst.fill(v),
-                    Port::Buffer(b) => dst.copy_from_slice(&self.buffers[b][..n]),
+                    Port::Buffer { node, offset } => {
+                        dst.copy_from_slice(&self.buffers[node][offset..offset + n])
+                    }
                 }
             }
             done += n;
@@ -277,9 +299,9 @@ impl Engine {
                             frame[c] = v;
                         }
                     }
-                    Port::Buffer(b) => {
-                        for (frame, &x) in dst.chunks_exact_mut(channels).zip(&self.buffers[b][..n])
-                        {
+                    Port::Buffer { node, offset } => {
+                        let src = &self.buffers[node][offset..offset + n];
+                        for (frame, &x) in dst.chunks_exact_mut(channels).zip(src) {
                             frame[c] = convert(x);
                         }
                     }
@@ -307,7 +329,12 @@ impl Engine {
                 buffers: &self.buffers,
                 frames: n,
             };
-            node.process(&ctx, &inputs, &mut out[..n]);
+            let mut outputs = Outputs {
+                buf: &mut out,
+                stride: self.config.max_frames,
+                frames: n,
+            };
+            node.process(&ctx, &inputs, &mut outputs);
             self.buffers[i] = out;
         }
         self.position += n as u64;
@@ -331,7 +358,9 @@ fn schedule(entries: &[crate::graph::Entry], outputs: &[Input]) -> Result<Vec<us
     let mut stack: Vec<(usize, usize)> = Vec::new();
 
     for root in outputs {
-        let Input::Node(root) = *root else { continue };
+        let Input::Port(root, _) = *root else {
+            continue;
+        };
         if mark[root.0] != Mark::New {
             continue;
         }
@@ -349,7 +378,7 @@ fn schedule(entries: &[crate::graph::Entry], outputs: &[Input]) -> Result<Vec<us
             }
             let input = inputs[top.1];
             top.1 += 1;
-            let Input::Node(dep) = input else { continue };
+            let Input::Port(dep, _) = input else { continue };
             match mark[dep.0] {
                 Mark::Done => {}
                 Mark::New => {
@@ -448,6 +477,21 @@ mod tests {
         assert_eq!(
             Engine::new(g, config(1)).err(),
             Some(BuildError::Cycle(vec!["gain"]))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_output_channels() {
+        let mut g = Graph::new();
+        let s = g.sine(440.0);
+        g.out(s.channel(1));
+        assert_eq!(
+            Engine::new(g, config(1)).err(),
+            Some(BuildError::UnknownChannel {
+                node: "sine",
+                channel: 1,
+                outputs: 1
+            })
         );
     }
 

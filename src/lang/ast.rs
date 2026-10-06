@@ -1,0 +1,213 @@
+//! Syntax tree produced by the parser.
+
+use super::diag::Span;
+use super::lexer::Unit;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Program {
+    pub items: Vec<Item>,
+    /// Number of expressions; every [`Expr::id`] is below this.
+    pub expr_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Item {
+    Fn(Def),
+    Rill(Def),
+    /// A top-level statement that builds the graph.
+    Stmt(Stmt),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ident {
+    pub name: String,
+    pub span: Span,
+}
+
+/// A `fn` or `rill` definition. Which one is recorded by the [`Item`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Def {
+    pub name: Ident,
+    /// Compile-time size parameters, as in `mix_down<N>`.
+    pub generics: Vec<Ident>,
+    pub params: Vec<Param>,
+    pub ret: TypeExpr,
+    /// `@ rate / 2`. Only meaningful on rills.
+    pub rate: Option<RateSpec>,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Param {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub default: Option<Expr>,
+}
+
+/// Output rate relative to the input rate: `rate * num / den`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateSpec {
+    pub num: u32,
+    pub den: u32,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypeExpr {
+    Named(Ident),
+    /// `[elem; size]`
+    Frame {
+        elem: Box<TypeExpr>,
+        size: SizeExpr,
+        span: Span,
+    },
+}
+
+impl TypeExpr {
+    pub fn span(&self) -> Span {
+        match self {
+            TypeExpr::Named(id) => id.span,
+            TypeExpr::Frame { span, .. } => *span,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SizeExpr {
+    Lit(u32, Span),
+    Var(Ident),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Block {
+    pub stmts: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stmt {
+    Let {
+        name: Ident,
+        ty: Option<TypeExpr>,
+        value: Expr,
+        span: Span,
+    },
+    State {
+        name: Ident,
+        ty: Option<TypeExpr>,
+        init: Expr,
+        span: Span,
+    },
+    Assign {
+        target: Ident,
+        value: Expr,
+        span: Span,
+    },
+    Return {
+        value: Expr,
+        span: Span,
+    },
+    Expr(Expr),
+}
+
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. }
+            | Stmt::State { span, .. }
+            | Stmt::Assign { span, .. }
+            | Stmt::Return { span, .. } => *span,
+            Stmt::Expr(e) => e.span,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Expr {
+    /// Dense index, unique within a [`Program`]. The checker records each
+    /// expression's type under it.
+    pub id: u32,
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExprKind {
+    Number {
+        value: f64,
+        unit: Option<Unit>,
+        integral: bool,
+    },
+    Bool(bool),
+    Name(String),
+    Unary(UnOp, Box<Expr>),
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    /// `f(a, b: c)`. `x |> f(a)` is sugar for `f(x, a)` and parses to this
+    /// with `piped` set.
+    Call {
+        callee: Ident,
+        args: Vec<Arg>,
+        piped: bool,
+    },
+    If {
+        cond: Box<Expr>,
+        then: Block,
+        /// Either a [`ExprKind::Block`] or, for `else if`, an [`ExprKind::If`].
+        els: Option<Box<Expr>>,
+    },
+    Block(Block),
+    /// `[a, b]`
+    Frame(Vec<Expr>),
+    Index(Box<Expr>, Box<Expr>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arg {
+    pub name: Option<Ident>,
+    pub value: Expr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Neg,
+    Plus,
+    Not,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    And,
+    Or,
+}
+
+impl BinOp {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Rem => "%",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::And => "&&",
+            BinOp::Or => "||",
+        }
+    }
+}

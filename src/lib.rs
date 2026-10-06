@@ -11,6 +11,7 @@ pub mod device;
 pub mod engine;
 pub mod format;
 pub mod graph;
+pub mod lang;
 pub mod node;
 pub mod nodes;
 pub mod offline;

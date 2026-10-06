@@ -1,0 +1,34 @@
+// Channel lifting: `peak` takes one sample, so applied to a stereo frame it
+// runs one independent copy per channel.
+
+rill sine(freq: Hz) -> sample {
+    state phase: f32 = 0
+    phase = wrap(phase + freq / RATE)
+    return sin(phase * TAU)
+}
+
+rill peak(x: sample, release: Time = 300ms) -> sample {
+    state level: sample = 0
+    let a = abs(x)
+    level = if a > level { a } else { level * decay(release) }
+    return level
+}
+
+// Equal-power pan of a mono signal into a stereo frame.
+fn pan(x: sample, position: f32) -> [sample; 2] {
+    let angle = (position + 1) * PI / 4
+    return [x * cos(angle), x * sin(angle)]
+}
+
+rill mix_down<N>(x: [sample; N]) -> [sample; 1] {
+    return [sum(x) / N]
+}
+
+let pair = [sine(220Hz), sine(330Hz)] * 0.25
+
+// One envelope follower per channel: `[sample; 2]`.
+let env = pair
+    |> peak(release: 50ms)
+
+let ducked = pair * (1 - env)
+out(pan(mix_down(ducked)[0], -0.5))

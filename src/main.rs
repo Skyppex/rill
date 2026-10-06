@@ -60,6 +60,14 @@ enum Command {
     /// List audio hosts and output devices.
     #[cfg(feature = "device")]
     Devices,
+    /// Parse and type-check a Rill source file.
+    Check {
+        /// Source file.
+        file: PathBuf,
+        /// Print the signature of every fn and rill.
+        #[arg(long)]
+        signatures: bool,
+    },
     /// Render a patch to a WAV file through a simulated audio callback.
     Render {
         /// Output file.
@@ -139,6 +147,36 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("{host}");
                 for device in devices {
                     println!("  {device}");
+                }
+            }
+        }
+        Command::Check { file, signatures } => {
+            let src = std::fs::read_to_string(&file)
+                .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+            let name = file.display().to_string();
+            match rill::lang::compile(&src) {
+                Ok((_, checked)) => {
+                    for w in &checked.warnings {
+                        eprint!("{}", w.render(&name, &src));
+                    }
+                    if signatures {
+                        for sig in &checked.signatures {
+                            println!("{sig}");
+                        }
+                    }
+                    let count = |k| checked.signatures.iter().filter(|s| s.kind == k).count();
+                    println!(
+                        "{name}: ok ({} fn, {} rill)",
+                        count(rill::lang::types::DefKind::Fn),
+                        count(rill::lang::types::DefKind::Rill)
+                    );
+                }
+                Err(diags) => {
+                    for d in &diags {
+                        eprint!("{}", d.render(&name, &src));
+                    }
+                    let errors = diags.iter().filter(|d| d.is_error()).count();
+                    return Err(format!("{name}: {errors} error(s)").into());
                 }
             }
         }

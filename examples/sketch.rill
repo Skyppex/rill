@@ -1,0 +1,41 @@
+// The syntax sketch from design/design.md, filled in where it said `...`.
+
+// Pure function on one value. Auto-lifted over streams and channels.
+fn abs(x: sample) -> sample {
+    if x < 0 { -x } else { x }
+}
+
+// Stateful 1:1 rill. Body runs once per tick.
+rill peak(x: sample, release: Time = 300ms) -> sample {
+    state level: sample = 0
+    let a = abs(x)
+    level = if a > level { a } else { level * decay(release) }
+    return level
+}
+
+// Composition with pipes.
+rill meter(x: sample) -> sample {
+    return x |> abs |> peak
+}
+
+// Generic over channel count. Only needed when a rill works ACROSS channels.
+rill mix_down<N>(x: [sample; N]) -> [sample; 1] {
+    return [sum(x) / N]
+}
+
+// Rate-changing rill: the ratio is part of the signature.
+rill decimate(x: sample) -> sample @ rate / 2 {
+    return x
+}
+
+// Generator: no audio input.
+rill sine(freq: Hz) -> sample {
+    state phase: f32 = 0
+    phase = wrap(phase + freq / RATE)
+    return sin(phase * TAU)
+}
+
+// Top level: build the graph and send it to the device.
+let lfo   = sine(0.5Hz) * 20Hz + 440Hz
+let voice = sine(lfo) * 0.3
+out(voice)

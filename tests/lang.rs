@@ -1,6 +1,6 @@
 //! Parser and type checker, through the public `rill::lang` API.
 
-use rill::lang::ast::{BinOp, ExprKind, Item, Stmt};
+use rill::lang::ast::{BinOp, ExprKind, Program, Stmt};
 use rill::lang::types::{Size, Type};
 use rill::lang::{self, Diagnostic};
 
@@ -20,6 +20,22 @@ rill mix_down<N>(x: [sample; N]) -> [sample; 1] {
     return [sum(x) / N]
 }
 ";
+
+/// `stmts` as the body of a `rill main`.
+fn body(stmts: &str) -> String {
+    format!("rill main() -> sample {{\n{stmts}\nreturn 0\n}}")
+}
+
+/// [`SINE`] plus `stmts` in a `rill main`.
+fn with_sine(stmts: &str) -> String {
+    format!("{SINE}\n{}", body(stmts))
+}
+
+/// The statements of `stmts` parsed as a rill body.
+fn parse_body(stmts: &str) -> Result<Vec<Stmt>, Vec<Diagnostic>> {
+    let program = lang::parse(&format!("rill main() -> sample {{\n{stmts}\n}}"))?;
+    Ok(program.items[0].def().body.stmts.clone())
+}
 
 fn diagnostics(src: &str) -> Vec<Diagnostic> {
     match lang::compile(src) {
@@ -54,21 +70,36 @@ fn assert_ok(src: &str) {
     }
 }
 
-/// Type of the top-level `let name = ...`.
-fn type_of(src: &str, name: &str) -> Type {
-    let (program, checked) = lang::compile(src).unwrap_or_else(|d| panic!("{d:#?}"));
+/// The `let name = ...` at the top of some definition's body.
+fn find_let<'p>(program: &'p Program, name: &str) -> &'p rill::lang::ast::Expr {
     for item in &program.items {
-        if let Item::Stmt(Stmt::Let { name: n, value, .. }) = item
-            && n.name == name
-        {
-            return checked.types[value.id as usize].clone();
+        for s in &item.def().body.stmts {
+            if let Stmt::Let { name: n, value, .. } = s
+                && n.name == name
+            {
+                return value;
+            }
         }
     }
-    panic!("no top-level let `{name}`");
+    panic!("no `let {name}`");
+}
+
+/// Type of `let name = ...` in `src`.
+fn type_of(src: &str, name: &str) -> Type {
+    let (program, checked) = lang::compile(src).unwrap_or_else(|d| panic!("{d:#?}"));
+    checked.types[find_let(&program, name).id as usize].clone()
 }
 
 fn frame(t: Type, n: u32) -> Type {
     Type::Frame(Box::new(t), Size::Const(n))
+}
+
+/// The errors from checking `src` as a program that starts at `entry`.
+fn entry_errors(src: &str, entry: &str) -> Vec<(String, Option<String>)> {
+    match lang::compile_entry(src, entry) {
+        Ok(_) => Vec::new(),
+        Err(diags) => diags.into_iter().map(|d| (d.message, d.help)).collect(),
+    }
 }
 
 // ---- examples -----------------------------------------------------------
@@ -81,7 +112,7 @@ fn examples_check_cleanly() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "rill") {
             let src = std::fs::read_to_string(&path).unwrap();
-            match lang::compile(&src) {
+            match lang::compile_entry(&src, "main") {
                 Ok((_, checked)) => assert!(
                     checked.warnings.is_empty(),
                     "{path:?}: {:?}",
@@ -100,10 +131,8 @@ fn examples_check_cleanly() {
 }
 
 #[test]
-fn design_doc_graph_types() {
-    let src = format!(
-        "{SINE}\nlet lfo = sine(0.5Hz) * 20Hz + 440Hz\nlet voice = sine(lfo) * 0.3\nout(voice)"
-    );
+fn design_doc_types() {
+    let src = with_sine("let lfo = sine(0.5Hz) * 20Hz + 440Hz\nlet voice = sine(lfo) * 0.3");
     assert_eq!(type_of(&src, "lfo"), Type::Hz);
     assert_eq!(type_of(&src, "voice"), Type::Sample);
 }
@@ -111,12 +140,20 @@ fn design_doc_graph_types() {
 // ---- parsing ------------------------------------------------------------
 
 #[test]
+fn programs_are_only_definitions() {
+    let errs = lang::parse("let x = 1").unwrap_err();
+    assert_eq!(errs[0].message, "expected `fn` or `rill`, found `let`");
+    assert_eq!(
+        errs[0].help.as_deref(),
+        Some("statements must be inside a rill; the program starts at `rill main`")
+    );
+}
+
+#[test]
 fn pipes_desugar_to_calls() {
-    let src = format!("{SINE}\nlet x = sine(1Hz) |> peak(release: 10ms) |> abs");
+    let src = with_sine("let x = sine(1Hz) |> peak(release: 10ms) |> abs");
     let (program, _) = lang::compile(&src).unwrap();
-    let Some(Item::Stmt(Stmt::Let { value, .. })) = program.items.last() else {
-        panic!()
-    };
+    let value = find_let(&program, "x");
     let ExprKind::Call {
         callee,
         args,
@@ -142,8 +179,8 @@ fn pipes_desugar_to_calls() {
 
 #[test]
 fn precedence() {
-    let program = lang::parse("let x = 1 + 2 * 3 < 4 && true").unwrap();
-    let Item::Stmt(Stmt::Let { value, .. }) = &program.items[0] else {
+    let stmts = parse_body("let x = 1 + 2 * 3 < 4 && true").unwrap();
+    let Stmt::Let { value, .. } = &stmts[0] else {
         panic!()
     };
     let ExprKind::Binary(BinOp::And, cmp, _) = &value.kind else {
@@ -161,16 +198,15 @@ fn precedence() {
 #[test]
 fn line_breaks_end_statements() {
     // A `-` at the start of a line begins a new statement...
-    let program = lang::parse("let a = 1\n-2").unwrap();
-    assert_eq!(program.items.len(), 2);
+    assert_eq!(parse_body("let a = 1\n-2").unwrap().len(), 2);
     // ...but not inside brackets, and `|>` always continues.
-    let program = lang::parse("let a = (1\n- 2)\nlet b = a\n  |> f\n  |> g").unwrap();
-    assert_eq!(program.items.len(), 2);
+    let stmts = parse_body("let a = (1\n- 2)\nlet b = a\n  |> f\n  |> g").unwrap();
+    assert_eq!(stmts.len(), 2);
     // `else` may start a line.
-    lang::parse("let a = if true { 1 }\nelse { 2 }").unwrap();
+    parse_body("let a = if true { 1 }\nelse { 2 }").unwrap();
     // Two statements on one line need a `;`.
-    lang::parse("let a = 1; let b = 2").unwrap();
-    let errs = lang::parse("let a = 1 let b = 2").unwrap_err();
+    parse_body("let a = 1; let b = 2").unwrap();
+    let errs = parse_body("let a = 1 let b = 2").unwrap_err();
     assert_eq!(
         errs[0].message,
         "expected a line break or `;` after the statement, found `let`"
@@ -191,7 +227,7 @@ fn parse_errors_point_at_the_problem() {
     );
 
     assert_eq!(
-        lang::parse("let x = a < b < c").unwrap_err()[0].message,
+        parse_body("let x = a < b < c").unwrap_err()[0].message,
         "comparisons cannot be chained"
     );
     assert_eq!(
@@ -199,7 +235,7 @@ fn parse_errors_point_at_the_problem() {
         "this `{` is never closed"
     );
     assert_eq!(
-        lang::parse("let x = 1 |> 2").unwrap_err()[0].message,
+        parse_body("let x = 1 |> 2").unwrap_err()[0].message,
         "expected a name after `|>`, found `2`"
     );
 }
@@ -217,7 +253,8 @@ fn parser_recovers_at_the_next_definition() {
 
 #[test]
 fn unit_arithmetic() {
-    let src = "
+    let src = body(
+        "
         let a = 440Hz * 2
         let b = 440Hz / 2Hz
         let c = 1 / 1kHz
@@ -225,26 +262,27 @@ fn unit_arithmetic() {
         let e = 300ms + 2s
         let f = [1Hz, 2Hz] * 3
         let g = 7st + 50cents
-    ";
-    assert_eq!(type_of(src, "a"), Type::Hz);
-    assert_eq!(type_of(src, "b"), Type::F32);
-    assert_eq!(type_of(src, "c"), Type::Time);
-    assert_eq!(type_of(src, "d"), Type::F32);
-    assert_eq!(type_of(src, "e"), Type::Time);
-    assert_eq!(type_of(src, "f"), frame(Type::Hz, 2));
-    assert_eq!(type_of(src, "g"), Type::Interval);
+    ",
+    );
+    assert_eq!(type_of(&src, "a"), Type::Hz);
+    assert_eq!(type_of(&src, "b"), Type::F32);
+    assert_eq!(type_of(&src, "c"), Type::Time);
+    assert_eq!(type_of(&src, "d"), Type::F32);
+    assert_eq!(type_of(&src, "e"), Type::Time);
+    assert_eq!(type_of(&src, "f"), frame(Type::Hz, 2));
+    assert_eq!(type_of(&src, "g"), Type::Interval);
 }
 
 #[test]
 fn units_do_not_mix_with_plain_numbers() {
-    let (msg, help) = error("let x = 440Hz + 3");
+    let (msg, help) = error(&body("let x = 440Hz + 3"));
     assert_eq!(msg, "cannot add `Hz` and `number`");
     assert_eq!(
         help.as_deref(),
         Some("give the number a unit, as in `440Hz`")
     );
 
-    let (msg, help) = error(&format!("{SINE}\nlet x = sine(440)"));
+    let (msg, help) = error(&with_sine("let x = sine(440)"));
     assert_eq!(
         msg,
         "argument `freq` of `sine` expects `Hz`, found `number`"
@@ -254,15 +292,18 @@ fn units_do_not_mix_with_plain_numbers() {
         Some("give the number a unit, as in `440Hz`")
     );
 
-    assert_eq!(error("let x = 1Hz + 1s").0, "cannot add `Hz` and `Time`");
-    let (msg, help) = error(&format!("{SINE}\nlet x = sine(1Hz) * 20 + 440Hz"));
+    assert_eq!(
+        error(&body("let x = 1Hz + 1s")).0,
+        "cannot add `Hz` and `Time`"
+    );
+    let (msg, help) = error(&with_sine("let x = sine(1Hz) * 20 + 440Hz"));
     assert_eq!(msg, "cannot add `sample` and `Hz`");
     assert_eq!(
         help.as_deref(),
         Some("`sample` has no unit; multiplying by a `Hz` value gives it one, as in `x * 440Hz`")
     );
     assert_eq!(
-        error("let x = 1Hz < 3").0,
+        error(&body("let x = 1Hz < 3")).0,
         "cannot compare `Hz` and `number` with `<`"
     );
 }
@@ -271,15 +312,15 @@ fn units_do_not_mix_with_plain_numbers() {
 
 #[test]
 fn rills_lift_over_channels() {
-    let src = format!(
-        "{SINE}
+    let src = with_sine(
+        "
         let st = [sine(1Hz), sine(2Hz)]
         let p = peak(st)
         let piped = st |> peak
         let both = peak(st, release: 10ms)
         let m = mix_down([sine(1Hz), sine(2Hz), sine(3Hz)])
         let one = st[1]
-        let builtin = abs(st)"
+        let scaled = st * 2",
     );
     assert_eq!(type_of(&src, "st"), frame(Type::Sample, 2));
     assert_eq!(type_of(&src, "p"), frame(Type::Sample, 2));
@@ -287,46 +328,69 @@ fn rills_lift_over_channels() {
     assert_eq!(type_of(&src, "both"), frame(Type::Sample, 2));
     assert_eq!(type_of(&src, "m"), frame(Type::Sample, 1));
     assert_eq!(type_of(&src, "one"), Type::Sample);
-    assert_eq!(type_of(&src, "builtin"), frame(Type::Sample, 2));
+    assert_eq!(type_of(&src, "scaled"), frame(Type::Sample, 2));
+}
+
+#[test]
+fn fns_and_builtins_do_not_lift() {
+    let src = "
+        fn double(x: sample) -> sample { x * 2 }
+        rill main() -> sample { return double([1, 2])[0] }
+    ";
+    let (msg, help) = error(src);
+    assert_eq!(msg, "`double` takes one value, not a frame (`[number; 2]`)");
+    assert!(help.unwrap().contains("fn double<N>(x: [sample; N])"));
+
+    let (msg, help) = error(&body("let x = abs([1, -2])"));
+    assert_eq!(msg, "`abs` takes one value, not a frame (`[number; 2]`)");
+    assert!(
+        help.unwrap()
+            .starts_with("built-in functions take one value")
+    );
+
+    // Saying so with a size parameter works.
+    let src = "
+        fn double<N>(x: [sample; N]) -> [sample; N] { x * 2 }
+        rill main() -> sample {
+            let d = double([1, 2])
+            return d[0]
+        }
+    ";
+    assert_eq!(type_of(src, "d"), frame(Type::Sample, 2));
 }
 
 #[test]
 fn lifting_needs_matching_channel_counts() {
     let src = "
-        fn mix(a: sample, b: sample) -> sample { a + b }
-        let x = mix([1, 2], [3, 4, 5])
+        rill mix(a: sample, b: sample) -> sample { return a + b }
+        rill main() -> sample { return mix([1, 2], [3, 4, 5])[0] }
     ";
     assert_eq!(
         error(src).0,
         "channel counts differ: this has 3 channels, an earlier argument has 2"
     );
     assert_eq!(
-        error("let x = [1, 2] + [1, 2, 3]").0,
+        error(&body("let x = [1, 2] + [1, 2, 3]")).0,
         "channel counts differ: `[number; 2]` and `[number; 3]`"
     );
     assert_eq!(
-        error("let x = [1, 2][2]").0,
+        error(&body("let x = [1, 2][2]")).0,
         "channel 2 is out of range for a frame of 2"
     );
     assert_eq!(
-        error("let x = [1, 2Hz]").0,
+        error(&body("let x = [1, 2Hz]")).0,
         "frame channels have different types: `number` and `Hz`"
     );
 }
 
 #[test]
 fn generic_sizes_are_inferred() {
-    let src = "
-        rill swap<N>(a: [sample; N], b: [sample; N]) -> [sample; N] { return b }
-        let x = swap([1, 2], [3, 4])
-    ";
-    assert_eq!(type_of(src, "x"), frame(Type::Sample, 2));
-    let src = "
-        rill swap<N>(a: [sample; N], b: [sample; N]) -> [sample; N] { return b }
-        let x = swap([1, 2], [3, 4, 5])
-    ";
+    let swap = "rill swap<N>(a: [sample; N], b: [sample; N]) -> [sample; N] { return b }";
+    let src = format!("{swap}\n{}", body("let x = swap([1, 2], [3, 4])"));
+    assert_eq!(type_of(&src, "x"), frame(Type::Sample, 2));
+    let src = format!("{swap}\n{}", body("let x = swap([1, 2], [3, 4, 5])"));
     assert_eq!(
-        error(src).0,
+        error(&src).0,
         "argument `b` of `swap` expects `[sample; 2]`, found `[number; 3]`"
     );
     assert_eq!(
@@ -364,10 +428,6 @@ fn state_rules() {
     assert_eq!(msg, "`state` is only allowed in rills");
     assert!(help.unwrap().contains("make this a rill"));
 
-    assert_eq!(
-        error("state s: sample = 0").0,
-        "`state` is only allowed in rills"
-    );
     assert_eq!(
         error("rill f(x: sample) -> sample { if x > 0 { state s: sample = 0 }\n return x }").0,
         "`state` must be declared at the top level of the rill body"
@@ -427,95 +487,145 @@ fn recursion_is_rejected() {
     );
 }
 
+// ---- the entry rill -----------------------------------------------------
+
 #[test]
-fn bodies_cannot_see_top_level_bindings() {
-    let (msg, _) = error("let g = 1\nfn f(x: sample) -> sample { x + g }");
-    assert_eq!(msg, "unknown name `g`");
+fn entry_rill_rules() {
+    assert!(
+        entry_errors(
+            "rill main(gain: sample = 0.5) -> sample { return gain }",
+            "main"
+        )
+        .is_empty()
+    );
+    assert!(entry_errors("rill main() -> [sample; 2] { return [0, 0] }", "main").is_empty());
+
+    assert_eq!(
+        entry_errors("fn f(x: sample) -> sample { x }", "main"),
+        [(
+            "there is no rill named `main` to run".to_owned(),
+            Some("add one, as in `rill main() -> sample { return 0 }`".to_owned())
+        )]
+    );
+    assert_eq!(
+        entry_errors("rill mian() -> sample { return 0 }", "main")[0]
+            .1
+            .as_deref(),
+        Some("did you mean `mian`?")
+    );
+    assert_eq!(
+        entry_errors(
+            "rill a() -> sample { return 0 }\nrill b() -> sample { return 0 }",
+            "main"
+        )[0]
+        .1
+        .as_deref(),
+        Some("pick one with `--entry`: a, b")
+    );
+    assert!(entry_errors("rill other() -> sample { return 0 }", "other").is_empty());
+
+    let messages = |src: &str| -> Vec<String> {
+        entry_errors(src, "main")
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect()
+    };
+    assert_eq!(
+        messages("fn main() -> sample { 0 }"),
+        ["`main` is a fn, but the program must start at a rill"]
+    );
+    assert_eq!(
+        messages("rill main<N>(x: [sample; N]) -> sample { return 0 }"),
+        [
+            "the entry rill cannot have size parameters",
+            "`x` needs a default value"
+        ]
+    );
+    assert_eq!(
+        messages("rill main(freq: Hz) -> sample { return 0 }"),
+        ["`freq` needs a default value"]
+    );
+    assert_eq!(
+        messages("rill main() -> sample @ rate / 2 { return 0 }"),
+        ["the entry rill cannot change the sample rate"]
+    );
+    assert_eq!(
+        messages("rill main() -> Hz { return 1Hz }"),
+        ["the entry rill must return audio (`sample` or `[sample; N]`), found `Hz`"]
+    );
 }
 
 // ---- calls and names ----------------------------------------------------
 
 #[test]
 fn argument_checking() {
-    let p = |rest: &str| format!("{SINE}\n{rest}");
     assert_eq!(
-        error(&p("let x = sine()")).0,
+        error(&with_sine("let x = sine()")).0,
         "missing argument `freq` for `sine`"
     );
     assert_eq!(
-        error(&p("let x = sine(1Hz, 2Hz)")).0,
+        error(&with_sine("let x = sine(1Hz, 2Hz)")).0,
         "`sine` takes 1 argument(s), but 2 were given"
     );
-    let (msg, help) = error(&p("let x = peak(1, relase: 1s)"));
+    let (msg, help) = error(&with_sine("let x = peak(1, relase: 1s)"));
     assert_eq!(msg, "`peak` has no parameter `relase`");
     assert_eq!(help.as_deref(), Some("did you mean `release`?"));
     assert_eq!(
-        error(&p("let x = peak(1, x: 1)")).0,
+        error(&with_sine("let x = peak(1, x: 1)")).0,
         "argument `x` is given more than once"
     );
     assert_eq!(
-        error(&p("let x = peak(release: 1s, 1)")).0,
+        error(&with_sine("let x = peak(release: 1s, 1)")).0,
         "positional arguments must come before named ones"
     );
-    assert_ok(&p("let x = peak(release: 1s, x: 1)"));
+    assert_ok(&with_sine("let x = peak(release: 1s, x: 1)"));
     assert_eq!(
-        error("let x = min(1, 2, 3)").0,
+        error(&body("let x = min(1, 2, 3)")).0,
         "`min` takes 1 or 2 argument(s), but 3 were given"
     );
     assert_eq!(
-        error("let x = sin(1Hz)").0,
+        error(&body("let x = sin(1Hz)")).0,
         "argument `x` of `sin` must be a plain number (`sample`, `f32` or `i32`), found `Hz`"
     );
 }
 
 #[test]
 fn names_and_suggestions() {
-    let (msg, help) = error(&format!("{SINE}\nlet x = sien(1Hz)"));
+    let (msg, help) = error(&with_sine("let x = sien(1Hz)"));
     assert_eq!(msg, "unknown fn or rill `sien`");
     assert_eq!(help.as_deref(), Some("did you mean `sine`?"));
 
-    let (msg, help) = error("let level = 1\nlet x = levl * 2");
+    let (msg, help) = error(&body("let level = 1\nlet x = levl * 2"));
     assert_eq!(msg, "unknown name `levl`");
     assert_eq!(help.as_deref(), Some("did you mean `level`?"));
 
     assert_eq!(
-        error(&format!("{SINE}\nlet x = sine")).0,
+        error(&with_sine("let x = sine")).0,
         "`sine` is a rill and must be called"
     );
     assert_eq!(
-        error("let a = 1\nlet x = a(2)").0,
+        error(&body("let a = 1\nlet x = a(2)")).0,
         "`a` is a value of type `number`, not a fn or rill"
     );
     assert_eq!(
         error("fn f(x: sample) -> sample { x }\nfn f(x: sample) -> sample { x }").0,
         "`f` is defined more than once"
     );
-    assert_eq!(error("let x: Sample = 1").0, "unknown type `Sample`");
+    assert_eq!(error(&body("let x: Sample = 1")).0, "unknown type `Sample`");
 }
 
 #[test]
 fn user_definitions_shadow_builtins() {
     // The design doc defines its own `abs`.
-    assert_ok("fn abs(x: sample) -> sample { if x < 0 { -x } else { x } }\nlet y = abs(-1)");
+    assert_ok(&format!(
+        "fn abs(x: sample) -> sample {{ if x < 0 {{ -x }} else {{ x }} }}\n{}",
+        body("let y = abs(-1)")
+    ));
 }
 
 #[test]
-fn top_level_rules() {
-    assert_eq!(
-        error("return 1").0,
-        "`return` is only allowed in fn and rill bodies"
-    );
-    assert_eq!(
-        error("rill f(x: sample) -> sample { out(x)\n return x }").0,
-        "`out` can only be used at the top level"
-    );
-    assert_eq!(
-        error("out(440Hz)").0,
-        "argument `x` of `out` must be audio (`sample` or a frame of samples), found `Hz`"
-    );
-    assert_ok("out([0.1, 0.2])");
-
-    let warnings = diagnostics(&format!("{SINE}\nsine(440Hz)"));
+fn unused_values_warn() {
+    let warnings = diagnostics(&with_sine("sine(440Hz)"));
     assert_eq!(warnings.len(), 1);
     assert!(!warnings[0].is_error());
     assert_eq!(warnings[0].message, "this value is never used");
@@ -523,16 +633,16 @@ fn top_level_rules() {
 
 #[test]
 fn conditions_and_branches() {
-    let (msg, help) = error("let x = if 1 { 2 } else { 3 }");
+    let (msg, help) = error(&body("let x = if 1 { 2 } else { 3 }"));
     assert_eq!(msg, "condition must be `bool`, found `number`");
     assert_eq!(help.as_deref(), Some("compare it, as in `x > 0`"));
     assert_eq!(
-        error("let x = if true { 1Hz } else { 1s }").0,
+        error(&body("let x = if true { 1Hz } else { 1s }")).0,
         "`if` and `else` have different types: `Hz` and `Time`"
     );
     assert_eq!(
         type_of(
-            "let x = if true { 1 } else if false { 2Hz / 1Hz } else { 3 }",
+            &body("let x = if true { 1 } else if false { 2Hz / 1Hz } else { 3 }"),
             "x"
         ),
         Type::F32
@@ -541,9 +651,11 @@ fn conditions_and_branches() {
 
 #[test]
 fn every_error_is_reported() {
-    let errs =
-        errors("let a = 1Hz + 1\nlet b = nope\nfn f(x: sample) -> sample { state s = 0\n x }");
-    assert_eq!(errs.len(), 3, "{errs:?}");
+    let src = format!(
+        "{}\nfn f(x: sample) -> sample {{ state s = 0\n x }}",
+        body("let a = 1Hz + 1\nlet b = nope")
+    );
+    assert_eq!(errors(&src).len(), 3, "{:?}", errors(&src));
 }
 
 #[test]
@@ -551,7 +663,7 @@ fn garbage_never_panics() {
     const PIECES: &[&str] = &[
         "rill", "fn", "state", "let", "return", "if", "else", "f", "x", "N", "sample", "Hz", "[",
         "]", "(", ")", "{", "}", "<", ">", ";", ":", ",", "->", "|>", "@", "rate", "=", "+", "-",
-        "*", "/", "==", "&&", "!", "1", "2.5", "440Hz", "3ms", "\n", " ", "sum", "out", "true",
+        "*", "/", "==", "&&", "!", "1", "2.5", "440Hz", "3ms", "\n", " ", "sum", "main", "true",
         "x[0]", "// c\n", "/* c */",
     ];
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -568,7 +680,7 @@ fn garbage_never_panics() {
             src.push_str(PIECES[(state % PIECES.len() as u64) as usize]);
             src.push(' ');
         }
-        if let Err(diags) = lang::compile(&src) {
+        if let Err(diags) = lang::compile_entry(&src, "main") {
             for d in diags {
                 d.render("fuzz.rill", &src);
             }

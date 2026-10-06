@@ -7,11 +7,17 @@
 //!         phase = wrap(phase + freq / RATE)
 //!         return sin(phase * TAU)
 //!     }
-//!     out(sine(440Hz) * 0.3)
+//!     rill main(freq: Hz = 440Hz) -> sample {
+//!         return sine(freq) * 0.3
+//!     }
 //! ";
 //! let (program, checked) = rill::lang::compile(src).unwrap();
 //! assert_eq!(checked.signatures[0].to_string(), "rill sine(freq: Hz) -> sample");
-//! # let _ = program;
+//!
+//! let config = rill::Config::default();
+//! let (graph, _warnings) = rill::lang::load(src, &config, "main").unwrap();
+//! let mut engine = rill::Engine::new(graph, config).unwrap();
+//! # let _ = (program, &mut engine);
 //! ```
 
 pub mod ast;
@@ -35,17 +41,24 @@ pub fn parse(src: &str) -> Result<ast::Program, Vec<Diagnostic>> {
     parser::parse(src, tokens)
 }
 
-/// Parse, check and build `src` into a graph for an engine with `config`.
+/// Parse, check and build `src` into a graph that runs the rill named
+/// `entry` (normally [`build::DEFAULT_ENTRY`]) on an engine with `config`.
 /// On success, also returns any warnings.
 pub fn load(
     src: &str,
     config: &crate::Config,
+    entry: &str,
 ) -> Result<(crate::Graph, Vec<Diagnostic>), Vec<Diagnostic>> {
     let (program, checked) = compile(src)?;
-    let built = build::build(&program, &checked, config)?;
-    let mut warnings = checked.warnings;
-    warnings.extend(built.warnings);
-    Ok((built.graph, warnings))
+    let graph = build::build(&program, &checked, config, entry)?;
+    Ok((graph, checked.warnings))
+}
+
+/// Parse and check `src`, including that `entry` can run as the program.
+pub fn compile_entry(src: &str, entry: &str) -> Result<(ast::Program, Checked), Vec<Diagnostic>> {
+    let (program, checked) = compile(src)?;
+    check::check_entry(&program, &checked, entry)?;
+    Ok((program, checked))
 }
 
 /// Parse and type-check `src`.

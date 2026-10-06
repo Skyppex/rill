@@ -87,7 +87,7 @@ fn compiled_rill_programs_do_not_allocate() {
             max_frames: 64,
             out_channels: 2,
         };
-        let (graph, _) = rill::lang::load(&src, &config).unwrap();
+        let (graph, _) = rill::lang::load(&src, &config, "main").unwrap();
         let mut engine = Engine::new(graph, config).unwrap();
         let mut out = vec![0.0f32; 2 * 1000];
         let count = allocations_during(|| {

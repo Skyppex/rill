@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! program := item*
-//! item    := "fn" def | "rill" def | stmt
+//! item    := "fn" def | "rill" def
 //! def     := NAME ("<" NAME ("," NAME)* ">")? "(" params ")" "->" type
 //!            ("@" "rate" (("*" | "/") INT)?)? block
 //! param   := NAME ":" type ("=" expr)?
@@ -169,7 +169,9 @@ impl Parser<'_> {
         if self.eat(TokenKind::Rill).is_some() {
             return Ok(Item::Rill(self.def("rill")?));
         }
-        Ok(Item::Stmt(self.stmt()?))
+        Err(self
+            .unexpected("`fn` or `rill`")
+            .with_help("statements must be inside a rill; the program starts at `rill main`"))
     }
 
     fn def(&mut self, keyword: &str) -> PResult<Def> {

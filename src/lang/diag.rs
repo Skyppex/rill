@@ -62,12 +62,28 @@ impl Diagnostic {
         self
     }
 
+    fn kind(&self) -> &'static str {
+        match self.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        }
+    }
+
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
     }
 
     /// Render rustc-style, with the offending line and a caret underline.
+    /// A diagnostic about the file as a whole ([`Span::default`]) gets no
+    /// snippet.
     pub fn render(&self, file: &str, src: &str) -> String {
+        if self.span == Span::default() {
+            let mut out = format!("{}: {}\n --> {file}\n", self.kind(), self.message);
+            if let Some(help) = &self.help {
+                let _ = writeln!(out, "  = help: {help}");
+            }
+            return out;
+        }
         let start = (self.span.start as usize).min(src.len());
         let end = (self.span.end as usize).clamp(start, src.len());
         let (line_no, col) = line_col(src, start);
@@ -77,10 +93,7 @@ impl Diagnostic {
 
         let width = src[start..end.min(line_end)].chars().count().max(1);
         let gutter = line_no.to_string().len();
-        let kind = match self.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-        };
+        let kind = self.kind();
 
         let mut out = String::new();
         let _ = writeln!(out, "{kind}: {}", self.message);
@@ -166,6 +179,16 @@ mod tests {
              2 | let b = fo(a)\n  \
              |         ^^\n  \
              = help: did you mean `foo`?\n"
+        );
+    }
+
+    #[test]
+    fn file_level_diagnostics_have_no_snippet() {
+        let d = Diagnostic::error(Span::default(), "there is no rill named `main` to run")
+            .with_help("add one");
+        assert_eq!(
+            d.render("x.rill", "fn f() -> sample { 0 }"),
+            "error: there is no rill named `main` to run\n --> x.rill\n  = help: add one\n"
         );
     }
 

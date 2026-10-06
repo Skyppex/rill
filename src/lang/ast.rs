@@ -10,12 +10,20 @@ pub struct Program {
     pub expr_count: u32,
 }
 
+/// A top-level definition. A program has no statements outside them; it
+/// runs by instantiating its entry rill (`main` by default).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     Fn(Def),
     Rill(Def),
-    /// A top-level statement that builds the graph.
-    Stmt(Stmt),
+}
+
+impl Item {
+    pub fn def(&self) -> &Def {
+        match self {
+            Item::Fn(d) | Item::Rill(d) => d,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

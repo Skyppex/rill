@@ -30,10 +30,10 @@ Design principles:
 
 ## Syntax sketch
 
-Three kinds of definitions: `fn` for pure functions on values, `rill` for stream processors with optional state, and top-level bindings that build the graph. All syntax here is provisional.
+Two kinds of definitions: `fn` for pure functions on values, and `rill` for stream processors with optional state. A file contains only definitions; running it instantiates its entry rill, `main` unless another is named, and plays what that rill returns. All syntax here is provisional.
 
 ```
-// Pure function on one value. Auto-lifted over streams and channels.
+// Pure function on one value. Takes exactly what it declares.
 fn abs(x: sample) -> sample {
     if x < 0 { -x } else { x }
 }
@@ -66,17 +66,20 @@ rill sine(freq: Hz) -> sample {
     return sin(phase * TAU)
 }
 
-// Top level: build the graph and send it to the device.
-let lfo   = sine(0.5Hz) * 20Hz + 440Hz
-let voice = sine(lfo) * 0.3
-out(voice)
+// Entry point: its return value goes to the device. Parameters need defaults;
+// they are the program's controls.
+rill main(depth: Hz = 20Hz) -> sample {
+    let lfo   = sine(0.5Hz) * depth + 440Hz
+    let voice = sine(lfo) * 0.3
+    return voice
+}
 ```
 
 Literals carry units: `440Hz`, `300ms`, `2s`, `+7st`, `+50cents`, `3/2`. Units convert to samples using the host rate at build time.
 
 ## Type system
 
-Types describe one tick's value; stream-ness comes from being inside a rill or a graph binding. The core types for v0.1:
+Types describe one tick's value; stream-ness comes from being inside a rill. Every value in a body is the current tick's. The core types for v0.1:
 
 | Type | Meaning | Notes |
 | --- | --- | --- |
@@ -88,8 +91,8 @@ Types describe one tick's value; stream-ness comes from being inside a rill or a
 
 Lifting rules:
 
-1. A `fn` taking `T` can be applied to a stream of `T`; it is mapped per tick.
-2. A rill taking `sample` can be applied to `[sample; N]`; it runs N independent copies, each with its own state.
+1. A `fn` takes exactly what it declares and never lifts. It is called from bodies, where values are already per tick; to accept channels it says so with a size parameter (`fn f<N>(x: [sample; N])`). Built-in functions follow the same rule.
+2. A rill taking `sample` can be applied to `[sample; N]`; it runs N independent copies, each with its own state. Every rill call is its own instance; `let` binds a value, so a bound result used twice is one instance.
 3. A constant can be passed wherever a stream of the same type is expected.
 4. Operators on frames are element-wise; `sum`, `max` and similar reduce across channels.
 
@@ -128,7 +131,7 @@ Rules:
 A Rill program runs in two stages: a build stage that may do anything, and a run stage that only executes a frozen graph inside the audio callback.
 
 1. **Parse and type-check** the source.
-2. **Build stage** (any thread): run top-level code, resolve pitches and units, expand chords and channel lifting, and produce a graph of nodes.
+2. **Build stage** (any thread): instantiate the entry rill with its parameter defaults, resolve pitches and units, inline every rill call (each call site gets its own state), expand chords and channel lifting, and produce a graph of nodes.
 3. **Optimize**: constant folding, specialization for constant parameters, control-rate inference, dead-node removal, buffer reuse via liveness analysis.
 4. **Freeze**: allocate every buffer and every `state` variable in one arena; topologically sort nodes.
 5. **Run stage** (audio thread): on each callback, pop due events, split the block at their sample offsets, run each node over its slice in order, write the final node into the host's output buffer.
@@ -159,7 +162,7 @@ rill_status  rill_load(rill_engine*, const char* src);     // build stage
 void         rill_render(rill_engine*,                      // run stage, real-time safe
                          const void* const* in, void* const* out,
                          uint32_t frames);
-void         rill_set_param(rill_engine*, const char* name, float value);
+void         rill_set_param(rill_engine*, const char* name, float value);  // a parameter of the entry rill
 void         rill_send_event(rill_engine*, uint32_t frame_offset, rill_event ev);
 void         rill_destroy(rill_engine*);
 ```
@@ -176,7 +179,7 @@ Open questions:
 - **Feedback in block processing.** Process cycles sample by sample, or fuse each cycle into one node that loops internally?
 - **Sequencing.** How notes and events over time fit beside streams: event streams, a scheduler API, or ChucK-style `=> now`.
 - **Block-level escape hatch.** Syntax for rills that need a whole buffer, such as FFT effects, and how they report latency.
-- **Sharing semantics.** Confirm that a bound stream used twice is one node, not two copies.
+- ~~**Sharing semantics.**~~ Settled: `let` binds a value, so a bound stream used twice is one instance; every call is a new instance.
 - **Time stretching.** Whether variable-rate rills are allowed on live input or only on stored buffers.
 
 ## Milestones

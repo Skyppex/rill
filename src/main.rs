@@ -19,6 +19,9 @@ struct SourceArgs {
     /// Rill source file to run.
     #[arg(required_unless_present = "patch", conflicts_with = "patch")]
     source: Option<PathBuf>,
+    /// Rill to start the program at.
+    #[arg(long, default_value = rill::lang::build::DEFAULT_ENTRY)]
+    entry: String,
     /// Run a built-in patch instead of a source file.
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(patches::NAMES))]
     patch: Option<String>,
@@ -49,7 +52,7 @@ impl SourceArgs {
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let name = path.display().to_string();
-        match rill::lang::load(&src, config) {
+        match rill::lang::load(&src, config, &self.entry) {
             Ok((graph, warnings)) => {
                 for w in &warnings {
                     eprint!("{}", w.render(&name, &src));
@@ -75,6 +78,9 @@ struct CheckArgs {
     /// Source file.
     #[arg(required = true)]
     file: Option<PathBuf>,
+    /// Rill the program starts at.
+    #[arg(long, default_value = rill::lang::build::DEFAULT_ENTRY)]
+    entry: String,
     /// Print the signature of every fn and rill.
     #[arg(long)]
     signatures: bool,
@@ -86,6 +92,9 @@ enum CheckView {
     Ast {
         /// Source file.
         file: PathBuf,
+        /// Rill the program starts at.
+        #[arg(long, default_value = rill::lang::build::DEFAULT_ENTRY)]
+        entry: String,
         /// Colour the tree. `auto` colours only when writing to a terminal
         /// and `NO_COLOR` is unset.
         #[arg(long, value_enum, default_value_t = Color::Auto)]
@@ -230,14 +239,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Check(args) => match args.view {
-            Some(CheckView::Ast { file, color }) => {
-                let (src, program, checked) = check_file(&file)?;
+            Some(CheckView::Ast { file, entry, color }) => {
+                let (src, program, checked) = check_file(&file, &entry)?;
                 let tree = rill::lang::pretty::tree(&src, &program, &checked, color.enabled());
                 print!("{tree}");
             }
             None => {
                 let file = args.file.expect("required by clap");
-                let (_, _, checked) = check_file(&file)?;
+                let (_, _, checked) = check_file(&file, &args.entry)?;
                 if args.signatures {
                     for sig in &checked.signatures {
                         println!("{sig}");
@@ -291,15 +300,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Parse and check `file`, printing diagnostics to stderr. Fails if there
-/// were any errors.
+/// Parse and check `file`, with `entry` as the rill it starts at, printing
+/// diagnostics to stderr. Fails if there were any errors.
 fn check_file(
     file: &std::path::Path,
+    entry: &str,
 ) -> Result<(String, rill::lang::ast::Program, rill::lang::Checked), Box<dyn std::error::Error>> {
     let src = std::fs::read_to_string(file)
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
     let name = file.display().to_string();
-    match rill::lang::compile(&src) {
+    match rill::lang::compile_entry(&src, entry) {
         Ok((program, checked)) => {
             for w in &checked.warnings {
                 eprint!("{}", w.render(&name, &src));

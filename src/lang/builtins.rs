@@ -4,7 +4,6 @@
 //!
 //! - `T`: a plain number (`sample`, `f32`, `i32` or a literal)
 //! - `S`: any number, with or without a unit
-//! - `A`: audio, i.e. `sample`/`f32` or a frame of them
 
 use super::types::{DefKind, ParamSig, Signature, Size, Type};
 
@@ -24,16 +23,9 @@ pub fn satisfies(param: &str, ty: &Type) -> bool {
     match param {
         "T" => ty.is_plain(),
         "S" => ty.is_plain() || ty.is_dimensioned(),
-        "A" => match ty {
-            Type::Frame(elem, _) => matches!(**elem, Type::Num | Type::Sample | Type::F32),
-            t => matches!(t, Type::Num | Type::Sample | Type::F32),
-        },
         _ => unreachable!("unknown builtin type parameter {param}"),
     }
 }
-
-/// Names that `out` and friends are restricted to.
-pub const TOP_LEVEL_ONLY: &[&str] = &["out"];
 
 /// All signatures named `name`, one per arity.
 pub fn lookup(name: &str) -> Vec<Signature> {
@@ -76,7 +68,6 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         "f32" => vec![sig(&[("x", t())], Type::F32)],
         "i32" => vec![sig(&[("x", t())], Type::I32)],
         "sample" => vec![sig(&[("x", t())], Type::Sample)],
-        "out" => vec![sig(&[("x", Type::Param("A"))], Type::Unit)],
         _ => Vec::new(),
     }
 }
@@ -84,7 +75,7 @@ pub fn lookup(name: &str) -> Vec<Signature> {
 /// Every built-in function name, for suggestions.
 pub const FUNCTIONS: &[&str] = &[
     "sin", "cos", "tan", "tanh", "exp", "log", "sqrt", "abs", "floor", "ceil", "round", "wrap",
-    "pow", "min", "max", "sum", "clamp", "decay", "f32", "i32", "sample", "out",
+    "pow", "min", "max", "sum", "clamp", "decay", "f32", "i32", "sample",
 ];
 
 #[cfg(test)]

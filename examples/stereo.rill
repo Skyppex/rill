@@ -24,11 +24,14 @@ rill mix_down<N>(x: [sample; N]) -> [sample; 1] {
     return [sum(x) / N]
 }
 
-let pair = [sine(220Hz), sine(330Hz)] * 0.25
+rill main() -> [sample; 2] {
+    let pair = [sine(220Hz), sine(330Hz)] * 0.25
 
-// One envelope follower per channel: `[sample; 2]`.
-let env = pair
-    |> peak(release: 50ms)
+    // One envelope follower per channel: `peak` is a rill, so it runs once
+    // per channel of the frame.
+    let env = pair
+        |> peak(release: 50ms)
 
-let ducked = pair * (1 - env)
-out(pan(mix_down(ducked)[0], -0.5))
+    let ducked = pair * (1 - env)
+    return pan(mix_down(ducked)[0], -0.5)
+}

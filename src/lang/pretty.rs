@@ -185,7 +185,6 @@ impl Printer<'_> {
         match item {
             Item::Fn(d) => self.def("fn", d),
             Item::Rill(d) => self.def("rill", d),
-            Item::Stmt(s) => self.stmt(s),
         }
     }
 
@@ -355,8 +354,10 @@ rill peak(x: sample, release: Time = 300ms) -> sample {
     level = if abs(x) > level { abs(x) } else { level * decay(release) }
     return level
 }
-let y = [0.5, 1] |> peak(release: 10ms)
-out(y[0])
+rill main() -> sample {
+    let y = [0.5, 1] |> peak(release: 10ms)
+    return y[0]
+}
 ";
 
     #[test]
@@ -388,17 +389,18 @@ rill peak -> sample
    └─ return
       └─ level : sample
 
-let y
-└─ call peak (piped) : [sample; 2]
-   ├─ frame : [number; 2]
-   │  ├─ 0.5 : number
-   │  └─ 1 : number
-   └─ release: 10ms : Time
-
-call out : ()
-└─ index : sample
-   ├─ y : [sample; 2]
-   └─ 0 : number
+rill main -> sample
+└─ body
+   ├─ let y
+   │  └─ call peak (piped) : [sample; 2]
+   │     ├─ frame : [number; 2]
+   │     │  ├─ 0.5 : number
+   │     │  └─ 1 : number
+   │     └─ release: 10ms : Time
+   └─ return
+      └─ index : sample
+         ├─ y : [sample; 2]
+         └─ 0 : number
 ";
         assert_eq!(tree(SRC, &program, &checked, false), expected);
     }

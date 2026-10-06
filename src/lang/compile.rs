@@ -1,10 +1,9 @@
 //! Compiling one rill (or fn) instance to bytecode.
 //!
-//! Each call of a rill from the top level becomes one [`Code`]. Everything
-//! it calls is inlined, so every call site gets its own `state` registers
-//! (each call is its own instance) and the result is one flat program.
-//! Arguments known at build time are folded into the code instead of
-//! becoming inputs, which is how `sine(440Hz)` ends up with no inputs.
+//! The entry rill becomes one [`Code`]. Everything it calls is inlined, so
+//! every call site gets its own `state` registers (each call is its own
+//! instance) and the result is one flat program. Arguments known at build
+//! time are folded into the code instead of becoming inputs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -58,10 +57,7 @@ pub struct Defs<'a> {
 
 impl<'a> Defs<'a> {
     pub fn new(program: &'a Program, checked: &'a Checked) -> Defs<'a> {
-        let defs = program.items.iter().filter_map(|item| match item {
-            Item::Fn(d) | Item::Rill(d) => Some(d),
-            Item::Stmt(_) => None,
-        });
+        let defs = program.items.iter().map(Item::def);
         Defs {
             map: defs
                 .zip(&checked.signatures)
@@ -80,6 +76,8 @@ impl<'a> Defs<'a> {
 pub enum ArgSpec {
     /// Known at build time; folded into the code.
     Const(CVal),
+    /// The parameter's default value, folded into the code.
+    Default,
     /// A stream: one node input per channel. `None` means a scalar.
     Stream(Option<usize>),
 }
@@ -109,9 +107,18 @@ pub fn compile_instance(
     };
     let mut input_regs = Vec::new();
     let mut vals = Vec::new();
-    for a in args {
+    for (a, p) in args.iter().zip(&def.params) {
         vals.push(match a {
             ArgSpec::Const(v) => v.clone(),
+            ArgSpec::Default => {
+                let d = p.default.as_ref().ok_or_else(|| {
+                    internal(p.name.span, &format!("`{}` has no default", p.name.name))
+                })?;
+                c.scopes = vec![HashMap::new()];
+                let v = c.expr(d)?;
+                c.scopes.clear();
+                v
+            }
             ArgSpec::Stream(None) => {
                 let r = c.reg()?;
                 input_regs.push(r);

@@ -4,8 +4,9 @@
 //!
 //! - Units never appear or vanish implicitly: `440 + 1Hz` is an error, and
 //!   `Hz / Hz` is a plain number.
-//! - A fn or rill taking a scalar can be applied to `[T; N]`; it runs once
-//!   per channel and returns a frame (lifting).
+//! - A rill taking a scalar can be applied to `[T; N]`; it runs once per
+//!   channel and returns a frame (lifting). A fn or built-in takes exactly
+//!   what it declares and never lifts.
 //! - `state` lives only at the top of a rill body; only `state` can be
 //!   assigned to.
 //! - Every path through a rill ends in exactly one `return`.
@@ -13,7 +14,8 @@
 //! - No recursion: the run stage has no unbounded loops and every rill
 //!   instance needs a fixed amount of state.
 //! - Defaults and `state` initial values are known before audio starts.
-//! - fn and rill bodies cannot see top-level bindings.
+//! - The entry rill (see [`check_entry`]) can run with no arguments and
+//!   returns audio.
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,7 +42,7 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
         types: vec![Type::Error; program.expr_count as usize],
         diags: Vec::new(),
         scopes: Vec::new(),
-        place: Place::Top,
+        place: Place::Fn,
         current: None,
         ret: Type::Unit,
         calls: HashMap::new(),
@@ -51,25 +53,10 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
         match item {
             Item::Fn(d) => c.declare(d, DefKind::Fn),
             Item::Rill(d) => c.declare(d, DefKind::Rill),
-            Item::Stmt(_) => {}
         }
     }
-    let mut index = 0;
-    for item in &program.items {
-        if let Item::Fn(d) | Item::Rill(d) = item {
-            c.check_def(d, index);
-            index += 1;
-        }
-    }
-
-    c.place = Place::Top;
-    c.current = None;
-    c.ret = Type::Unit;
-    c.scopes = vec![HashMap::new()];
-    for item in &program.items {
-        if let Item::Stmt(s) = item {
-            c.stmt(s, false, false);
-        }
+    for (index, item) in program.items.iter().enumerate() {
+        c.check_def(item.def(), index);
     }
 
     c.check_recursion();
@@ -91,7 +78,6 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Place {
-    Top,
     Fn,
     Rill,
 }
@@ -483,12 +469,9 @@ impl Checker {
                 }
                 (Type::Unit, t == Type::Never)
             }
-            Stmt::Return { value, span } => {
+            Stmt::Return { value, .. } => {
                 let t = self.expr(value);
-                if self.place == Place::Top {
-                    let e = self.error(*span, "`return` is only allowed in fn and rill bodies");
-                    self.report(e);
-                } else if !coerces(&t, &self.ret) {
+                if !coerces(&t, &self.ret) {
                     let what = format!("`{}`", self.current.as_deref().unwrap_or("?"));
                     let ret = self.ret.clone();
                     let e = mismatch(value.span, &format!("return value of {what}"), &ret, &t);
@@ -499,13 +482,7 @@ impl Checker {
             Stmt::Expr(e) => {
                 let t = self.expr(e);
                 let has_value = !matches!(t, Type::Unit | Type::Error | Type::Never);
-                if has_value && self.place == Place::Top {
-                    self.report(
-                        Diagnostic::warning(e.span, "this value is never used").with_help(
-                            "send it to the device with `out(...)`, or name it with `let`",
-                        ),
-                    );
-                } else if has_value && !last {
+                if has_value && !last {
                     self.report(Diagnostic::warning(e.span, "this value is never used"));
                 }
                 (t.clone(), t == Type::Never)
@@ -788,16 +765,6 @@ impl Checker {
                 ));
             self.report(d);
         }
-        if kind == DefKind::Builtin
-            && builtins::TOP_LEVEL_ONLY.contains(&name)
-            && self.place != Place::Top
-        {
-            let d = self.error(
-                callee.span,
-                format!("`{name}` can only be used at the top level"),
-            );
-            self.report(d);
-        }
         if kind != DefKind::Builtin
             && let Some(me) = &self.current
         {
@@ -901,8 +868,9 @@ impl Checker {
             return Type::Error;
         }
 
-        // Unify argument types with parameter types, lifting over channels
-        // where a scalar parameter receives a frame.
+        // Unify argument types with parameter types. A rill whose scalar
+        // parameter receives a frame runs once per channel (lifting); fns and
+        // built-ins never lift.
         let mut subst = Subst::default();
         let mut lift: Option<(Size, Span)> = None;
         for (p, slot) in sig.params.iter().zip(&slots) {
@@ -923,6 +891,27 @@ impl Checker {
             {
                 let mut trial = subst.clone();
                 if unify(&p.ty, elem, &mut trial, &sig.generics) {
+                    if kind != DefKind::Rill {
+                        let help = if kind == DefKind::Fn {
+                            format!(
+                                "fns take exactly what they declare; give `{name}` a size parameter, \
+                                 as in `fn {name}<N>(x: [sample; N])`, or make it a rill to run it per channel"
+                            )
+                        } else {
+                            "built-in functions take one value; to run one per channel, call it from a \
+                             rill and apply that rill to the frame"
+                                .to_owned()
+                        };
+                        let d = self
+                            .error(
+                                arg_span,
+                                format!("`{name}` takes one value, not a frame (`{at}`)"),
+                            )
+                            .with_help(help);
+                        self.report(d);
+                        ok = false;
+                        continue;
+                    }
                     match &lift {
                         Some((m, _)) if m != n => {
                             let d = self.error(
@@ -989,7 +978,6 @@ impl Checker {
                 self.lookup(name).is_none()
                     && !self.defs.contains_key(name)
                     && !builtins::lookup(name).is_empty()
-                    && !builtins::TOP_LEVEL_ONLY.contains(&name)
                     && args.iter().all(|a| self.is_const(&a.value))
             }
             ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::Index(..) => false,
@@ -1051,7 +1039,6 @@ fn describe_param(c: &str) -> &'static str {
     match c {
         "T" => "a plain number (`sample`, `f32` or `i32`)",
         "S" => "a number",
-        "A" => "audio (`sample` or a frame of samples)",
         _ => "something else",
     }
 }
@@ -1276,5 +1263,92 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
             _ => fail(),
         },
         _ => unreachable!("not an arithmetic operator"),
+    }
+}
+
+/// Check that `entry` names a rill that can run as a whole program: it
+/// takes no arguments that lack defaults, has no size parameters, does not
+/// change rate, and returns audio.
+pub fn check_entry(
+    program: &Program,
+    checked: &Checked,
+    entry: &str,
+) -> Result<(), Vec<Diagnostic>> {
+    let found = program
+        .items
+        .iter()
+        .zip(&checked.signatures)
+        .find(|(item, _)| item.def().name.name == entry);
+    let Some((item, sig)) = found else {
+        let rills: Vec<&str> = program
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Rill(_)))
+            .map(|i| i.def().name.name.as_str())
+            .collect();
+        let d = Diagnostic::error(
+            Span::default(),
+            format!("there is no rill named `{entry}` to run"),
+        );
+        let help = match suggest(entry, rills.iter().copied()) {
+            Some(s) => format!("did you mean `{s}`?"),
+            None if rills.is_empty() => {
+                format!("add one, as in `rill {entry}() -> sample {{ return 0 }}`")
+            }
+            None => format!("pick one with `--entry`: {}", rills.join(", ")),
+        };
+        return Err(vec![d.with_help(help)]);
+    };
+
+    let def = item.def();
+    let mut errors = Vec::new();
+    if let Item::Fn(_) = item {
+        errors.push(Diagnostic::error(
+            def.name.span,
+            format!("`{entry}` is a fn, but the program must start at a rill"),
+        ));
+    }
+    if let Some(g) = def.generics.first() {
+        errors.push(
+            Diagnostic::error(g.span, "the entry rill cannot have size parameters").with_help(
+                format!(
+                    "nothing calls it, so there is nothing to infer `{}` from",
+                    g.name
+                ),
+            ),
+        );
+    }
+    for p in def.params.iter().filter(|p| p.default.is_none()) {
+        errors.push(
+            Diagnostic::error(p.name.span, format!("`{}` needs a default value", p.name.name)).with_help(
+                "the entry rill's parameters are the program's controls, so each needs a starting value, \
+                 as in `freq: Hz = 440Hz`",
+            ),
+        );
+    }
+    if let Some(rate) = &def.rate {
+        errors.push(Diagnostic::error(
+            rate.span,
+            "the entry rill cannot change the sample rate",
+        ));
+    }
+    let audio = |t: &Type| matches!(t, Type::Sample | Type::F32 | Type::Num);
+    let ok_ret = match &sig.ret {
+        Type::Frame(elem, Size::Const(_)) => audio(elem),
+        t => audio(t),
+    };
+    if !ok_ret && !sig.ret.is_wild() {
+        errors.push(Diagnostic::error(
+            def.ret.span(),
+            format!(
+                "the entry rill must return audio (`sample` or `[sample; N]`), found `{}`",
+                sig.ret
+            ),
+        ));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }

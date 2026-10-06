@@ -35,14 +35,16 @@ rill sine(freq: Hz) -> sample {
     return sin(phase * TAU)
 }
 
-// Top level: build the graph and send it to the device.
-// let lfo   = sine(360Hz) * 100Hz + 440Hz
-// let voice1 = sine(lfo)
-// let voice2 = sine(lfo * (3/2))
-// let voice3 = sine(lfo * (5/4))
+// Entry point: the program runs `main` and plays what it returns.
+rill main() -> sample {
+    // let lfo   = sine(360Hz) * 100Hz + 440Hz
+    // let voice1 = sine(lfo)
+    // let voice2 = sine(lfo * (3/2))
+    // let voice3 = sine(lfo * (5/4))
 
-let tremolo = sine(440Hz) * (sine(8Hz) * 0.5 + 1)
-let ring = sine(440Hz) * sine(200Hz)
+    let tremolo = sine(440Hz) * (sine(8Hz) * 0.5 + 1)
+    let ring = sine(440Hz) * sine(200Hz)
 
-let voice = tremolo * 0.3
-out(voice)
+    let voice = tremolo * 0.3
+    return voice
+}

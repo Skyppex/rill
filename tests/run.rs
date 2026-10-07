@@ -533,6 +533,24 @@ fn equal_temperament_keeps_pitches_between_notes() {
 }
 
 #[test]
+fn intervals_transpose_frequencies() {
+    let src = "
+        rill main() [Sample; 3] {
+            return [
+                (440Hz + 12st) / 1Hz,
+                (440Hz - 12st) / 1Hz,
+                (440Hz + 30cents) / 1Hz,
+            ]
+        }
+    ";
+    let out = render_with(src, 3, 1, Blocks::Fixed(1));
+    let expected = [880.0, 220.0, 440.0 * 2f32.powf(0.3 / 12.0)];
+    for (got, want) in out.iter().zip(expected) {
+        assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+    }
+}
+
+#[test]
 fn pitch_bends_glide_at_run_time() {
     // The interval changes every tick, so tuning happens in the VM rather
     // than at build time, and must not snap to semitones.

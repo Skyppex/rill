@@ -8,24 +8,57 @@ rill sine(freq: Freq) Sample {
     return sin(phase * TAU)
 }
 
+rill saw(freq: Freq, phase_offset: Float = 0) Sample {
+    state phase: Float = 0
+    phase = wrap(phase + freq / RATE)
+    return wrap(phase + phase_offset) * 2 - 1
+}
+
+rill bright(freq: Freq, phase_offset: Float = 0) Sample {
+    state phase: Float = 0
+    phase = wrap(phase + freq / RATE)
+    let p = wrap(phase + phase_offset) * TAU
+
+    return (
+        (sin(p) + sin(p * 2) * 0.5 + sin(p * 3) * 0.33 + sin(p * 4) * 0.25)
+        / 2.08
+    )
+}
+
 // Equal-power panning: 0 is hard left, 1 hard right.
 rill pan(x: Sample, pos: Float) [Sample; 2] {
     let angle = pos * PI / 2
     return [x * cos(angle), x * sin(angle)]
 }
 
-rill unison<N>(
-    pitch: Freq,
-    spread: Interval,
-) [Freq; N] {
+rill unison_pan<N>(voices: [Sample; N]) [[Sample; 2]; N] {
+    let out: [[Sample; 2]; N]
+
+    for i in 0..N {
+        let pos = if N == 1 { 0.5 } else { i as Float / (N - 1) as Float }
+        out[i] = pan(voices[i], pos)
+    }
+
+    return out
+}
+
+rill unison_bright<N>(pitches: [Freq; N]) [Sample; N] {
+    let out: [Sample; N]
+
+    for i in 0..N {
+        let t = if N == 1 { 0.5 } else { i as Float / (N - 1) as Float }
+        let phase_offset = wrap(i as Float * 0.61803398875)
+        out[i] = bright(pitches[i], phase_offset) * (0.85 + 0.15 * sin(t * PI))
+    }
+
+    return out
+}
+
+rill unison<N>(pitch: Freq, spread: Interval) [Freq; N] {
     let pitches: [Freq; N]
 
     for i in 0..N {
-        let t = if N == 1 {
-            0
-        } else {
-            i / (N - 1)
-        }
+        let t = if N == 1 { 0.5 } else { i as Float / (N - 1) as Float }
 
         let offset = spread * (t - 0.5)
         pitches[i] = pitch + offset
@@ -34,6 +67,6 @@ rill unison<N>(
     return pitches
 }
 
-rill main(volume: Gain = -12dB) Sample {
-    return sum(unison<8>(440Hz, 30cents) |> sine) / 8 + volume
+rill main(volume: Gain = -12dB) [Sample; 2] {
+    return (unison<5>(440Hz, 2cents) |> saw |> unison_pan |> sum) / 5 + volume
 }

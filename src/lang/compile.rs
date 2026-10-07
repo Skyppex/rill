@@ -943,6 +943,10 @@ impl Compiler<'_> {
                 if ga || gb {
                     return self.gain_binary(*op, &va, &vb, ga, gb, &self.types[e.id as usize]);
                 }
+                let (ta, tb) = (&self.types[a.id as usize], &self.types[b.id as usize]);
+                if is_freq(&self.types[e.id as usize]) && is_freq(ta) && is_interval(tb) {
+                    return self.freq_interval_binary(*op, &va, &vb);
+                }
                 let op = op2_for(*op, &self.types[e.id as usize]);
                 self.zip2(op, &va, &vb)
             }
@@ -1475,6 +1479,21 @@ impl Compiler<'_> {
         }
     }
 
+    /// `freq + interval` transposes by semitones, so `440Hz + 12st` is
+    /// `880Hz`; subtraction moves the same distance downward.
+    fn freq_interval_binary(&mut self, op: BinOp, freq: &CVal, interval: &CVal) -> CResult<CVal> {
+        let octaves = self.zip2(Op2::Div, interval, &CVal::Scalar(Operand::Const(12.0)))?;
+        let ratio = self.zip2(Op2::Pow, &CVal::Scalar(Operand::Const(2.0)), &octaves)?;
+        match op {
+            BinOp::Add => self.zip2(Op2::Mul, freq, &ratio),
+            BinOp::Sub => self.zip2(Op2::Div, freq, &ratio),
+            _ => Err(internal(
+                self.span,
+                "unsupported frequency interval operator",
+            )),
+        }
+    }
+
     /// A direct call of a built-in: arguments by position or name, with
     /// defaults for the rest.
     fn call_builtin(&mut self, span: Span, name: &str, args: &[Arg]) -> CResult<CVal> {
@@ -1540,6 +1559,22 @@ fn is_gain(t: &Type) -> bool {
     match t {
         Type::Gain => true,
         Type::Frame(elem, _) => is_gain(elem),
+        _ => false,
+    }
+}
+
+fn is_freq(t: &Type) -> bool {
+    match t {
+        Type::Freq => true,
+        Type::Frame(elem, _) => is_freq(elem),
+        _ => false,
+    }
+}
+
+fn is_interval(t: &Type) -> bool {
+    match t {
+        Type::Interval => true,
+        Type::Frame(elem, _) => is_interval(elem),
         _ => false,
     }
 }

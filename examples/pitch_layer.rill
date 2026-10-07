@@ -15,7 +15,8 @@ rill main() Sample {
     let tuning = fn(p: Pitch) Freq { equal(p, 12, a4: 440Hz) }
 
     on press(note) {
-        pitch = note.pitch // note.pitch becomes this type of pitch instead of a frequency
+        // note.pitch becomes this type of pitch instead of a frequency
+        pitch = note.pitch
         // Velocity arrives as 0–1. Squaring it is a simple loudness curve:
         // a straight line sounds too loud at soft velocities.
         gain = note.velocity * note.velocity

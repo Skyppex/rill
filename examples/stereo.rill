@@ -29,8 +29,7 @@ rill main() [Sample; 2] {
 
     // One envelope follower per channel: `peak` is a rill, so it runs once
     // per channel of the frame.
-    let env = pair
-        |> peak(release: 50ms)
+    let env = pair |> peak(release: 50ms)
 
     let ducked = pair * (1 - env)
     return pan(mix_down(ducked)[0], -0.5)

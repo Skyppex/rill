@@ -11,9 +11,11 @@ rill sine(freq: Freq) Sample {
 rill ramp(from: Float, to: Float, length: Time) Float {
     state elapsed = 0s
     let t = min(elapsed / length, 1)
+
     if elapsed < length {
         elapsed = elapsed + 1 / RATE
     }
+
     return from + (to - from) * t
 }
 

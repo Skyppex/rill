@@ -15,11 +15,15 @@ rill pan(x: Sample, pos: Float) [Sample; 2] {
 }
 
 rill main(volume: Gain = -12dB) [Sample; 2] {
-    let voices = [C4, E4, G4] |> equal |> sine   // [Sample; 3]
+    let voices = [C4, E4, G4]
+        |> equal
+        |> sine // [Sample; 3]
 
     // One position and one level per voice.
-    let placed = voices |> pan([0.2, 0.5, 0.8])  // [[Sample; 2]; 3]
+    let placed = voices
+        |> pan([0.2, 0.5, 0.8]) // [[Sample; 2]; 3]
+
     let shaped = placed + [0dB, -3dB, -6dB]
 
-    return sum(shaped) + volume                  // [Sample; 2]
+    return sum(shaped) + volume // [Sample; 2]
 }

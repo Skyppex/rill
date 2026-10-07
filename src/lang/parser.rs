@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! program := item*
-//! item    := "fn" def | "rill" def
+//! item    := "fn" def | "rill" def | event
+//! event   := "event" NAME NAME ("(" (NAME ":" expr),* ")")?
 //! def     := NAME ("<" NAME ("," NAME)* ">")? "(" params ")" type
 //!            ("@" "rate" (("*" | "/") INT)?)? block
 //! param   := NAME ":" type ("=" expr)?
@@ -14,6 +15,7 @@
 //!          | "state" NAME (":" type)? "=" expr
 //!          | "return" expr
 //!          | NAME "=" expr
+//!          | "on" NAME ("(" NAME,* ")")? block
 //!          | expr
 //! expr    := or ("|>" NAME ("(" args ")")?)*
 //! or      := and ("||" and)*
@@ -88,10 +90,20 @@ impl<'a> Parser<'a> {
 
     fn program(mut self) -> (Program, Vec<Diagnostic>) {
         let mut items = Vec::new();
+        let mut events = Vec::new();
         while !self.at(TokenKind::Eof) {
+            if self.at_ident("event") {
+                match self.event_decl() {
+                    Ok(e) => events.push(e),
+                    Err(err) => {
+                        self.errors.push(err);
+                        self.recover();
+                    }
+                }
+                continue;
+            }
             match self.item() {
-                Ok(Some(item)) => items.push(item),
-                Ok(None) => {}
+                Ok(item) => items.push(item),
                 Err(err) => {
                     self.errors.push(err);
                     self.recover();
@@ -100,6 +112,7 @@ impl<'a> Parser<'a> {
         }
         let program = Program {
             items,
+            events,
             expr_count: self.next_id,
         };
         (program, self.errors)
@@ -194,23 +207,20 @@ impl Parser<'_> {
     fn recover(&mut self) {
         self.bump();
         while !self.at(TokenKind::Eof)
-            && !(self.peek().newline_before && (self.at(TokenKind::Fn) || self.at(TokenKind::Rill)))
+            && !(self.peek().newline_before
+                && (self.at(TokenKind::Fn) || self.at(TokenKind::Rill) || self.at_ident("event")))
         {
             self.bump();
         }
         self.nest = 0;
     }
 
-    fn item(&mut self) -> PResult<Option<Item>> {
+    fn item(&mut self) -> PResult<Item> {
         if self.eat(TokenKind::Fn).is_some() {
-            return Ok(Some(Item::Fn(self.def("fn")?)));
+            return Ok(Item::Fn(self.def("fn")?));
         }
         if self.eat(TokenKind::Rill).is_some() {
-            return Ok(Some(Item::Rill(self.def("rill")?)));
-        }
-        if self.at_ident("event") {
-            self.skip_event_decl()?;
-            return Ok(None);
+            return Ok(Item::Rill(self.def("rill")?));
         }
         Err(self
             .unexpected("`fn` or `rill`")
@@ -392,7 +402,7 @@ impl Parser<'_> {
     fn stmt(&mut self) -> PResult<Stmt> {
         let start = self.peek().span;
         if self.at_ident("on") && self.peek_at(1).kind == TokenKind::Ident {
-            return self.skip_event_handler();
+            return self.event_handler();
         }
         let stmt = match self.peek().kind {
             TokenKind::Let | TokenKind::State => {
@@ -507,11 +517,37 @@ impl Parser<'_> {
         self.at(TokenKind::Ident) && self.text(self.peek()) == name
     }
 
-    fn skip_event_decl(&mut self) -> PResult<()> {
-        self.bump(); // event
-        self.ident("after `event`")?;
+    fn event_decl(&mut self) -> PResult<EventDecl> {
+        let start = self.bump().span; // event
+        let name = self.ident("as the event's name")?;
+        if self.at(TokenKind::LParen) || !self.at(TokenKind::Ident) {
+            let kinds = "`note_on`, `note_off` or `control_change`";
+            return Err(self
+                .unexpected(&format!("the event's kind ({kinds}) after its name"))
+                .with_help(format!(
+                    "give it a name and a kind, as in `event keys {}(channel: 1)`",
+                    if crate::event::EventKind::from_name(&name.name).is_some() {
+                        name.name.as_str()
+                    } else {
+                        "note_on"
+                    }
+                )));
+        }
+        let kind = self.ident("")?;
+        let mut filters = Vec::new();
         if self.eat(TokenKind::LParen).is_some() {
-            self.skip_balanced(TokenKind::LParen, TokenKind::RParen)?;
+            self.nest += 1;
+            while !self.at(TokenKind::RParen) {
+                let fname = self.ident("as a filter name, `sender` or `channel`")?;
+                self.expect(TokenKind::Colon, "and a value after the filter name")?;
+                let value = self.expr()?;
+                filters.push(Filter { name: fname, value });
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RParen, "to close the filters")?;
+            self.nest -= 1;
         }
         if self.eat(TokenKind::Semi).is_none()
             && !self.at(TokenKind::Eof)
@@ -519,10 +555,15 @@ impl Parser<'_> {
         {
             return Err(self.unexpected("a line break or `;` after the event declaration"));
         }
-        Ok(())
+        Ok(EventDecl {
+            name,
+            kind,
+            filters,
+            span: self.span_from(start),
+        })
     }
 
-    fn skip_event_handler(&mut self) -> PResult<Stmt> {
+    fn event_handler(&mut self) -> PResult<Stmt> {
         let start = self.bump().span; // on
         let name = self.ident("after `on`")?;
         let mut params = Vec::new();
@@ -544,25 +585,6 @@ impl Parser<'_> {
             body,
             span: self.span_from(start),
         })
-    }
-
-    fn skip_balanced(&mut self, open: TokenKind, close: TokenKind) -> PResult<()> {
-        let mut depth = 1u32;
-        while depth > 0 {
-            let t = self.bump();
-            if same_kind(&t.kind, &TokenKind::Eof) {
-                return Err(Diagnostic::error(
-                    t.span,
-                    format!("this {} is never closed", open.describe()),
-                ));
-            }
-            if same_kind(&t.kind, &open) {
-                depth += 1;
-            } else if same_kind(&t.kind, &close) {
-                depth -= 1;
-            }
-        }
-        Ok(())
     }
 
     /// True if the next token continues the current expression rather than

@@ -26,6 +26,7 @@ use super::ast::*;
 use super::builtins;
 use super::diag::{Diagnostic, Span, suggest};
 use super::types::{DefKind, ParamSig, Signature, Size, Type, coerces, join};
+use crate::event::{EventDecl as Declared, EventKind};
 
 /// Result of a successful check.
 #[derive(Clone, Debug)]
@@ -43,6 +44,9 @@ pub struct Checked {
     /// targets and types. Declarations are in `bindings` and the program's
     /// definitions instead.
     pub resolutions: Vec<(Span, Resolution)>,
+    /// The program's event declarations, in source order (the same as
+    /// [`Program::events`]). `None` where a declaration has an unknown kind.
+    pub events: Vec<Option<Declared>>,
 }
 
 /// Index into [`Checked::bindings`].
@@ -57,6 +61,8 @@ pub enum BindingKind {
     State,
     /// A parameter of an anonymous fn.
     FnParam,
+    /// The payload of an `on` handler.
+    EventParam,
 }
 
 /// A named value and where it can be used.
@@ -87,6 +93,8 @@ pub enum Resolution {
     Note,
     /// A built-in type like `Sample`.
     Type,
+    /// A declared event, by index into [`Checked::events`].
+    Event(usize),
 }
 
 /// Check `program`. On failure the list holds the errors and any warnings.
@@ -123,12 +131,24 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         scope_spans: Vec::new(),
         sizes: Vec::new(),
         current_def: 0,
+        events: Vec::new(),
+        event_used: Vec::new(),
     };
 
+    c.declare_events(&program.events);
     for item in &program.items {
         match item {
             Item::Fn(d) => c.declare(d, DefKind::Fn),
             Item::Rill(d) => c.declare(d, DefKind::Rill),
+        }
+    }
+    for (i, decl) in program.events.iter().enumerate() {
+        if c.events[i].is_some() && c.defs.contains_key(&decl.name.name) {
+            let e = c.error(
+                decl.name.span,
+                format!("`{}` is already the name of a fn or rill", decl.name.name),
+            );
+            c.report(e);
         }
     }
     for (index, item) in program.items.iter().enumerate() {
@@ -136,6 +156,14 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
     }
 
     c.check_recursion();
+    for (decl, used) in program.events.iter().zip(c.event_used.clone()) {
+        if !used {
+            c.report(Diagnostic::warning(
+                decl.name.span,
+                format!("event `{}` is declared but never handled", decl.name.name),
+            ));
+        }
+    }
 
     let warnings = c.diags.iter().filter(|d| !d.is_error()).cloned().collect();
     let (mut errors, others): (Vec<_>, Vec<_>) = c.diags.into_iter().partition(|d| d.is_error());
@@ -149,6 +177,7 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         warnings,
         bindings: c.bindings,
         resolutions: c.resolutions,
+        events: c.events,
     };
     (checked, errors)
 }
@@ -166,6 +195,8 @@ enum VarKind {
     State,
     /// A size parameter like `N`, usable as a number.
     Size,
+    /// The payload of an `on` handler.
+    EventParam,
 }
 
 #[derive(Clone, Debug)]
@@ -216,6 +247,10 @@ struct Checker {
     sizes: Vec<(String, BindingId)>,
     /// Index of the definition being checked.
     current_def: usize,
+    /// Event declarations, as in [`Checked::events`].
+    events: Vec<Option<Declared>>,
+    /// Per declaration: whether a handler uses it.
+    event_used: Vec<bool>,
 }
 
 impl Checker {
@@ -251,6 +286,121 @@ impl Checker {
     }
 
     // ---- declarations -------------------------------------------------
+
+    fn declare_events(&mut self, decls: &[EventDecl]) {
+        for (i, d) in decls.iter().enumerate() {
+            if decls[..i].iter().any(|p| p.name.name == d.name.name) {
+                let e = self.error(
+                    d.name.span,
+                    format!("event `{}` is declared more than once", d.name.name),
+                );
+                self.report(e);
+            }
+            let kind = EventKind::from_name(&d.kind.name);
+            if kind.is_none() {
+                let kinds = EventKind::ALL.map(EventKind::name);
+                let mut e =
+                    self.error(d.kind.span, format!("unknown event kind `{}`", d.kind.name));
+                e = match suggest(&d.kind.name, kinds) {
+                    Some(k) => e.with_help(format!("did you mean `{k}`?")),
+                    None => e.with_help("the kinds are `note_on`, `note_off` and `control_change`"),
+                };
+                self.report(e);
+            }
+            let (mut sender, mut channel) = (None, None);
+            for f in &d.filters {
+                let value = match &f.value.kind {
+                    ExprKind::Number {
+                        value,
+                        unit: None,
+                        integral: true,
+                    } if *value <= f64::from(u32::MAX) => Some(*value as u32),
+                    _ => None,
+                };
+                self.types[f.value.id as usize] = Type::Int;
+                let Some(value) = value else {
+                    let e = self
+                        .error(f.value.span, "a filter is a whole number ≥ 0")
+                        .with_help(
+                            "filters are fixed when the program is built, as in `channel: 1`",
+                        );
+                    self.report(e);
+                    continue;
+                };
+                let slot = match f.name.name.as_str() {
+                    "sender" => &mut sender,
+                    "channel" => &mut channel,
+                    other => {
+                        let e = self
+                            .error(f.name.span, format!("unknown filter `{other}`"))
+                            .with_help("events can be filtered by `sender` and `channel`");
+                        self.report(e);
+                        continue;
+                    }
+                };
+                if slot.is_some() {
+                    let e = self.error(
+                        f.name.span,
+                        format!("filter `{}` is given more than once", f.name.name),
+                    );
+                    self.report(e);
+                }
+                *slot = Some(value);
+            }
+            self.events.push(kind.map(|kind| Declared {
+                name: d.name.name.clone(),
+                kind,
+                sender,
+                channel,
+            }));
+            self.event_used.push(false);
+        }
+    }
+
+    /// The declared event an `on` handler names, if any; reports the
+    /// problem otherwise.
+    fn handled_event(&mut self, name: &Ident) -> Option<usize> {
+        let found = self
+            .events
+            .iter()
+            .position(|d| d.as_ref().is_some_and(|d| d.name == name.name));
+        if let Some(i) = found {
+            self.event_used[i] = true;
+            self.resolve(name.span, Resolution::Event(i));
+            return Some(i);
+        }
+        // A declaration with an unknown kind is already reported.
+        let broken = self.events.iter().any(Option::is_none);
+        if broken {
+            return None;
+        }
+        let e = if EventKind::from_name(&name.name).is_some() {
+            self.error(
+                name.span,
+                format!("`{}` is a kind of event, not a declared event", name.name),
+            )
+            .with_help(format!(
+                "declare one at the top level and handle it by name: `event keys {}(channel: 1)`, then `on keys(...)`",
+                name.name
+            ))
+        } else {
+            let near = suggest(
+                &name.name,
+                self.events.iter().flatten().map(|d| d.name.as_str()),
+            )
+            .map(str::to_owned);
+            let e = self.error(name.span, format!("unknown event `{}`", name.name));
+            match near {
+                Some(n) => e.with_help(format!("did you mean `{n}`?")),
+                None => e.with_help(format!(
+                    "declare it at the top level, as in `event {} note_on(channel: 1)`",
+                    name.name
+                )),
+            }
+        };
+        self.report(e);
+        None
+    }
 
     fn declare(&mut self, d: &Def, kind: DefKind) {
         let name = &d.name.name;
@@ -564,6 +714,7 @@ impl Checker {
             VarKind::Let => BindingKind::Let,
             VarKind::State => BindingKind::State,
             VarKind::Size => BindingKind::Size,
+            VarKind::EventParam => BindingKind::EventParam,
         };
         let scope = Span {
             start: visible_from,
@@ -713,25 +864,41 @@ impl Checker {
                 (Type::Never, true)
             }
             Stmt::EventHandler {
-                name: _,
-                params,
-                body,
-                ..
+                name, params, body, ..
             } => {
                 if self.place != Place::Rill {
                     let e = self.error(s.span(), "event handlers are only allowed in rills");
                     self.report(e);
                     return (Type::Unit, false);
                 }
+                let kind = self
+                    .handled_event(name)
+                    .and_then(|i| self.events[i].as_ref())
+                    .map(|d| d.kind);
+                if let Some(extra) = params.get(1) {
+                    let e = self
+                        .error(
+                            extra.span,
+                            "an event handler takes one parameter: the event",
+                        )
+                        .with_help(match kind {
+                            Some(EventKind::ControlChange) => {
+                                "a control change's parameter is its value".to_owned()
+                            }
+                            _ => "read its fields, as in `note.pitch`".to_owned(),
+                        });
+                    self.report(e);
+                }
                 self.scopes.push(HashMap::new());
                 self.scope_spans.push(body.span);
-                for param in params {
-                    let ty = if param.name == "cc" {
-                        Type::Sample
-                    } else {
-                        Type::Event
+                if let Some(param) = params.first() {
+                    let ty = match kind {
+                        Some(EventKind::NoteOn) => Type::NoteOn,
+                        Some(EventKind::NoteOff) => Type::NoteOff,
+                        Some(EventKind::ControlChange) => Type::Float,
+                        None => Type::Error,
                     };
-                    self.bind(param, ty, VarKind::Let, param.span.end);
+                    self.bind(param, ty, VarKind::EventParam, param.span.end);
                 }
                 let saved = std::mem::replace(&mut self.in_event, true);
                 let (_, diverged) = self.block(body, false);
@@ -893,22 +1060,24 @@ impl Checker {
                     }
                     acc = match acc {
                         None => Some(t),
-                        Some(prev) => {
-                            match join(&prev, &t) {
-                                Some(j) => Some(j),
-                                None => {
-                                    let msg = if prev.depth() > 0 || t.depth() > 0 {
-                                        format!("frame elements have different shapes: `{prev}` and `{t}`")
-                                    } else {
-                                        format!("frame channels have different types: `{prev}` and `{t}`")
-                                    };
-                                    let d = self.error(el.span, msg);
-                                    self.report(d);
-                                    bad = true;
-                                    Some(prev)
-                                }
+                        Some(prev) => match join(&prev, &t) {
+                            Some(j) => Some(j),
+                            None => {
+                                let msg = if prev.depth() > 0 || t.depth() > 0 {
+                                    format!(
+                                        "frame elements have different shapes: `{prev}` and `{t}`"
+                                    )
+                                } else {
+                                    format!(
+                                        "frame channels have different types: `{prev}` and `{t}`"
+                                    )
+                                };
+                                let d = self.error(el.span, msg);
+                                self.report(d);
+                                bad = true;
+                                Some(prev)
                             }
-                        }
+                        },
                     };
                 }
                 match acc {
@@ -968,13 +1137,34 @@ impl Checker {
             }
             ExprKind::Field(base, field) => {
                 let base_ty = self.expr(base);
-                if base_ty == Type::Event {
-                    event_field_type(&field.name).unwrap_or_else(|| {
-                        let e =
-                            self.error(field.span, format!("unknown event field `{}`", field.name));
-                        self.report(e);
-                        Type::Error
-                    })
+                if let Some(kind) = base_ty.event_kind() {
+                    match event_field_type(kind, &field.name) {
+                        Some(t) => t,
+                        None => {
+                            let has = kind
+                                .fields()
+                                .iter()
+                                .map(|f| format!("`{f}`"))
+                                .collect::<Vec<_>>()
+                                .join(" and ");
+                            let mut e = self.error(
+                                field.span,
+                                format!("a `{base_ty}` has no field `{}`", field.name),
+                            );
+                            let elsewhere = EventKind::ALL
+                                .into_iter()
+                                .find(|k| *k != kind && k.fields().contains(&field.name.as_str()));
+                            e = match elsewhere {
+                                Some(k) => e.with_help(format!(
+                                    "`{}` belongs to `{k}` events; a `{base_ty}` has {has}",
+                                    field.name
+                                )),
+                                None => e.with_help(format!("a `{base_ty}` has {has}")),
+                            };
+                            self.report(e);
+                            Type::Error
+                        }
+                    }
                 } else if base_ty.is_wild() {
                     Type::Error
                 } else {
@@ -1257,11 +1447,9 @@ impl Checker {
                                 shape(earlier)
                             ),
                         };
-                        let d = self
-                            .error(arg_span, msg)
-                            .with_help(
-                                "every argument that runs per element needs the same extra layers",
-                            );
+                        let d = self.error(arg_span, msg).with_help(
+                            "every argument that runs per element needs the same extra layers",
+                        );
                         self.report(d);
                         ok = false;
                     }
@@ -1717,6 +1905,7 @@ fn var_word(kind: VarKind) -> &'static str {
         VarKind::Let => "value",
         VarKind::State => "state variable",
         VarKind::Size => "size",
+        VarKind::EventParam => "event",
     }
 }
 
@@ -2071,11 +2260,11 @@ fn gain_arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
     }
 }
 
-fn event_field_type(name: &str) -> Option<Type> {
-    match name {
-        "pitch" => Some(Type::Pitch),
-        "velocity" | "release" => Some(Type::Sample),
-        "channel" | "index" => Some(Type::Int),
+/// The type of field `name` of an event payload of kind `kind`.
+fn event_field_type(kind: EventKind, name: &str) -> Option<Type> {
+    match (kind, name) {
+        (EventKind::NoteOn | EventKind::NoteOff, "pitch") => Some(Type::Pitch),
+        (EventKind::NoteOn, "velocity") | (EventKind::NoteOff, "release") => Some(Type::Float),
         _ => None,
     }
 }

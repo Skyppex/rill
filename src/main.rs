@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use rill::offline::{self, Blocks};
 use rill::wav::{self, WavFormat};
-use rill::{Config, Engine, EventValue, Graph, ParamEvent, RillEvent, patches};
+use rill::{Config, Engine, Graph, ParamEvent, RillEvent, patches};
 
 #[derive(Parser)]
 #[command(version, about = "Rill: a language for real-time audio")]
@@ -138,9 +138,10 @@ struct ScheduledParamEvent {
 
 #[derive(Clone, Debug, PartialEq)]
 struct ScheduledRillEvent {
-    name: String,
+    /// An event kind (`note_on`) or the name of a declared event.
+    target: String,
     time_seconds: f32,
-    values: Vec<EventValue>,
+    fields: Vec<(String, f32)>,
 }
 
 fn parse_param_event(input: &str) -> Result<ScheduledParamEvent, String> {
@@ -170,12 +171,12 @@ fn parse_rill_event(input: &str) -> Result<ScheduledRillEvent, String> {
         .map_or((input, ""), |(head, fields)| (head, fields));
     let (name, time) = head
         .split_once('@')
-        .ok_or_else(|| "expected NAME@TIME[:FIELD=VALUE,...]".to_owned())?;
+        .ok_or_else(|| "expected EVENT@TIME[:FIELD=VALUE,...]".to_owned())?;
     if name.is_empty() {
         return Err("event name cannot be empty".to_owned());
     }
     let time_seconds = parse_time_seconds(time)?;
-    let mut values = Vec::new();
+    let mut values: Vec<(String, f32)> = Vec::new();
     if !fields.is_empty() {
         for field in fields.split(',') {
             let (name, value) = field
@@ -184,16 +185,13 @@ fn parse_rill_event(input: &str) -> Result<ScheduledRillEvent, String> {
             if name.is_empty() {
                 return Err("event field name cannot be empty".to_owned());
             }
-            values.push(EventValue {
-                name: name.to_owned(),
-                value: parse_event_value(value)?,
-            });
+            values.push((name.to_owned(), parse_event_value(value)?));
         }
     }
     Ok(ScheduledRillEvent {
-        name: name.to_owned(),
+        target: name.to_owned(),
         time_seconds,
-        values,
+        fields: values,
     })
 }
 
@@ -238,9 +236,9 @@ impl From<&ScheduledParamEvent> for rill::device::ScheduledParamEvent {
 impl From<&ScheduledRillEvent> for rill::device::ScheduledRillEvent {
     fn from(event: &ScheduledRillEvent) -> Self {
         rill::device::ScheduledRillEvent {
-            name: event.name.clone(),
+            target: event.target.clone(),
             time_seconds: event.time_seconds,
-            values: event.values.clone(),
+            fields: event.fields.clone(),
         }
     }
 }
@@ -270,7 +268,7 @@ fn validate_rill_event_duration(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for event in events {
         if event.time_seconds > seconds {
-            return Err(format!("event `{}` is after the playback duration", event.name).into());
+            return Err(format!("event `{}` is after the playback duration", event.target).into());
         }
     }
     Ok(())
@@ -295,8 +293,10 @@ enum Command {
         /// Simulate a live control change, e.g. `gain=0.8@500ms`.
         #[arg(long = "param-event", value_name = "NAME=VALUE@TIME", value_parser = parse_param_event)]
         param_events: Vec<ScheduledParamEvent>,
-        /// Simulate a rill event, e.g. `note_on@0ms:pitch=660,velocity=1`.
-        #[arg(long = "event", value_name = "NAME@TIME[:FIELD=VALUE,...]", value_parser = parse_rill_event)]
+        /// Send an event. `note_on@1s:sender=5,channel=1,pitch=A4,velocity=0.8`
+        /// is matched against the declared events; a declared name, as in
+        /// `keys@1s:pitch=A4,velocity=0.8`, goes straight to that event.
+        #[arg(long = "event", value_name = "EVENT@TIME[:FIELD=VALUE,...]", value_parser = parse_rill_event)]
         events: Vec<ScheduledRillEvent>,
     },
     /// List audio hosts and output devices.
@@ -326,8 +326,10 @@ enum Command {
         /// Simulate a live control change, e.g. `gain=0.8@500ms`.
         #[arg(long = "param-event", value_name = "NAME=VALUE@TIME", value_parser = parse_param_event)]
         param_events: Vec<ScheduledParamEvent>,
-        /// Simulate a rill event, e.g. `note_on@0ms:pitch=660,velocity=1`.
-        #[arg(long = "event", value_name = "NAME@TIME[:FIELD=VALUE,...]", value_parser = parse_rill_event)]
+        /// Send an event. `note_on@1s:sender=5,channel=1,pitch=A4,velocity=0.8`
+        /// is matched against the declared events; a declared name, as in
+        /// `keys@1s:pitch=A4,velocity=0.8`, goes straight to that event.
+        #[arg(long = "event", value_name = "EVENT@TIME[:FIELD=VALUE,...]", value_parser = parse_rill_event)]
         events: Vec<ScheduledRillEvent>,
     },
 }
@@ -500,10 +502,16 @@ fn render_with_events(
             .into());
         }
     }
+    let mut dispatches = Vec::with_capacity(rill_events.len());
     for event in rill_events {
         if (event.time_seconds * rate).round() as usize > frames {
-            return Err(format!("event `{}` is after the render duration", event.name).into());
+            return Err(format!("event `{}` is after the render duration", event.target).into());
         }
+        dispatches.push(rill::event::parse_dispatch(
+            engine.events(),
+            &event.target,
+            &event.fields,
+        )?);
     }
 
     let mut scheduled_params = param_events
@@ -513,7 +521,8 @@ fn render_with_events(
     scheduled_params.sort_by_key(|(frame, _)| *frame);
     let mut scheduled_rill = rill_events
         .iter()
-        .map(|e| ((e.time_seconds * rate).round() as usize, e))
+        .zip(dispatches)
+        .map(|(e, d)| ((e.time_seconds * rate).round() as usize, d))
         .collect::<Vec<_>>();
     scheduled_rill.sort_by_key(|(frame, _)| *frame);
 
@@ -542,10 +551,9 @@ fn render_with_events(
         }
         let block_rill_events = scheduled_rill[start_rill..next_rill]
             .iter()
-            .map(|(frame, event)| RillEvent {
+            .map(|&(frame, dispatch)| RillEvent {
                 frame_offset: frame - done,
-                name: event.name.as_str(),
-                values: &event.values,
+                dispatch,
             })
             .collect::<Vec<_>>();
         engine.render_interleaved_with_param_and_rill_events(
@@ -603,10 +611,12 @@ mod tests {
         assert!(parse_param_event("gain@1s").is_err());
         assert!(parse_param_event("gain=1@-1s").is_err());
 
-        let event = parse_rill_event("note_on@250ms:pitch=660,velocity=1").unwrap();
-        assert_eq!(event.name, "note_on");
+        let event = parse_rill_event("note_on@250ms:pitch=A4,velocity=1").unwrap();
+        assert_eq!(event.target, "note_on");
         assert_eq!(event.time_seconds, 0.25);
-        assert_eq!(event.values[0].name, "pitch");
-        assert_eq!(event.values[0].value, 660.0);
+        assert_eq!(
+            event.fields,
+            [("pitch".to_owned(), 69.0), ("velocity".to_owned(), 1.0)]
+        );
     }
 }

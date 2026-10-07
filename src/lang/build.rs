@@ -69,6 +69,10 @@ pub fn build(
     }
 
     let mut graph = Graph::new();
+    // Every declaration, so ids match the ones in the compiled handlers.
+    for decl in &checked.events {
+        graph.event(decl.clone().expect("checked: every kind is known"));
+    }
     let outputs: Vec<Input> = match code.output.iter().all(|o| matches!(o, Operand::Const(_))) {
         // Nothing varies over time, so no node is needed.
         true => code

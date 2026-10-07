@@ -6,6 +6,8 @@ use super::lexer::Unit;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,
+    /// Event declarations, in source order.
+    pub events: Vec<EventDecl>,
     /// Number of expressions; every [`Expr::id`] is below this.
     pub expr_count: u32,
 }
@@ -24,6 +26,23 @@ impl Item {
             Item::Fn(d) | Item::Rill(d) => d,
         }
     }
+}
+
+/// `event keys note_on(sender: 5, channel: 1)`: a name, a kind and
+/// optional filters. The kind is checked by the checker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventDecl {
+    pub name: Ident,
+    pub kind: Ident,
+    pub filters: Vec<Filter>,
+    pub span: Span,
+}
+
+/// `sender: 5` in an event declaration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Filter {
+    pub name: Ident,
+    pub value: Expr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

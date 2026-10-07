@@ -15,7 +15,8 @@ use super::ast::*;
 use super::check::Checked;
 use super::diag::{Diagnostic, Span};
 use super::types::{Signature, Size, Type};
-use super::vm::{Code, EventBinding, EventCode, Instr, Operand, Tuning};
+use super::vm::{Code, EventCode, Instr, Operand, Tuning};
+use crate::event::{EventId, EventKind};
 use crate::ops::{Op1, Op2};
 
 /// A compile-time value: one operand per channel. Frames nest, so a frame's
@@ -122,6 +123,8 @@ fn type_depth(t: &Type) -> usize {
 pub struct Defs<'a> {
     map: HashMap<&'a str, (&'a Def, &'a Signature)>,
     lambdas: HashMap<u32, &'a Expr>,
+    /// Declared events by name: their id and kind.
+    events: HashMap<&'a str, (EventId, EventKind)>,
 }
 
 impl<'a> Defs<'a> {
@@ -136,7 +139,17 @@ impl<'a> Defs<'a> {
             }
             collect_lambdas_in_block(&d.body, &mut lambdas);
         }
+        let events = checked
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| {
+                d.as_ref()
+                    .map(|d| (d.name.as_str(), (EventId(i as u16), d.kind)))
+            })
+            .collect();
         Defs {
+            events,
             map: defs
                 .zip(&checked.signatures)
                 .map(|(d, s)| (d.name.name.as_str(), (d, s)))
@@ -428,7 +441,10 @@ impl Compiler<'_> {
         match (a, b) {
             (CVal::Frame(xs), CVal::Frame(ys)) => {
                 if xs.len() != ys.len() {
-                    return Err(internal(self.span, "frames of different sizes reached an operator"));
+                    return Err(internal(
+                        self.span,
+                        "frames of different sizes reached an operator",
+                    ));
                 }
                 let mut out = Vec::with_capacity(xs.len());
                 for (x, y) in xs.iter().zip(ys) {
@@ -857,28 +873,25 @@ impl Compiler<'_> {
         let saved_code = std::mem::take(&mut self.code);
         let saved_scopes = self.scopes.clone();
         self.scopes.push(HashMap::new());
-        let mut bindings = Vec::new();
-        for param in params {
-            if param.name == "cc" {
-                let reg = self.reg()?;
-                self.bind(&param.name, CVal::Scalar(Operand::Reg(reg)), false);
-                bindings.push(EventBinding::Scalar {
-                    name: param.name.clone(),
-                    reg,
-                });
-            } else {
-                let mut fields = Vec::new();
-                for field in event_fields_for(&param.name) {
-                    let reg = self.reg()?;
-                    fields.push(((*field).to_owned(), Operand::Reg(reg)));
-                    bindings.push(EventBinding::Field {
-                        path: format!("{}.{}", param.name, field),
-                        fallback: (*field).to_owned(),
-                        reg,
-                    });
-                }
-                self.bind(&param.name, CVal::Event(fields), false);
-            }
+        let &(event, kind) = self
+            .defs
+            .events
+            .get(name.name.as_str())
+            .ok_or_else(|| internal(name.span, "handler of an undeclared event"))?;
+        // The payload arrives in registers, one per field.
+        let mut payload = Vec::new();
+        let mut fields = Vec::new();
+        for field in kind.fields() {
+            let reg = self.reg()?;
+            payload.push(reg);
+            fields.push(((*field).to_owned(), Operand::Reg(reg)));
+        }
+        if let Some(param) = params.first() {
+            let value = match kind {
+                EventKind::ControlChange => CVal::Scalar(fields[0].1),
+                EventKind::NoteOn | EventKind::NoteOff => CVal::Event(fields),
+            };
+            self.bind(&param.name, value, false);
         }
         let (_, diverged) = self.block(body)?;
         if diverged {
@@ -888,8 +901,8 @@ impl Compiler<'_> {
         self.scopes = saved_scopes;
         self.code = saved_code;
         self.events.push(EventCode {
-            name: name.name.clone(),
-            bindings,
+            event,
+            payload,
             instrs,
         });
         Ok(())
@@ -1292,14 +1305,6 @@ impl Compiler<'_> {
                 format!("`{name}` cannot be used here"),
             )),
         }
-    }
-}
-
-fn event_fields_for(param: &str) -> &'static [&'static str] {
-    match param {
-        "note" => &["pitch", "velocity", "release"],
-        "control" => &["channel", "index"],
-        _ => &["pitch", "velocity", "release", "channel", "index"],
     }
 }
 

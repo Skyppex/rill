@@ -4,6 +4,7 @@
 //! built on any thread and allocates freely; [`crate::Engine::new`] freezes it
 //! into something the audio callback can run.
 
+use crate::event::{EventDecl, EventId};
 use crate::node::Node;
 
 /// Handle to a node inside a [`Graph`].
@@ -60,6 +61,8 @@ pub(crate) enum Output {
 pub struct Graph {
     pub(crate) entries: Vec<Entry>,
     pub(crate) output: Output,
+    /// Declared events, indexed by [`EventId`].
+    pub(crate) events: Vec<EventDecl>,
 }
 
 impl Default for Graph {
@@ -73,6 +76,7 @@ impl Graph {
         Graph {
             entries: Vec::new(),
             output: Output::None,
+            events: Vec::new(),
         }
     }
 
@@ -127,6 +131,12 @@ impl Graph {
     /// `a + b`, which on audio streams is mixing.
     pub fn add(&mut self, a: impl Into<Input>, b: impl Into<Input>) -> NodeId {
         self.node(crate::nodes::Add, [a.into(), b.into()])
+    }
+
+    /// Declare an event that nodes can handle.
+    pub fn event(&mut self, decl: EventDecl) -> EventId {
+        self.events.push(decl);
+        EventId((self.events.len() - 1) as u16)
     }
 
     /// Send `x` to every output channel.

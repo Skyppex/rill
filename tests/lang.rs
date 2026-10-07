@@ -254,10 +254,9 @@ fn parse_errors_point_at_the_problem() {
 
 #[test]
 fn parser_recovers_at_the_next_definition() {
-    let errs = lang::parse(
-        "fn a( -> Sample { 1 }\nfn b() Sample { 2 }\nrill c(x: ) Sample { return x }",
-    )
-    .unwrap_err();
+    let errs =
+        lang::parse("fn a( -> Sample { 1 }\nfn b() Sample { 2 }\nrill c(x: ) Sample { return x }")
+            .unwrap_err();
     assert_eq!(errs.len(), 2, "{errs:#?}");
 }
 
@@ -1101,7 +1100,9 @@ fn operators_line_up_with_the_outer_layers() {
 #[test]
 fn reductions_take_the_outer_layer_off() {
     let stereo = || frame(Type::Sample, 2);
-    let src = with_voices("let a = sum(buses)\nlet b = max(buses)\nlet c = min(buses)\nlet d = sum(mono)");
+    let src = with_voices(
+        "let a = sum(buses)\nlet b = max(buses)\nlet c = min(buses)\nlet d = sum(mono)",
+    );
     for name in ["a", "b", "c"] {
         assert_eq!(type_of(&src, name), stereo(), "{name}");
     }
@@ -1128,4 +1129,129 @@ fn the_entry_rill_stays_flat() {
             ),
         ]
     );
+}
+
+// ---- events -------------------------------------------------------------
+
+/// `decls` at the top, then a rill with `handlers` in its body.
+fn with_events(decls: &str, handlers: &str) -> String {
+    format!("{decls}\nrill main() Sample {{\n{handlers}\nreturn 0\n}}")
+}
+
+#[test]
+fn event_declarations() {
+    assert_ok(&with_events(
+        "event keys note_on(sender: 5, channel: 1)\nevent all note_off\nevent cc control_change(channel: 11);",
+        "on keys(n) { }\non all { }\non cc(v) { }",
+    ));
+
+    for (decls, msg, help) in [
+        (
+            "event keys note_onn",
+            "unknown event kind `note_onn`",
+            Some("did you mean `note_on`?"),
+        ),
+        (
+            "event keys note_on(device: 1)",
+            "unknown filter `device`",
+            Some("events can be filtered by `sender` and `channel`"),
+        ),
+        (
+            "event keys note_on(channel: 1, channel: 2)",
+            "filter `channel` is given more than once",
+            None,
+        ),
+        (
+            "event keys note_on(channel: 1.5)",
+            "a filter is a whole number ≥ 0",
+            Some("filters are fixed when the program is built, as in `channel: 1`"),
+        ),
+        (
+            "event keys note_on(channel: -1)",
+            "a filter is a whole number ≥ 0",
+            Some("filters are fixed when the program is built, as in `channel: 1`"),
+        ),
+        (
+            "event keys note_on\nevent keys note_off",
+            "event `keys` is declared more than once",
+            None,
+        ),
+        (
+            "event main note_on",
+            "`main` is already the name of a fn or rill",
+            None,
+        ),
+        (
+            "event note_on(note)",
+            "expected the event's kind (`note_on`, `note_off` or `control_change`) after its name, found `(`",
+            Some("give it a name and a kind, as in `event keys note_on(channel: 1)`"),
+        ),
+    ] {
+        let src = with_events(decls, "on keys { }");
+        let errs: Vec<Diagnostic> = diagnostics(&src)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .collect();
+        assert_eq!(errs[0].message, msg, "{decls}");
+        assert_eq!(errs[0].help.as_deref(), help, "{decls}");
+    }
+}
+
+#[test]
+fn event_handlers() {
+    let decls = "event keys note_on\nevent lifts note_off\nevent cc control_change";
+    let all = "on keys { }\non lifts { }\non cc { }";
+    for (handler, msg, help) in [
+        (
+            "on key(n) { }",
+            "unknown event `key`".to_owned(),
+            Some("did you mean `keys`?".to_owned()),
+        ),
+        (
+            "on note_on(n) { }",
+            "`note_on` is a kind of event, not a declared event".to_owned(),
+            Some("declare one at the top level and handle it by name: `event keys note_on(channel: 1)`, then `on keys(...)`".to_owned()),
+        ),
+        (
+            "on keys(a, b) { }",
+            "an event handler takes one parameter: the event".to_owned(),
+            Some("read its fields, as in `note.pitch`".to_owned()),
+        ),
+        (
+            "on keys(n) { let r = n.release }",
+            "a `NoteOn` has no field `release`".to_owned(),
+            Some("`release` belongs to `note_off` events; a `NoteOn` has `pitch` and `velocity`".to_owned()),
+        ),
+        (
+            "on lifts(n) { let v = n.velocity }",
+            "a `NoteOff` has no field `velocity`".to_owned(),
+            Some("`velocity` belongs to `note_on` events; a `NoteOff` has `pitch` and `release`".to_owned()),
+        ),
+        (
+            "on cc(v) { let x = v.value }",
+            "cannot read fields from `Float`".to_owned(),
+            None,
+        ),
+    ] {
+        let (m, h) = error(&with_events(decls, &format!("{all}\n{handler}")));
+        assert_eq!(m, msg, "{handler}");
+        assert_eq!(h, help, "{handler}");
+    }
+
+    // Payload types come from the kind, whatever the parameter is called.
+    let src = with_events(
+        decls,
+        "state p: Pitch = A4\nstate x: Float = 0
+         on keys(anything) { p = anything.pitch; x = anything.velocity }
+         on lifts(n) { x = n.release }
+         on cc(v) { x = v }",
+    );
+    assert_ok(&src);
+
+    // A declaration nothing handles is a warning.
+    let warnings: Vec<String> = diagnostics(&with_events(decls, "on keys { }\non cc { }"))
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+    assert_eq!(warnings, ["event `lifts` is declared but never handled"]);
 }

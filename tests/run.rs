@@ -2,7 +2,7 @@
 
 use rill::lang;
 use rill::offline::{self, Blocks};
-use rill::{Config, Engine, EventValue, Graph, ParamEvent, RillEvent};
+use rill::{Config, Dispatch, Engine, Event, Graph, ParamEvent, Payload, RillEvent};
 
 const RATE: u32 = 48_000;
 
@@ -196,9 +196,10 @@ fn parameter_events_split_blocks_at_sample_offsets() {
 #[test]
 fn rill_events_run_handlers_at_sample_offsets() {
     let src = "
+        event keys note_on
         rill main() Sample {
             state pitch: Freq = 440Hz
-            on note_on(note) {
+            on keys(note) {
                 pitch = note.pitch |> equal(12)
             }
             return pitch / 1Hz
@@ -206,17 +207,20 @@ fn rill_events_run_handlers_at_sample_offsets() {
     ";
     let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
     let mut out = [0.0f32; 6];
-    let values = [EventValue {
-        name: "pitch".to_owned(),
-        value: rill::lang::check::pitch_literal("E5").unwrap(),
-    }];
+    let e5 = rill::lang::check::pitch_literal("E5").unwrap();
     engine.render_interleaved_with_rill_events(
         &mut out,
         |x| x,
         &[RillEvent {
             frame_offset: 2,
-            name: "note_on",
-            values: &values,
+            dispatch: Dispatch::Incoming(Event {
+                sender: 0,
+                channel: 0,
+                payload: Payload::NoteOn {
+                    pitch: e5,
+                    velocity: 1.0,
+                },
+            }),
         }],
     );
     for x in &out[..2] {
@@ -819,7 +823,11 @@ fn a_chord_through_a_stereo_voice_mixes_to_stereo() {
         }}"
     );
     let ours = render_with(&lifted, 2, 2_000, Blocks::Fixed(64));
-    close(&ours, &render_with(&by_hand, 2, 2_000, Blocks::Fixed(64)), 1e-6);
+    close(
+        &ours,
+        &render_with(&by_hand, 2, 2_000, Blocks::Fixed(64)),
+        1e-6,
+    );
     assert!(ours.iter().any(|x| x.abs() > 0.5), "the chord is audible");
 }
 
@@ -886,5 +894,123 @@ fn nested_frames_in_operators_state_and_indexing() {
             return bus
         }
     ";
-    assert_eq!(stereo(src, 4), [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [1.0, 2.0]]);
+    assert_eq!(
+        stereo(src, 4),
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [1.0, 2.0]]
+    );
+}
+
+// ---- events -------------------------------------------------------------
+
+const EVENTS: &str = "
+event keys note_on(sender: 5, channel: 1)
+event any_note note_on
+event lifts note_off(sender: 5)
+event mod control_change(channel: 1)
+event bend control_change(channel: 2)
+
+rill main() [Sample; 4] {
+    state a: Sample = 0
+    state b: Sample = 0
+    state c: Sample = 0
+    state d: Sample = 0
+    on keys(note) { a = a + note.velocity }
+    on any_note(note) { b = b + 1 }
+    on lifts(note) { c = note.release }
+    on mod(value) { d = value }
+    on bend { d = -1 }
+    return [a, b, c, d]
+}
+";
+
+fn note_on(sender: u32, channel: u32, velocity: f32) -> Event {
+    Event {
+        sender,
+        channel,
+        payload: Payload::NoteOn {
+            pitch: 60.0,
+            velocity,
+        },
+    }
+}
+
+/// One frame of [`EVENTS`] after sending `events`.
+fn after(events: &[Event]) -> Vec<f32> {
+    let mut engine = Engine::new(graph(EVENTS, 4), config(4)).unwrap();
+    for e in events {
+        engine.send(e);
+    }
+    let mut out = [0.0f32; 4];
+    engine.render_interleaved(&mut out);
+    out.to_vec()
+}
+
+#[test]
+fn declarations_filter_by_sender_and_channel() {
+    // Matches both `keys` and `any_note`.
+    assert_eq!(after(&[note_on(5, 1, 0.5)]), [0.5, 1.0, 0.0, 0.0]);
+    // Wrong sender or channel: only the unfiltered `any_note`.
+    assert_eq!(after(&[note_on(4, 1, 0.5)]), [0.0, 1.0, 0.0, 0.0]);
+    assert_eq!(after(&[note_on(5, 2, 0.5)]), [0.0, 1.0, 0.0, 0.0]);
+    // An omitted filter matches any channel.
+    let off = Event {
+        sender: 5,
+        channel: 9,
+        payload: Payload::NoteOff {
+            pitch: 60.0,
+            release: 0.25,
+        },
+    };
+    assert_eq!(after(&[off]), [0.0, 0.0, 0.25, 0.0]);
+    // Control changes go by channel; the value arrives as it is sent.
+    let cc = |channel, value| Event {
+        sender: 0,
+        channel,
+        payload: Payload::Control(value),
+    };
+    assert_eq!(after(&[cc(1, 0.75)]), [0.0, 0.0, 0.0, 0.75]);
+    assert_eq!(after(&[cc(2, 0.75)]), [0.0, 0.0, 0.0, -1.0]);
+    assert_eq!(after(&[cc(3, 0.75)]), [0.0; 4]);
+    // One event fires every matching declaration, each once.
+    assert_eq!(
+        after(&[note_on(5, 1, 0.5), note_on(5, 1, 0.25)]),
+        [0.75, 2.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn sending_to_a_declared_event_skips_its_filters() {
+    let mut engine = Engine::new(graph(EVENTS, 4), config(4)).unwrap();
+    let keys = engine.event_id("keys").unwrap();
+    let on = Payload::NoteOn {
+        pitch: 60.0,
+        velocity: 0.5,
+    };
+    assert!(engine.send_to(keys, on));
+    // A payload of another kind is refused.
+    assert!(!engine.send_to(keys, Payload::Control(1.0)));
+    assert_eq!(engine.event_id("nope"), None);
+    let mut out = [0.0f32; 4];
+    engine.render_interleaved(&mut out);
+    // Only `keys` ran: `any_note` was not sent to.
+    assert_eq!(out, [0.5, 0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn every_lifted_instance_handles_the_event() {
+    let src = "
+        event hit note_on
+        rill counter(step: Sample) Sample {
+            state n: Sample = 0
+            on hit { n = n + step }
+            return n
+        }
+        rill main() [Sample; 2] { return counter([1, 10]) }
+    ";
+    let mut engine = Engine::new(graph(src, 2), config(2)).unwrap();
+    engine.send(&note_on(0, 0, 1.0));
+    engine.send(&note_on(0, 0, 1.0));
+    let mut out = [0.0f32; 2];
+    engine.render_interleaved(&mut out);
+    assert_eq!(out, [2.0, 20.0]);
 }

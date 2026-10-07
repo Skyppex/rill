@@ -154,7 +154,7 @@ Rules:
 - A tuning's settings are ordinary arguments, so they can change while playing (`a4` from a live control, say). Your own tuning is any `fn(Pitch) Freq`.
 - Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Freq` and mixing on streams. The built-in tunings accept a chord and tune each pitch; passing the result to a rill that takes `Freq` lifts it to one voice per pitch.
 - When every input is known at build time, tuning constant-folds to a number. Otherwise it is evaluated per tick.
-- Note events carry `pitch` as a `Pitch` and `velocity` in 0–1. Velocity is linear; a curve such as `velocity * velocity` sounds more even, since a straight line is too loud at soft velocities.
+- Note events carry `pitch` as a `Pitch` and `velocity` (or `release`) in 0–1 (see Events). Velocity is linear; a curve such as `velocity * velocity` sounds more even, since a straight line is too loud at soft velocities.
 
 ## Levels
 
@@ -174,6 +174,45 @@ Rules:
 - Levels combine with `+`/`-`, scale with `*`/`/` by plain numbers (half of `-6dB` is `-3dB`), and compare with each other. `Gain / Gain` is a plain ratio.
 - A `Gain` is stored as an amplitude factor (`-6dB` is about 0.5), so any plain number can be passed where a `Gain` is expected: `0.5` means about -6dB. Hosts send `Gain` controls the same way. Inside an expression nothing converts: `voice - 0.5` is ordinary subtraction.
 - `level(x)` is the level of an amplitude (`level(1)` is 0dB; silence is held at -120dB instead of -inf). `amp(g)` is the amplitude factor of a level.
+
+## Events
+
+Events come from outside the program: a keyboard, a plugin host, a test, later the sequencer. Every incoming event has a **kind**, a `sender`, a `channel` and a payload. What senders and channels mean is up to whoever sends the event; Rill only compares the numbers. Nothing is tied to MIDI: a MIDI host would use a number per device as the sender, and put control change 11 on channel 11.
+
+A program declares the events it handles, once, at the top level: a name, a kind, and optional filters. Handlers name the declaration, so the routing lives in one place and the code that reacts never sees sender or channel numbers.
+
+```rill
+event keys_press note_on(sender: 5, channel: 1)
+event keys_release note_off(sender: 5, channel: 1)
+event expression control_change(sender: 5, channel: 11)
+event melody note_on                    // no filters: every note_on
+
+rill synth() Sample {
+    state pitch: Pitch = A4
+    state level: Float = 0
+    state bright: Float = 0
+
+    on keys_press(note) { pitch = note.pitch; level = note.velocity }
+    on keys_release(note) { level = level * (1 - note.release) }
+    on expression(value) { bright = value }
+    ...
+}
+```
+
+| Kind | Handler receives | Fields |
+| --- | --- | --- |
+| `note_on` | `NoteOn` | `pitch: Pitch`, `velocity: Float` (0–1) |
+| `note_off` | `NoteOff` | `pitch: Pitch`, `release: Float` (0–1) |
+| `control_change` | `Float` | the value, as sent |
+
+Rules:
+
+- The filters are `sender` and `channel`, whole-number constants. A filter left out matches anything.
+- An incoming event runs the handlers of every declaration it matches, in declaration order. A host can also send straight to a declaration by name, skipping its filters; tests and the sequencer do that.
+- `on NAME(param)` takes at most one parameter, typed by the event's kind whatever it is called; `on NAME { ... }` ignores the payload. Each payload has only its own kind's fields: `note.release` in a `note_on` handler is an error.
+- Handlers live in rills. Every instance handles the event, so a lifted rill reacts once per copy.
+- Pitch bend, aftertouch and any other controller are control changes on their own channel.
+- A declaration nothing handles is a warning.
 
 ## Functions as values
 
@@ -239,9 +278,13 @@ void         rill_render(rill_engine*,                      // run stage, real-t
                          const void* const* in, void* const* out,
                          uint32_t frames);
 void         rill_set_param(rill_engine*, const char* name, float value);  // a parameter of the entry rill
-void         rill_send_event(rill_engine*, uint32_t frame_offset, rill_event ev);
+void         rill_send_event(rill_engine*, uint32_t frame_offset, rill_event ev);       // matched against the declarations
+int32_t      rill_event_id(rill_engine*, const char* name);                            // a declared event, or -1
+void         rill_send_event_to(rill_engine*, uint32_t frame_offset, int32_t id, rill_payload p);
 void         rill_destroy(rill_engine*);
 ```
+
+A `rill_event` is a sender, a channel and a `rill_payload`: a tagged union of note on (pitch, velocity), note off (pitch, release) and control change (value).
 
 On microcontrollers the host calls `rill_render` from the DMA half-complete and complete interrupts. Memory use is fixed after `rill_load` and can be reported so the host can size its arena.
 

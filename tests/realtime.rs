@@ -100,3 +100,46 @@ fn compiled_rill_programs_do_not_allocate() {
         assert!(out.iter().any(|&x| x != 0.0), "{name} rendered silence");
     }
 }
+
+#[test]
+fn matching_and_handling_events_does_not_allocate() {
+    use rill::{Dispatch, Event, Payload, RillEvent};
+    let path = format!("{}/examples/live_control.rill", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(path).unwrap();
+    let config = Config {
+        sample_rate: 48_000,
+        max_frames: 64,
+        out_channels: 2,
+    };
+    let (graph, _) = rill::lang::load(&src, &config, "main").unwrap();
+    let mut engine = Engine::new(graph, config).unwrap();
+    let press = Event {
+        sender: 1,
+        channel: 3,
+        payload: Payload::NoteOn {
+            pitch: 64.0,
+            velocity: 0.8,
+        },
+    };
+    let brightness = Event {
+        sender: 1,
+        channel: 74,
+        payload: Payload::Control(0.5),
+    };
+    let events = [
+        RillEvent {
+            frame_offset: 10,
+            dispatch: Dispatch::Incoming(press),
+        },
+        RillEvent {
+            frame_offset: 500,
+            dispatch: Dispatch::Incoming(brightness),
+        },
+    ];
+    let mut out = vec![0.0f32; 2 * 1000];
+    let count = allocations_during(|| {
+        engine.render_interleaved_with_rill_events(&mut out, |x| x, &events);
+        engine.send(&press);
+    });
+    assert_eq!(count, 0);
+}

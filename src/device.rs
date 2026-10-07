@@ -14,8 +14,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
 use crate::engine::{Config, Engine};
+use crate::event::{Dispatch, parse_dispatch};
 use crate::graph::Graph;
-use crate::node::EventValue;
 
 /// If no PulseAudio cookie can be found, write an all-zero one to the temp
 /// directory and point `$PULSE_COOKIE` at it for this process.
@@ -71,11 +71,14 @@ pub struct ScheduledParamEvent {
     pub time_seconds: f32,
 }
 
+/// An event to send at a time, written out: `target` is an event kind or
+/// the name of a declared event, with fields by name (see
+/// [`parse_dispatch`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScheduledRillEvent {
-    pub name: String,
+    pub target: String,
     pub time_seconds: f32,
-    pub values: Vec<EventValue>,
+    pub fields: Vec<(String, f32)>,
 }
 
 /// Callback period requested when the caller does not pick one.
@@ -152,7 +155,7 @@ pub fn play(
     let engine = Engine::new(make_graph(&config)?, config)?;
     validate_param_events(&engine, &options.param_events)?;
     let scheduled_params = schedule_param_events(&config, &options.param_events);
-    let scheduled_rill = schedule_rill_events(&config, &options.events);
+    let scheduled_rill = schedule_rill_events(&engine, &config, &options.events)?;
 
     let stream = match format {
         SampleFormat::F32 => build::<f32>(
@@ -266,8 +269,7 @@ where
                 while next_rill_event < rill_events.len()
                     && rill_events[next_rill_event].frame == absolute
                 {
-                    let event = &rill_events[next_rill_event];
-                    engine.send_event(&event.name, &event.values);
+                    engine.dispatch(&rill_events[next_rill_event].dispatch);
                     next_rill_event += 1;
                 }
                 let next_param_frame = scheduled
@@ -295,8 +297,7 @@ where
             while next_rill_event < rill_events.len()
                 && rill_events[next_rill_event].frame == callback_end
             {
-                let event = &rill_events[next_rill_event];
-                engine.send_event(&event.name, &event.values);
+                engine.dispatch(&rill_events[next_rill_event].dispatch);
                 next_rill_event += 1;
             }
         },
@@ -316,8 +317,7 @@ struct ScheduledParamEventAtFrame {
 
 #[derive(Clone, Debug)]
 struct ScheduledRillEventAtFrame {
-    name: String,
-    values: Vec<EventValue>,
+    dispatch: Dispatch,
     frame: u64,
 }
 
@@ -353,19 +353,22 @@ fn schedule_param_events(
 }
 
 fn schedule_rill_events(
+    engine: &Engine,
     config: &Config,
     events: &[ScheduledRillEvent],
-) -> Vec<ScheduledRillEventAtFrame> {
+) -> anyhow::Result<Vec<ScheduledRillEventAtFrame>> {
     let mut scheduled = events
         .iter()
-        .map(|event| ScheduledRillEventAtFrame {
-            name: event.name.clone(),
-            values: event.values.clone(),
-            frame: (event.time_seconds * config.sample_rate as f32).round() as u64,
+        .map(|event| {
+            Ok(ScheduledRillEventAtFrame {
+                dispatch: parse_dispatch(engine.events(), &event.target, &event.fields)
+                    .map_err(anyhow::Error::msg)?,
+                frame: (event.time_seconds * config.sample_rate as f32).round() as u64,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     scheduled.sort_by_key(|event| event.frame);
-    scheduled
+    Ok(scheduled)
 }
 
 /// Names of the hosts and output devices cpal can see, for diagnostics.

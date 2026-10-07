@@ -5,7 +5,8 @@
 //! Jumps only go forward, so every tick finishes in at most `instrs.len()`
 //! steps: there are no loops at run time.
 
-use crate::node::{Context, Event, Inputs, Node, Outputs};
+use crate::event::{EventId, Payload};
+use crate::node::{Context, Inputs, Node, Outputs};
 use crate::ops::{Op1, Op2};
 
 /// An instruction operand.
@@ -162,24 +163,15 @@ pub struct Code {
     pub events: Vec<EventCode>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct EventCode {
-    pub name: String,
-    pub bindings: Vec<EventBinding>,
-    pub instrs: Vec<Instr>,
-}
-
+/// One `on` handler: the code to run when the declared event `event`
+/// arrives.
 #[derive(Clone, Debug, PartialEq)]
-pub enum EventBinding {
-    Scalar {
-        name: String,
-        reg: u16,
-    },
-    Field {
-        path: String,
-        fallback: String,
-        reg: u16,
-    },
+pub struct EventCode {
+    pub event: EventId,
+    /// Registers that receive the payload's values, in
+    /// [`EventKind::fields`](crate::event::EventKind::fields) order.
+    pub payload: Vec<u16>,
+    pub instrs: Vec<Instr>,
 }
 
 impl Code {
@@ -331,79 +323,56 @@ impl Node for Program {
         }
     }
 
-    fn handle_event(&mut self, event: &Event<'_>, _sample_rate: f32) -> bool {
-        let Some(handler) = self
-            .code
-            .events
-            .iter()
-            .find(|handler| handler.name == event.name)
-        else {
-            return false;
-        };
-        let regs = &mut self.regs[..];
-        let val = |regs: &[f32], o: Operand| match o {
-            Operand::Reg(r) => regs[r as usize],
-            Operand::Const(c) => c,
-        };
-        let event_value = |name: &str| {
-            event
-                .values
-                .iter()
-                .find(|value| value.name == name)
-                .map(|value| value.value)
-        };
-        for binding in &handler.bindings {
-            match binding {
-                EventBinding::Scalar { name, reg } => {
-                    regs[*reg as usize] = event_value(name).unwrap_or(0.0);
-                }
-                EventBinding::Field {
-                    path,
-                    fallback,
-                    reg,
-                } => {
-                    regs[*reg as usize] = event_value(path)
-                        .or_else(|| event_value(fallback))
-                        .unwrap_or(0.0);
-                }
+    fn handle_event(&mut self, event: EventId, payload: &Payload, _sample_rate: f32) -> bool {
+        let mut handled = false;
+        // Every instance in the program can have its own handler.
+        for handler in self.code.events.iter().filter(|h| h.event == event) {
+            handled = true;
+            let regs = &mut self.regs[..];
+            let val = |regs: &[f32], o: Operand| match o {
+                Operand::Reg(r) => regs[r as usize],
+                Operand::Const(c) => c,
+            };
+            for (&reg, value) in handler.payload.iter().zip(payload.values()) {
+                regs[reg as usize] = value;
             }
-        }
-        let mut pc = 0;
-        while let Some(instr) = handler.instrs.get(pc) {
-            pc += 1;
-            match *instr {
-                Instr::Op2 { op, dst, a, b } => {
-                    regs[dst as usize] = op.apply(val(regs, a), val(regs, b));
-                }
-                Instr::Op1 { op, dst, x } => {
-                    regs[dst as usize] = op.apply(val(regs, x), _sample_rate);
-                }
-                Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
-                Instr::Tune {
-                    tuning,
-                    dst,
-                    pitch,
-                    setting,
-                    a4,
-                } => {
-                    regs[dst as usize] =
-                        tuning.frequency(val(regs, pitch), val(regs, setting), val(regs, a4));
-                }
-                Instr::Select { dst, cond, a, b } => {
-                    regs[dst as usize] = if val(regs, cond) != 0.0 {
-                        val(regs, a)
-                    } else {
-                        val(regs, b)
-                    };
-                }
-                Instr::JumpUnless { cond, target } => {
-                    if val(regs, cond) == 0.0 {
-                        pc = target as usize;
+            let mut pc = 0;
+            while let Some(instr) = handler.instrs.get(pc) {
+                pc += 1;
+                match *instr {
+                    Instr::Op2 { op, dst, a, b } => {
+                        regs[dst as usize] = op.apply(val(regs, a), val(regs, b));
                     }
+                    Instr::Op1 { op, dst, x } => {
+                        regs[dst as usize] = op.apply(val(regs, x), _sample_rate);
+                    }
+                    Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
+                    Instr::Tune {
+                        tuning,
+                        dst,
+                        pitch,
+                        setting,
+                        a4,
+                    } => {
+                        regs[dst as usize] =
+                            tuning.frequency(val(regs, pitch), val(regs, setting), val(regs, a4));
+                    }
+                    Instr::Select { dst, cond, a, b } => {
+                        regs[dst as usize] = if val(regs, cond) != 0.0 {
+                            val(regs, a)
+                        } else {
+                            val(regs, b)
+                        };
+                    }
+                    Instr::JumpUnless { cond, target } => {
+                        if val(regs, cond) == 0.0 {
+                            pc = target as usize;
+                        }
+                    }
+                    Instr::Jump { target } => pc = target as usize,
                 }
-                Instr::Jump { target } => pc = target as usize,
             }
         }
-        true
+        handled
     }
 }

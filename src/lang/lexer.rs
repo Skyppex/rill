@@ -505,8 +505,8 @@ mod tests {
         assert_eq!(
             kinds("rill f(x) Sample { x |> g /* c /* nested */ */ } // end\n a != b || !c"),
             vec![
-                Rill, Ident, LParen, Ident, RParen, Ident, LBrace, Ident, Pipe, Ident,
-                RBrace, Ident, Ne, Ident, OrOr, Bang, Ident, Eof
+                Rill, Ident, LParen, Ident, RParen, Ident, LBrace, Ident, Pipe, Ident, RBrace,
+                Ident, Ne, Ident, OrOr, Bang, Ident, Eof
             ]
         );
     }

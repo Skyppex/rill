@@ -21,8 +21,10 @@ pub enum Type {
     /// A level change, written in `dB`. Stored as an amplitude factor, so
     /// any plain number can be used where a `Gain` is expected.
     Gain,
-    /// Dynamically shaped payload passed to an `on event(...)` handler.
-    Event,
+    /// What an `on` handler of a `note_on` event receives.
+    NoteOn,
+    /// What an `on` handler of a `note_off` event receives.
+    NoteOff,
     /// An unsuffixed number literal not yet pinned to `Sample`, `Float` or
     /// `Int`. It becomes whichever plain numeric type it meets.
     Num,
@@ -69,7 +71,8 @@ impl fmt::Display for Type {
             Type::Time => f.write_str("Time"),
             Type::Interval => f.write_str("Interval"),
             Type::Gain => f.write_str("Gain"),
-            Type::Event => f.write_str("event"),
+            Type::NoteOn => f.write_str("NoteOn"),
+            Type::NoteOff => f.write_str("NoteOff"),
             Type::Num => f.write_str("number"),
             Type::Frame(elem, size) => write!(f, "[{elem}; {size}]"),
             Type::Fn(params, ret) => {
@@ -115,6 +118,15 @@ impl Type {
     /// Values that can be compared, ordered and put in a frame.
     pub fn is_quantity(&self) -> bool {
         self.is_plain() || self.is_dimensioned() || matches!(self, Type::Pitch | Type::Gain)
+    }
+
+    /// The event kind whose payload this is, for `NoteOn` and `NoteOff`.
+    pub fn event_kind(&self) -> Option<crate::event::EventKind> {
+        match self {
+            Type::NoteOn => Some(crate::event::EventKind::NoteOn),
+            Type::NoteOff => Some(crate::event::EventKind::NoteOff),
+            _ => None,
+        }
     }
 
     /// What a frame holds once every layer is taken off; the type itself

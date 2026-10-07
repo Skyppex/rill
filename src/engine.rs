@@ -3,9 +3,10 @@
 use std::fmt;
 
 use crate::denormal::FlushDenormals;
+use crate::event::{Dispatch, Event, EventDecl, EventId, Payload};
 use crate::format::OutSample;
 use crate::graph::{Graph, Input, Output};
-use crate::node::{Context, Event, EventValue, Inputs, Node, Outputs, Port};
+use crate::node::{Context, Inputs, Node, Outputs, Port};
 
 /// What the host promises the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,12 +64,11 @@ pub struct ParamEvent<'a> {
     pub value: f32,
 }
 
-/// A timestamped rill event, relative to one render call.
+/// A timestamped event, relative to one render call.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RillEvent<'a> {
+pub struct RillEvent {
     pub frame_offset: usize,
-    pub name: &'a str,
-    pub values: &'a [EventValue],
+    pub dispatch: Dispatch,
 }
 
 impl fmt::Display for BuildError {
@@ -125,6 +125,8 @@ pub struct Engine {
     outputs: Vec<Port>,
     /// Live controls by public name and scheduled node slot.
     controls: Vec<(String, usize)>,
+    /// Declared events, indexed by [`EventId`].
+    events: Vec<EventDecl>,
     position: u64,
 }
 
@@ -142,7 +144,11 @@ impl Engine {
             return Err(BuildError::InvalidConfig("out_channels must be > 0"));
         }
 
-        let Graph { entries, output } = graph;
+        let Graph {
+            entries,
+            output,
+            events,
+        } = graph;
 
         for entry in &entries {
             let expected = entry.node.inputs();
@@ -231,6 +237,7 @@ impl Engine {
             buffers,
             outputs,
             controls,
+            events,
             position: 0,
         })
     }
@@ -289,13 +296,52 @@ impl Engine {
         self.nodes[*node].set_control_value(value, self.config.sample_rate as f32)
     }
 
-    pub fn send_event(&mut self, name: &str, values: &[EventValue]) -> bool {
-        let event = Event { name, values };
+    /// The program's declared events, indexed by [`EventId`].
+    pub fn events(&self) -> &[EventDecl] {
+        &self.events
+    }
+
+    /// Look up a declared event by name. Do this before playing; the audio
+    /// thread should only pass ids around.
+    pub fn event_id(&self, name: &str) -> Option<EventId> {
+        self.events
+            .iter()
+            .position(|d| d.name == name)
+            .map(|i| EventId(i as u16))
+    }
+
+    /// Run the handlers of every declaration `event` matches, in
+    /// declaration order. Returns whether any ran.
+    pub fn send(&mut self, event: &Event) -> bool {
         let mut handled = false;
-        for node in &mut self.nodes {
-            handled |= node.handle_event(&event, self.config.sample_rate as f32);
+        for i in 0..self.events.len() {
+            if self.events[i].matches(event) {
+                handled |= self.send_to(EventId(i as u16), event.payload);
+            }
         }
         handled
+    }
+
+    /// Run the handlers of the declared event `id`, skipping its filters.
+    /// Returns `false` if there is no such event, the payload is of another
+    /// kind, or nothing handles it.
+    pub fn send_to(&mut self, id: EventId, payload: Payload) -> bool {
+        match self.events.get(usize::from(id.0)) {
+            Some(decl) if decl.kind == payload.kind() => {}
+            _ => return false,
+        }
+        let mut handled = false;
+        for node in &mut self.nodes {
+            handled |= node.handle_event(id, &payload, self.config.sample_rate as f32);
+        }
+        handled
+    }
+
+    pub fn dispatch(&mut self, dispatch: &Dispatch) -> bool {
+        match dispatch {
+            Dispatch::Incoming(event) => self.send(event),
+            Dispatch::To(id, payload) => self.send_to(*id, *payload),
+        }
     }
 
     /// Render into planar output, one slice per channel. All slices must be
@@ -377,7 +423,7 @@ impl Engine {
         &mut self,
         out: &mut [T],
         convert: impl Fn(f32) -> T,
-        events: &[RillEvent<'_>],
+        events: &[RillEvent],
     ) {
         self.render_interleaved_with_param_and_rill_events(out, convert, &[], events);
     }
@@ -387,7 +433,7 @@ impl Engine {
         out: &mut [T],
         convert: impl Fn(f32) -> T,
         param_events: &[ParamEvent<'_>],
-        rill_events: &[RillEvent<'_>],
+        rill_events: &[RillEvent],
     ) {
         let channels = self.config.out_channels;
         let frames = out.len() / channels;
@@ -409,7 +455,7 @@ impl Engine {
                 param_event += 1;
             }
             while rill_event < rill_events.len() && rill_events[rill_event].frame_offset == done {
-                self.send_event(rill_events[rill_event].name, rill_events[rill_event].values);
+                self.dispatch(&rill_events[rill_event].dispatch);
                 rill_event += 1;
             }
             let next_param_event = param_events
@@ -453,7 +499,7 @@ impl Engine {
             param_event += 1;
         }
         while rill_event < rill_events.len() && rill_events[rill_event].frame_offset == frames {
-            self.send_event(rill_events[rill_event].name, rill_events[rill_event].values);
+            self.dispatch(&rill_events[rill_event].dispatch);
             rill_event += 1;
         }
     }
@@ -555,7 +601,7 @@ fn assert_events_sorted(events: &[ParamEvent<'_>]) {
     );
 }
 
-fn assert_rill_events_sorted(events: &[RillEvent<'_>]) {
+fn assert_rill_events_sorted(events: &[RillEvent]) {
     assert!(
         events
             .windows(2)

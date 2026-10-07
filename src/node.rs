@@ -1,5 +1,7 @@
 //! The run-stage interface every node implements.
 
+use crate::event::{EventId, Payload};
+
 /// Per-block information handed to every node.
 #[derive(Clone, Copy, Debug)]
 pub struct Context {
@@ -9,19 +11,6 @@ pub struct Context {
     pub frames: usize,
     /// Absolute frame index of the first frame in this block.
     pub position: u64,
-}
-
-/// One control event delivered between samples.
-#[derive(Clone, Copy, Debug)]
-pub struct Event<'a> {
-    pub name: &'a str,
-    pub values: &'a [EventValue],
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct EventValue {
-    pub name: String,
-    pub value: f32,
 }
 
 /// One input as seen from inside [`Node::process`].
@@ -148,8 +137,9 @@ pub trait Node: Send {
         false
     }
 
-    /// Handle a timestamped event delivered between samples.
-    fn handle_event(&mut self, _event: &Event<'_>, _sample_rate: f32) -> bool {
+    /// Run the handlers for the declared event `event`, between samples.
+    /// Returns whether the node has any.
+    fn handle_event(&mut self, _event: EventId, _payload: &Payload, _sample_rate: f32) -> bool {
         false
     }
 }

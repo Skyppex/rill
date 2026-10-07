@@ -9,6 +9,7 @@ pub mod denormal;
 #[cfg(feature = "device")]
 pub mod device;
 pub mod engine;
+pub mod event;
 pub mod format;
 pub mod graph;
 pub mod lang;
@@ -20,5 +21,6 @@ pub mod patches;
 pub mod wav;
 
 pub use engine::{BuildError, Config, Engine, ParamEvent, RillEvent};
+pub use event::{Dispatch, Event, EventDecl, EventId, EventKind, Payload};
 pub use graph::{Graph, Input, NodeId};
-pub use node::{Context, Event, EventValue, Inputs, Node, Signal};
+pub use node::{Context, Inputs, Node, Signal};

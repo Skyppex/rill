@@ -1,5 +1,12 @@
 // Live control example highlighting parameters, smoothing and events.
 // The entry rill exposes `depth` (LFO speed) and `gain` as realtime controls.
+
+// Events, declared once: a name, a kind, and which senders and channels it
+// accepts. What the numbers mean is up to whoever sends the events.
+event keys_press note_on(sender: 1)
+event keys_release note_off(sender: 1)
+event brightness control_change(sender: 1, channel: 74)
+
 rill sine(freq: Freq) Sample {
     state phase: Float = 0
     phase = wrap(phase + freq / RATE)
@@ -11,40 +18,30 @@ rill main() Sample {
 }
 
 rill live_control(depth: Freq = 0.5Hz, gain: Sample = 0.25) Sample {
-    // Preserve the last note's pitch and release so events can shape the tone.
+    // Keep the last note's pitch and level so events can shape the tone.
     state pitch: Pitch = A4
-    state release: Sample = 0.0
+    state level: Sample = 0.0
     state cc_gain: Sample = 0.0
 
-    on note_on(note) {
-        // Update pitch + release immediately when a note starts.
+    on keys_press(note) {
+        // Update pitch and level immediately when a note starts.
         pitch = note.pitch
-        release = note.velocity
+        level = note.velocity
     }
 
-    on note_off(note) {
-        // Let release carry the last velocity so the entry rill can smooth it away.
-        release = note.release
+    on keys_release(note) {
+        // A soft release keeps some of the level ringing.
+        level = level * (1 - note.release)
     }
 
-    // Map an incoming MIDI control change into the gain parameter.
-    on control_change(control, cc) {
-        // `control.channel` and `control.index` describe the MIDI source.
-        if control.index == 74 { // typically brightness
-            cc_gain = cc / 127.0
-        }
+    // Only control 74 from sender 1 arrives here; the declaration filters.
+    on brightness(value) {
+        cc_gain = value
     }
 
     // A slow LFO modulates a band-limited tone.
     let tremolo = sine(depth) * 0.3
     let tuned = (pitch |> equal(12, a4: 440Hz)) + tremolo * 120Hz
-    let voice = sine(tuned) * (gain + cc_gain + release * 0.5)
+    let voice = sine(tuned) * (gain + cc_gain + level * 0.5)
     return voice
 }
-
-// Sample-accurate event handlers.
-event note_on(note)
-event note_off(note)
-
-// Map an incoming MIDI control change into the gain parameter.
-event control_change(control, cc)

@@ -1,5 +1,5 @@
-event note_on(note)
-event note_off(note)
+event press note_on
+event release note_off
 
 rill sine(freq: Freq) Sample {
     state phase: Float = 0
@@ -14,14 +14,14 @@ rill main() Sample {
     // so this fills in the rest; named arguments are optional.
     let tuning = fn(p: Pitch) Freq { equal(p, 12, a4: 440Hz) }
 
-    on note_on(note) {
+    on press(note) {
         pitch = note.pitch // note.pitch becomes this type of pitch instead of a frequency
         // Velocity arrives as 0–1. Squaring it is a simple loudness curve:
         // a straight line sounds too loud at soft velocities.
         gain = note.velocity * note.velocity
     }
 
-    on note_off(note) {
+    on release(note) {
         gain = 0.0
     }
 

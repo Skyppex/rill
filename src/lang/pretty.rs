@@ -140,12 +140,20 @@ impl Node {
 /// ANSI colours if `color` is set.
 pub fn tree(src: &str, program: &Program, checked: &Checked, color: bool) -> String {
     let p = Printer { src, checked };
+    // Definitions and event declarations, in source order.
+    let mut nodes: Vec<(u32, Node)> = program
+        .items
+        .iter()
+        .map(|item| (item.def().span.start, p.item(item)))
+        .chain(program.events.iter().map(|e| (e.span.start, p.event(e))))
+        .collect();
+    nodes.sort_by_key(|(start, _)| *start);
     let mut out = String::new();
-    for (i, item) in program.items.iter().enumerate() {
+    for (i, (_, node)) in nodes.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        render(&p.item(item), "", "", color, &mut out);
+        render(node, "", "", color, &mut out);
     }
     out
 }
@@ -179,6 +187,29 @@ struct Printer<'a> {
 impl Printer<'_> {
     fn text(&self, span: Span) -> &str {
         &self.src[span.start as usize..span.end as usize]
+    }
+
+    /// `event keys note_on(sender: 5, channel: 1)`
+    fn event(&self, e: &EventDecl) -> Node {
+        let mut label = kw("event")
+            .plain(" ")
+            .callable(&e.name.name)
+            .plain(" ")
+            .ty(&e.kind.name);
+        if !e.filters.is_empty() {
+            label = label.plain("(");
+            for (i, f) in e.filters.iter().enumerate() {
+                if i > 0 {
+                    label = label.plain(", ");
+                }
+                label = label
+                    .ident(&f.name.name)
+                    .plain(": ")
+                    .value(self.text(f.value.span));
+            }
+            label = label.plain(")");
+        }
+        Node::leaf(label)
     }
 
     fn item(&self, item: &Item) -> Node {

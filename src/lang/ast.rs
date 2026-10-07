@@ -8,6 +8,8 @@ pub struct Program {
     pub items: Vec<Item>,
     /// Event declarations, in source order.
     pub events: Vec<EventDecl>,
+    /// Sequences, in source order.
+    pub seqs: Vec<SeqDecl>,
     /// Number of expressions; every [`Expr::id`] is below this.
     pub expr_count: u32,
 }
@@ -38,11 +40,42 @@ pub struct EventDecl {
     pub span: Span,
 }
 
-/// `sender: 5` in an event declaration.
+/// `sender: 5` in an event declaration, or `tempo: 120bpm` in a sequence's
+/// settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Filter {
     pub name: Ident,
     pub value: Expr,
+}
+
+/// `seq riff(step: 1/8) { C4, _, E4@0.5, [G4, B4] }`
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeqDecl {
+    pub name: Ident,
+    pub settings: Vec<Filter>,
+    pub steps: Vec<Step>,
+    pub span: Span,
+}
+
+/// One step of a sequence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Step {
+    /// `None` for a rest (`_`); otherwise a pitch or a chord of pitches.
+    pub notes: Option<Expr>,
+    /// `@0.5`
+    pub velocity: Option<Expr>,
+    pub span: Span,
+}
+
+/// How an `on` handler shares events out over the copies of a voice pool.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HandlerMode {
+    /// Runs in every copy.
+    Plain,
+    /// `claim` or `claim(tail: 2s)`: runs in one copy, which holds the note.
+    Claim { tail: Option<Expr> },
+    /// `release`: runs in the copy holding the note.
+    Release,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,6 +185,7 @@ pub enum Stmt {
     EventHandler {
         name: Ident,
         params: Vec<Ident>,
+        mode: HandlerMode,
         body: Block,
         span: Span,
     },
@@ -246,6 +280,8 @@ pub enum ExprKind {
     Block(Block),
     /// `[a, b]`
     Frame(Vec<Expr>),
+    /// `[synth(); 8]`: the expression evaluated that many times.
+    Repeat(Box<Expr>, u32),
     Index(Box<Expr>, Box<Expr>),
     Field(Box<Expr>, Ident),
     /// `x as Float`
@@ -255,6 +291,20 @@ pub enum ExprKind {
         params: Vec<FnParam>,
         ret: Option<TypeExpr>,
         body: Block,
+    },
+    /// `invoke riff(tempo: 90bpm)`, `invoke id riff`, `trigger 3 id riff`,
+    /// or `invoke keys(pitch: C4)` for a declared event. `step` is set for
+    /// `trigger`.
+    Invoke {
+        step: Option<Box<Expr>>,
+        id: Option<Box<Expr>>,
+        target: Ident,
+        args: Vec<Arg>,
+    },
+    /// `halt riff` or `halt id riff`
+    Halt {
+        id: Option<Box<Expr>>,
+        target: Ident,
     },
 }
 

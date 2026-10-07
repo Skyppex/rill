@@ -8,7 +8,7 @@
 
 use super::ast::Program;
 use super::check::{Checked, check_entry};
-use super::compile::{ArgSpec, CVal, Defs, compile_instance, default_value};
+use super::compile::{ArgSpec, CVal, Defs, compile_instance, default_value, seq_tables};
 use super::diag::Diagnostic;
 use super::types::Type;
 use super::vm::{Operand, Program as ProgramNode};
@@ -26,7 +26,9 @@ pub fn build(
     entry: &str,
 ) -> Result<Graph, Vec<Diagnostic>> {
     check_entry(program, checked, entry)?;
-    let defs = Defs::new(program, checked);
+    let mut defs = Defs::new(program, checked);
+    defs.seqs = seq_tables(&defs, &checked.types, config.sample_rate as f32, program)
+        .map_err(|d| vec![d])?;
     let (def, sig) = defs.get(entry).expect("checked by check_entry");
 
     let mut args = Vec::with_capacity(sig.params.len());
@@ -46,7 +48,7 @@ pub fn build(
         defaults.push(value);
         args.push(ArgSpec::Stream(None));
     }
-    let code = compile_instance(
+    let mut code = compile_instance(
         &defs,
         &checked.types,
         config.sample_rate as f32,
@@ -55,6 +57,15 @@ pub fn build(
         &args,
     )
     .map_err(|d| vec![d])?;
+    // Controls hold their defaults from the start, so `on start` and events
+    // that arrive before the first sample see them.
+    let inputs: Vec<(u16, f32)> = code
+        .input_regs
+        .iter()
+        .copied()
+        .zip(defaults.iter().copied())
+        .collect();
+    code.state_init.extend(inputs);
 
     let channels = code.output.len();
     let n = config.out_channels;

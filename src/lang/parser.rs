@@ -6,6 +6,8 @@
 //! program := item*
 //! item    := "fn" def | "rill" def | event
 //! event   := "event" NAME NAME ("(" (NAME ":" expr),* ")")?
+//! seq     := "seq" NAME ("(" (NAME ":" expr),* ")")? "{" (step ","?)* "}"
+//! step    := ("_" | expr) ("@" expr)?
 //! def     := NAME ("<" NAME ("," NAME)* ">")? "(" params ")" type
 //!            ("@" "rate" (("*" | "/") INT)?)? block
 //! param   := NAME ":" type ("=" expr)?
@@ -16,7 +18,7 @@
 //!          | "return" expr
 //!          | "for" NAME "in" expr block
 //!          | assignable ("=" | "+=") expr
-//!          | "on" NAME ("(" NAME,* ")")? block
+//!          | "on" NAME ("(" NAME,* ")")? ("claim" ("(" args ")")? | "release")? block
 //!          | expr
 //! expr    := range ("|>" NAME size_args? ("(" args ")")?)*
 //! range   := or ((".." | "..=") or)?
@@ -29,7 +31,12 @@
 //! unary   := ("-" | "+" | "!") unary | postfix
 //! postfix := primary ("[" expr "]")*
 //! primary := NUMBER UNIT? | "true" | "false" | NAME ("(" args ")")?
-//!          | "(" expr ")" | "[" expr ("," expr)* "]" | if | block | lambda
+//!          | "(" expr ")" | "[" expr ("," expr)* "]" | "[" expr ";" INT "]"
+//!          | if | block | lambda | invoke
+//! invoke  := "invoke" id? NAME ("(" args ")")?
+//!          | "trigger" id id? NAME ("(" args ")")?
+//!          | "halt" id? NAME
+//! id      := NUMBER | NAME ("." NAME)*
 //! lambda  := "fn" "(" (NAME (":" type)?),* ")" type? block
 //! if      := "if" expr block ("else" (if | block))?
 //! args    := (NAME ":")? expr ("," (NAME ":")? expr)*
@@ -93,7 +100,18 @@ impl<'a> Parser<'a> {
     fn program(mut self) -> (Program, Vec<Diagnostic>) {
         let mut items = Vec::new();
         let mut events = Vec::new();
+        let mut seqs = Vec::new();
         while !self.at(TokenKind::Eof) {
+            if self.at_ident("seq") && self.peek_at(1).kind == TokenKind::Ident {
+                match self.seq_decl() {
+                    Ok(s) => seqs.push(s),
+                    Err(err) => {
+                        self.errors.push(err);
+                        self.recover();
+                    }
+                }
+                continue;
+            }
             if self.at_ident("event") {
                 match self.event_decl() {
                     Ok(e) => events.push(e),
@@ -115,6 +133,7 @@ impl<'a> Parser<'a> {
         let program = Program {
             items,
             events,
+            seqs,
             expr_count: self.next_id,
         };
         (program, self.errors)
@@ -210,7 +229,10 @@ impl Parser<'_> {
         self.bump();
         while !self.at(TokenKind::Eof)
             && !(self.peek().newline_before
-                && (self.at(TokenKind::Fn) || self.at(TokenKind::Rill) || self.at_ident("event")))
+                && (self.at(TokenKind::Fn)
+                    || self.at(TokenKind::Rill)
+                    || self.at_ident("event")
+                    || self.at_ident("seq")))
         {
             self.bump();
         }
@@ -600,6 +622,68 @@ impl Parser<'_> {
         self.at(TokenKind::Ident) && self.text(self.peek()) == name
     }
 
+    /// `(name: value, ...)`, as in event filters and sequence settings.
+    fn settings(&mut self, what: &str) -> PResult<Vec<Filter>> {
+        let mut out = Vec::new();
+        if self.eat(TokenKind::LParen).is_some() {
+            self.nest += 1;
+            while !self.at(TokenKind::RParen) {
+                let name = self.ident(&format!("as a {what} name"))?;
+                self.expect(
+                    TokenKind::Colon,
+                    &format!("and a value after the {what} name"),
+                )?;
+                let value = self.expr()?;
+                out.push(Filter { name, value });
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RParen, &format!("to close the {what}s"))?;
+            self.nest -= 1;
+        }
+        Ok(out)
+    }
+
+    fn seq_decl(&mut self) -> PResult<SeqDecl> {
+        let start = self.bump().span; // seq
+        let name = self.ident("as the sequence's name")?;
+        let settings = self.settings("setting")?;
+        self.expect(TokenKind::LBrace, "and the steps of the sequence")?;
+        // Steps may span lines.
+        self.nest += 1;
+        let mut steps = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let at = self.peek().span;
+            let notes = if self.at_ident("_") {
+                self.bump();
+                None
+            } else {
+                Some(self.expr()?)
+            };
+            let velocity = match self.eat(TokenKind::At) {
+                Some(_) => Some(self.unary()?),
+                None => None,
+            };
+            steps.push(Step {
+                notes,
+                velocity,
+                span: self.span_from(at),
+            });
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace, "or `,` between steps")?;
+        self.nest -= 1;
+        Ok(SeqDecl {
+            name,
+            settings,
+            steps,
+            span: self.span_from(start),
+        })
+    }
+
     fn event_decl(&mut self) -> PResult<EventDecl> {
         let start = self.bump().span; // event
         let name = self.ident("as the event's name")?;
@@ -617,21 +701,7 @@ impl Parser<'_> {
                 )));
         }
         let kind = self.ident("")?;
-        let mut filters = Vec::new();
-        if self.eat(TokenKind::LParen).is_some() {
-            self.nest += 1;
-            while !self.at(TokenKind::RParen) {
-                let fname = self.ident("as a filter name, `sender` or `channel`")?;
-                self.expect(TokenKind::Colon, "and a value after the filter name")?;
-                let value = self.expr()?;
-                filters.push(Filter { name: fname, value });
-                if self.eat(TokenKind::Comma).is_none() {
-                    break;
-                }
-            }
-            self.expect(TokenKind::RParen, "to close the filters")?;
-            self.nest -= 1;
-        }
+        let filters = self.settings("filter")?;
         if self.eat(TokenKind::Semi).is_none()
             && !self.at(TokenKind::Eof)
             && !self.peek().newline_before
@@ -677,10 +747,41 @@ impl Parser<'_> {
             self.expect(TokenKind::RParen, "to close the event parameter list")?;
             self.nest -= 1;
         }
+        let mode = if self.at_ident("claim") {
+            self.bump();
+            let tail = if self.at(TokenKind::LParen) {
+                let mut settings = self.settings("claim setting")?;
+                match settings.len() {
+                    0 => None,
+                    1 if settings[0].name.name == "tail" => Some(settings.remove(0).value),
+                    _ => {
+                        // Something other than `tail`, or `tail` twice.
+                        let bad = settings
+                            .iter()
+                            .find(|s| s.name.name != "tail")
+                            .unwrap_or(&settings[settings.len() - 1]);
+                        return Err(Diagnostic::error(
+                            bad.name.span,
+                            format!("`claim` takes only `tail`, not `{}`", bad.name.name),
+                        )
+                        .with_help("as in `claim(tail: 2s)`"));
+                    }
+                }
+            } else {
+                None
+            };
+            HandlerMode::Claim { tail }
+        } else if self.at_ident("release") && self.peek_at(1).kind == TokenKind::LBrace {
+            self.bump();
+            HandlerMode::Release
+        } else {
+            HandlerMode::Plain
+        };
         let body = self.block()?;
         Ok(Stmt::EventHandler {
             name,
             params,
+            mode,
             body,
             span: self.span_from(start),
         })
@@ -922,6 +1023,7 @@ impl Parser<'_> {
                 self.bump();
                 Ok(self.expr_node(ExprKind::Bool(t.kind == TokenKind::True), t.span))
             }
+            TokenKind::Ident if self.at_invoke() => self.invoke(),
             TokenKind::Ident => {
                 let name = self.ident("")?;
                 let sizes = if self.at_size_call_args() {
@@ -965,6 +1067,14 @@ impl Parser<'_> {
                 let mut elems = Vec::new();
                 while !self.at(TokenKind::RBracket) {
                     elems.push(self.expr()?);
+                    if elems.len() == 1 && self.eat(TokenKind::Semi).is_some() {
+                        let count = self.int("as the number of copies")?;
+                        self.expect(TokenKind::RBracket, "to close the frame")?;
+                        self.nest -= 1;
+                        let span = self.span_from(t.span);
+                        let e = elems.pop().expect("one element");
+                        return Ok(self.expr_node(ExprKind::Repeat(Box::new(e), count), span));
+                    }
                     if self.eat(TokenKind::Comma).is_none() {
                         break;
                     }
@@ -989,6 +1099,82 @@ impl Parser<'_> {
             }
             _ => Err(self.unexpected("an expression")),
         }
+    }
+
+    /// At `invoke`, `trigger` or `halt` used as a keyword: followed by what
+    /// it acts on rather than by an operator or `(`.
+    fn at_invoke(&self) -> bool {
+        let next = self.peek_at(1);
+        (self.at_ident("invoke") || self.at_ident("trigger") || self.at_ident("halt"))
+            && !next.newline_before
+            && matches!(next.kind, TokenKind::Ident | TokenKind::Number { .. })
+    }
+
+    /// An instance id or a step: a number, or a name with optional fields.
+    fn id_expr(&mut self) -> PResult<Expr> {
+        if !self.at(TokenKind::Ident) {
+            return self.primary();
+        }
+        let name = self.ident("")?;
+        let mut e = self.expr_node(ExprKind::Name(name.name), name.span);
+        while self.eat(TokenKind::Dot).is_some() {
+            let field = self.ident("after `.`")?;
+            let span = Span {
+                start: e.span.start,
+                end: field.span.end,
+            };
+            e = self.expr_node(ExprKind::Field(Box::new(e), field), span);
+        }
+        Ok(e)
+    }
+
+    /// An id comes before the target when another name, a number or a
+    /// field access follows it.
+    fn at_id(&self) -> bool {
+        match self.peek().kind {
+            TokenKind::Number { .. } => true,
+            TokenKind::Ident => {
+                let next = self.peek_at(1);
+                !next.newline_before && matches!(next.kind, TokenKind::Ident | TokenKind::Dot)
+            }
+            _ => false,
+        }
+    }
+
+    fn invoke(&mut self) -> PResult<Expr> {
+        let start = self.peek().span;
+        let keyword = self.ident("")?;
+        let step = match keyword.name.as_str() {
+            "trigger" => Some(Box::new(self.id_expr()?)),
+            _ => None,
+        };
+        let id = match self.at_id() {
+            true => Some(Box::new(self.id_expr()?)),
+            false => None,
+        };
+        let target = self.ident(&format!(
+            "as the sequence or event after `{}`",
+            keyword.name
+        ))?;
+        if keyword.name == "halt" {
+            let span = self.span_from(start);
+            return Ok(self.expr_node(ExprKind::Halt { id, target }, span));
+        }
+        let args = if self.at(TokenKind::LParen) && !self.peek().newline_before {
+            self.args()?
+        } else {
+            Vec::new()
+        };
+        let span = self.span_from(start);
+        Ok(self.expr_node(
+            ExprKind::Invoke {
+                step,
+                id,
+                target,
+                args,
+            },
+            span,
+        ))
     }
 
     /// `fn(p) { ... }`: a fn without a name.

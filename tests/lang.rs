@@ -728,10 +728,11 @@ fn garbage_never_panics() {
         "rill", "fn", "state", "let", "return", "if", "else", "f", "x", "N", "sample", "Hz", "[",
         "]", "(", ")", "{", "}", "<", ">", ";", ":", ",", "->", "|>", "@", "rate", "=", "+", "-",
         "*", "/", "==", "&&", "!", "1", "2.5", "440Hz", "3ms", "\n", " ", "sum", "main", "true",
-        "x[0]", "// c\n", "/* c */",
+        "x[0]", "// c\n", "/* c */", "seq", "invoke", "trigger", "halt", "claim", "release", "on",
+        "event", "start", "_", "@", "120bpm", "note_on", "note_off", "1/8", "s", "tail:",
     ];
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    for _ in 0..20_000 {
+    for _ in 0..60_000 {
         let mut src = String::new();
         state ^= state << 13;
         state ^= state >> 7;
@@ -1259,12 +1260,12 @@ fn event_handlers() {
         (
             "on keys(n) { let r = n.release }",
             "a `NoteOn` has no field `release`".to_owned(),
-            Some("`release` belongs to `note_off` events; a `NoteOn` has `pitch` and `velocity`".to_owned()),
+            Some("`release` belongs to `note_off` events; a `NoteOn` has `pitch`, `velocity` and `instance`".to_owned()),
         ),
         (
             "on lifts(n) { let v = n.velocity }",
             "a `NoteOff` has no field `velocity`".to_owned(),
-            Some("`velocity` belongs to `note_on` events; a `NoteOff` has `pitch` and `release`".to_owned()),
+            Some("`velocity` belongs to `note_on` events; a `NoteOff` has `pitch`, `release` and `instance`".to_owned()),
         ),
         (
             "on cc(v) { let x = v.value }",
@@ -1293,4 +1294,270 @@ fn event_handlers() {
         .map(|d| d.message)
         .collect();
     assert_eq!(warnings, ["event `lifts` is declared but never handled"]);
+}
+
+// ---- sequences ----------------------------------------------------------
+
+/// `decls` at the top, then a rill whose handlers include `handler`.
+fn with_seq(decls: &str, handler: &str) -> String {
+    format!(
+        "seq riff(step: 1/8) {{ C4, _, E4@0.5, [G4, B4] }}
+        event pad note_on(sender: 1)
+        event lead note_on(sender: riff)
+        {decls}
+        rill main() Sample {{
+            on pad(hit) {{ {handler} }}
+            on lead {{ }}
+            return 0
+        }}"
+    )
+}
+
+#[test]
+fn sequences_check() {
+    assert_ok(&with_seq("", "invoke riff"));
+    assert_ok(&with_seq(
+        "seq beat(meter: 7/8, step: 3/16, tempo: 140bpm, gate: 1, velocity: 0.5, repeat: 2, loop: false, instances: 4) { C2 + 7st, _ }\nevent b note_on(sender: beat)",
+        "let id = invoke 3 riff(tempo: 90bpm * hit.velocity, repeat: 4)\ntrigger 2 id beat\nhalt riff\nhalt id beat\ninvoke lead(pitch: C4, velocity: 1)",
+    ));
+    // `invoke` gives the instance id, an `Int`.
+    let src = with_seq("", "let id = invoke riff\nlet x: Int = id + 1");
+    assert_ok(&src);
+    assert_eq!(
+        error(&with_seq("", "let x: Float = invoke riff")).0,
+        "`x` expects `Float`, found `Int`"
+    );
+
+    for (decls, msg, help) in [
+        ("seq s(swing: 1) { C4 }", "unknown setting `swing`", None),
+        (
+            "seq s(meter: 4) { C4 }",
+            "`meter` is a time signature, written as two whole numbers",
+            Some("as in `meter: 4/4`"),
+        ),
+        (
+            "seq s(step: 0.125) { C4 }",
+            "`step` is a note value, written as two whole numbers",
+            Some("as in `step: 1/8`"),
+        ),
+        ("seq s(tempo: 0bpm) { C4 }", "a tempo is above 0bpm", None),
+        (
+            "seq s(gate: 1.5) { C4 }",
+            "`gate` is a fraction of the step, above 0 and at most 1",
+            None,
+        ),
+        (
+            "seq s(velocity: 2) { C4 }",
+            "a velocity is from 0 to 1",
+            None,
+        ),
+        (
+            "seq s(repeat: 0) { C4 }",
+            "this is a whole number, at least 1",
+            None,
+        ),
+        (
+            "seq s(tempo: 120Hz, tempo: 1Hz) { C4 }",
+            "setting `tempo` is given more than once",
+            None,
+        ),
+        (
+            "seq s { 440Hz }",
+            "a step is a pitch, a chord or `_`, not `Freq`",
+            Some("as in `C4`, `[C4, E4, G4]` or `_` for a rest"),
+        ),
+        ("seq s { C4@1.5 }", "a velocity is from 0 to 1", None),
+        ("seq s { _@0.5 }", "a rest has no velocity", None),
+        (
+            "seq s { }",
+            "sequence `s` has no steps",
+            Some("add steps between the braces, as in `{ C4, _, E4 }`"),
+        ),
+        (
+            "seq riff { C4 }",
+            "sequence `riff` is declared more than once",
+            None,
+        ),
+        (
+            "event riff note_on",
+            "`riff` is already the name of a sequence",
+            None,
+        ),
+        (
+            "event x note_on(sender: rif)",
+            "unknown sequence `rif`",
+            Some("a sender is a whole number from the host, or a sequence's name"),
+        ),
+    ] {
+        let errs: Vec<Diagnostic> = diagnostics(&with_seq(decls, "invoke riff"))
+            .into_iter()
+            .filter(|d| d.is_error())
+            .collect();
+        assert!(!errs.is_empty(), "{decls}: no error");
+        assert_eq!(errs[0].message, msg, "{decls}");
+        if let Some(help) = help {
+            assert_eq!(errs[0].help.as_deref(), Some(help), "{decls}");
+        }
+    }
+
+    // A sequence nothing invokes is a warning.
+    let warnings: Vec<String> = diagnostics(&with_seq("seq idle { C4 }", "invoke riff"))
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+    assert_eq!(warnings, ["sequence `idle` is never invoked"]);
+}
+
+#[test]
+fn invoking() {
+    for (handler, msg, help) in [
+        (
+            "invoke rif",
+            "unknown sequence `rif`",
+            Some("did you mean `riff`?"),
+        ),
+        (
+            "invoke riff(meter: 3/4)",
+            "`meter` is fixed when `riff` is declared",
+            Some(
+                "only `tempo`, `gate`, `velocity`, `repeat` and `loop` can be given when invoking",
+            ),
+        ),
+        ("invoke riff(swing: 1)", "unknown setting `swing`", None),
+        (
+            "invoke riff(90bpm)",
+            "settings are given by name",
+            Some("as in `invoke riff(tempo: 90bpm)`"),
+        ),
+        ("invoke riff(tempo: 0bpm)", "a tempo is above 0bpm", None),
+        (
+            "invoke riff(tempo: 2s)",
+            "setting `tempo` expects `Freq`, found `Time`",
+            None,
+        ),
+        (
+            "invoke 0 riff",
+            "an id you pick is a whole number ≥ 1",
+            Some("0 marks notes that did not come from a sequence, and fresh ids are negative"),
+        ),
+        (
+            "trigger 5 riff",
+            "step 5 is outside `riff`, which has 4 steps",
+            Some("steps count from 1"),
+        ),
+        (
+            "trigger 0 riff",
+            "step 0 is outside `riff`, which has 4 steps",
+            Some("steps count from 1"),
+        ),
+        (
+            "trigger 1 lead",
+            "`lead` is an event; only sequences have steps and instances",
+            Some("send it with `invoke lead(...)`"),
+        ),
+        (
+            "invoke lead(release: 1)",
+            "a note_on event has no field `release`",
+            Some("it has `pitch`, `velocity`, `instance`"),
+        ),
+        (
+            "invoke lead(pitch: 440Hz)",
+            "field `pitch` expects `Pitch`, found `Freq`",
+            None,
+        ),
+        (
+            "invoke start",
+            "`start` cannot be invoked",
+            Some("it runs once, before the first sample"),
+        ),
+        ("halt pad", "unknown sequence `pad`", None),
+    ] {
+        let (m, h) = error(&with_seq("", handler));
+        assert_eq!(m, msg, "{handler}");
+        if let Some(help) = help {
+            assert_eq!(h.as_deref(), Some(help), "{handler}");
+        }
+    }
+
+    // Only in handlers.
+    let src = "seq s { C4 }\nrill main() Sample { let id = invoke s\nreturn 0 }";
+    let (m, h) = error(src);
+    assert_eq!(m, "`invoke` only works inside an `on` handler");
+    assert!(h.unwrap().starts_with("a rill body runs every sample"));
+}
+
+#[test]
+fn invoke_loops_are_rejected() {
+    // A riff note starting the riff again would never end.
+    let (m, h) = error(
+        "seq riff { C4 }
+         event lead note_on(sender: riff)
+         rill main() Sample {
+             on start { invoke riff }
+             on lead { invoke riff }
+             return 0
+         }",
+    );
+    assert_eq!(
+        m,
+        "invoking here can lead back to the same handler: `lead` -> `riff` -> `lead`"
+    );
+    assert!(h.unwrap().contains("same sample"));
+    // And through events.
+    let (m, _) = error(
+        "event a control_change(channel: 1)
+         event b control_change(channel: 2)
+         rill main() Sample {
+             on a { invoke b(value: 1) }
+             on b { invoke a(value: 1) }
+             return 0
+         }",
+    );
+    assert!(
+        m.starts_with("invoking here can lead back to the same handler"),
+        "{m}"
+    );
+}
+
+#[test]
+fn start_and_voice_handlers() {
+    let src = "event k note_on\nevent o note_off\nrill main() Sample {\n{h}\non k { }\non o { }\nreturn 0\n}";
+    for (h, msg) in [
+        ("on start(x) { }", "`start` has no payload"),
+        (
+            "on start claim { }",
+            "`on start` runs in every copy; it cannot `claim` or `release`",
+        ),
+        ("on o claim { }", "only a `note_on` event can be claimed"),
+        (
+            "on k release { }",
+            "only a `note_off` event can release a voice",
+        ),
+        (
+            "on k claim(tail: 1Hz) { }",
+            "`tail` expects `Time`, found `Freq`",
+        ),
+        (
+            "on k claim(size: 1s) { }",
+            "`claim` takes only `tail`, not `size`",
+        ),
+    ] {
+        let errs: Vec<String> = errors(&src.replace("{h}", h));
+        assert_eq!(errs.first().map(String::as_str), Some(msg), "{h}: {errs:?}");
+    }
+    assert_ok(&src.replace(
+        "{h}",
+        "on start { }\non k claim(tail: 2s) { }\non o release { }",
+    ));
+    assert_eq!(
+        errors("event start note_on\nrill main() Sample { return 0 }")[0],
+        "`start` is a built-in event"
+    );
+}
+
+#[test]
+fn repeated_frames() {
+    let src = "rill v() Sample { return 0 }\nrill main() Sample { let a = [v(); 3]\nlet b = [[1, 2]; 2]\nreturn 0 }";
+    assert_eq!(type_of(src, "a"), frame(Type::Sample, 3));
+    assert_eq!(type_of(src, "b"), frame(frame(Type::Num, 2), 2));
 }

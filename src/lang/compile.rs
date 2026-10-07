@@ -15,8 +15,10 @@ use super::ast::*;
 use super::check::Checked;
 use super::diag::{Diagnostic, Span};
 use super::types::{Signature, Size, Type};
-use super::vm::{Code, EventCode, Instr, Operand, Tuning};
-use crate::event::{EventId, EventKind};
+use super::vm::{
+    Code, EventCode, Handles, Instr, InvokeCall, Mode, Operand, SeqStep, SeqTable, Source, Tuning,
+};
+use crate::event::{EventDecl as Declared, EventId, EventKind};
 use crate::ops::{Op1, Op2};
 
 /// A compile-time value: one operand per channel. Frames nest, so a frame's
@@ -125,6 +127,9 @@ pub struct Defs<'a> {
     lambdas: HashMap<u32, &'a Expr>,
     /// Declared events by name: their id and kind.
     events: HashMap<&'a str, (EventId, EventKind)>,
+    decls: Vec<Declared>,
+    /// The program's sequences, filled in by [`seq_tables`].
+    pub seqs: Vec<SeqTable>,
 }
 
 impl<'a> Defs<'a> {
@@ -150,6 +155,8 @@ impl<'a> Defs<'a> {
             .collect();
         Defs {
             events,
+            decls: checked.events.iter().flatten().cloned().collect(),
+            seqs: Vec::new(),
             map: defs
                 .zip(&checked.signatures)
                 .map(|(d, s)| (d.name.name.as_str(), (d, s)))
@@ -203,6 +210,20 @@ fn collect_lambdas<'a>(e: &'a Expr, out: &mut HashMap<u32, &'a Expr>) {
             }
         }
         ExprKind::Number { .. } | ExprKind::Bool(_) | ExprKind::Name(_) => {}
+        ExprKind::Repeat(x, _) => collect_lambdas(x, out),
+        ExprKind::Invoke { step, id, args, .. } => {
+            for x in step.iter().chain(id.iter()) {
+                collect_lambdas(x, out);
+            }
+            for a in args {
+                collect_lambdas(&a.value, out);
+            }
+        }
+        ExprKind::Halt { id, .. } => {
+            if let Some(x) = id {
+                collect_lambdas(x, out);
+            }
+        }
     }
 }
 
@@ -245,21 +266,7 @@ pub fn compile_instance(
     sig: &Signature,
     args: &[ArgSpec],
 ) -> Result<Code, Diagnostic> {
-    let mut c = Compiler {
-        defs,
-        types,
-        sample_rate,
-        code: Vec::new(),
-        events: Vec::new(),
-        inlining: Vec::new(),
-        regs: 0,
-        state_init: Vec::new(),
-        state_regs: HashSet::new(),
-        scopes: Vec::new(),
-        rets: Vec::new(),
-        depth: 0,
-        span: def.name.span,
-    };
+    let mut c = Compiler::new(defs, types, sample_rate, def.name.span);
     let mut input_regs = Vec::new();
     let mut vals = Vec::new();
     for (a, p) in args.iter().zip(&def.params) {
@@ -293,12 +300,90 @@ pub fn compile_instance(
     let out = c.inline(def, sig, vals, HashMap::new())?;
     Ok(Code {
         instrs: c.code,
+        post: c.post,
         regs: c.regs as usize,
         input_regs,
         output: out.operands(),
         state_init: c.state_init,
         events: c.events,
+        decls: defs.decls.clone(),
+        seqs: defs.seqs.clone(),
+        calls: c.calls,
+        pools: c.pools,
     })
+}
+
+/// Build every sequence's table: its settings and steps, all constants.
+pub fn seq_tables(
+    defs: &Defs,
+    types: &[Type],
+    sample_rate: f32,
+    program: &Program,
+) -> Result<Vec<SeqTable>, Diagnostic> {
+    let mut tables = Vec::new();
+    for seq in &program.seqs {
+        let mut c = Compiler::new(defs, types, sample_rate, seq.name.span);
+        c.scopes = vec![HashMap::new()];
+        let mut table = SeqTable {
+            name: seq.name.name.clone(),
+            step_beats: 0.0,
+            steps: Vec::new(),
+            settings: [2.0, 0.9, 0.8],
+            repeat: 1,
+            looping: false,
+            instances: 64,
+        };
+        // A beat is a `1/beat` note; a step is `n/d` of a whole note.
+        let mut beat = 4u32;
+        let mut step = (1u32, 8u32);
+        for setting in &seq.settings {
+            let name = setting.name.name.as_str();
+            let fraction = super::check::fraction(&setting.value);
+            match (name, fraction) {
+                ("meter", Some((_, d))) => beat = d,
+                ("step", Some(f)) => step = f,
+                ("meter" | "step", None) => {}
+                _ => {
+                    let value = c.constant(&setting.value)?;
+                    match name {
+                        "tempo" if value <= 0.0 => return Err(zero_tempo(setting.value.span)),
+                        "tempo" => table.settings[super::vm::TEMPO] = value,
+                        "gate" => table.settings[super::vm::GATE] = value.clamp(1e-6, 1.0),
+                        "velocity" => table.settings[super::vm::VELOCITY] = value.clamp(0.0, 1.0),
+                        "repeat" => table.repeat = value.max(1.0) as u32,
+                        "loop" => table.looping = value != 0.0,
+                        "instances" => table.instances = value.clamp(1.0, 65_535.0) as u16,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        table.step_beats = f64::from(step.0) * f64::from(beat) / f64::from(step.1);
+        for st in &seq.steps {
+            let pitches = match &st.notes {
+                Some(notes) => {
+                    let v = c.expr(notes)?;
+                    v.operands()
+                        .into_iter()
+                        .map(|o| match o {
+                            Operand::Const(p) => Ok(p),
+                            Operand::Reg(_) => {
+                                Err(Diagnostic::error(notes.span, "a step must be a constant"))
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+                None => Vec::new(),
+            };
+            let velocity = match &st.velocity {
+                Some(v) => Some(c.constant(v)?.clamp(0.0, 1.0)),
+                None => None,
+            };
+            table.steps.push(SeqStep { pitches, velocity });
+        }
+        tables.push(table);
+    }
+    Ok(tables)
 }
 
 /// Evaluate one parameter default at build time.
@@ -315,21 +400,8 @@ pub fn default_value(
             &format!("`{}` has no default", def.params[param].name.name),
         )
     })?;
-    let mut c = Compiler {
-        defs,
-        types,
-        sample_rate,
-        code: Vec::new(),
-        events: Vec::new(),
-        inlining: Vec::new(),
-        regs: 0,
-        state_init: Vec::new(),
-        state_regs: HashSet::new(),
-        scopes: vec![HashMap::new()],
-        rets: Vec::new(),
-        depth: 0,
-        span: def.name.span,
-    };
+    let mut c = Compiler::new(defs, types, sample_rate, def.name.span);
+    c.scopes = vec![HashMap::new()];
     c.expr(default)
 }
 
@@ -372,6 +444,17 @@ struct Compiler<'a> {
     depth: u32,
     /// For internal errors: the definition being compiled.
     span: Span,
+    /// Code run every tick after the main code: settings of playing
+    /// sequences that follow streams.
+    post: Vec<Instr>,
+    calls: Vec<InvokeCall>,
+    /// Voice pools: per pool, per copy, the copy's output operands.
+    pools: Vec<Vec<Vec<Operand>>>,
+    /// The voice pool and copy being compiled, innermost.
+    voice: Option<(u16, u16)>,
+    /// Inside a handler: the first scope that belongs to it. Names bound
+    /// from there on are the handler's own.
+    handler_scope: Option<usize>,
 }
 
 type CResult<T> = Result<T, Diagnostic>;
@@ -380,7 +463,38 @@ fn internal(span: Span, what: &str) -> Diagnostic {
     Diagnostic::error(span, format!("internal compiler error: {what}"))
 }
 
-impl Compiler<'_> {
+impl<'a> Compiler<'a> {
+    fn new(defs: &'a Defs<'a>, types: &'a [Type], sample_rate: f32, span: Span) -> Compiler<'a> {
+        Compiler {
+            defs,
+            types,
+            sample_rate,
+            code: Vec::new(),
+            events: Vec::new(),
+            inlining: Vec::new(),
+            regs: 0,
+            state_init: Vec::new(),
+            state_regs: HashSet::new(),
+            scopes: Vec::new(),
+            rets: Vec::new(),
+            depth: 0,
+            span,
+            post: Vec::new(),
+            calls: Vec::new(),
+            pools: Vec::new(),
+            voice: None,
+            handler_scope: None,
+        }
+    }
+
+    /// A constant scalar, folded at build time.
+    fn constant(&mut self, e: &Expr) -> CResult<f32> {
+        match self.expr(e)?.scalar() {
+            Operand::Const(c) => Ok(c),
+            Operand::Reg(_) => Err(Diagnostic::error(e.span, "this must be a constant")),
+        }
+    }
+
     fn reg(&mut self) -> CResult<u16> {
         let r = self.regs;
         self.regs = self
@@ -696,10 +810,14 @@ impl Compiler<'_> {
         if matches!(sig.kind, super::types::DefKind::Rill) {
             for stmt in &def.body.stmts {
                 if let Stmt::EventHandler {
-                    name, params, body, ..
+                    name,
+                    params,
+                    mode,
+                    body,
+                    ..
                 } = stmt
                 {
-                    self.event_handler(name, params, body)?;
+                    self.event_handler(name, params, mode, body)?;
                 }
             }
         }
@@ -1002,6 +1120,30 @@ impl Compiler<'_> {
                 }
                 Ok(result)
             }
+            ExprKind::Repeat(x, n) => self.repeat(x, *n),
+            ExprKind::Invoke {
+                step,
+                id,
+                target,
+                args,
+            } => self.invoke(e, step.as_deref(), id.as_deref(), target, args),
+            ExprKind::Halt { id, target } => {
+                let seq = self
+                    .defs
+                    .seqs
+                    .iter()
+                    .position(|t| t.name == target.name)
+                    .ok_or_else(|| internal(target.span, "unknown sequence"))?;
+                let id = match id {
+                    Some(id) => Some(self.expr(id)?.scalar()),
+                    None => None,
+                };
+                self.emit(Instr::Halt {
+                    seq: seq as u16,
+                    id,
+                });
+                Ok(CVal::unit())
+            }
             ExprKind::Field(base, field) => {
                 let CVal::Event(fields) = self.expr(base)? else {
                     return Err(internal(e.span, "field access on a non-event value"));
@@ -1017,30 +1159,55 @@ impl Compiler<'_> {
         }
     }
 
-    fn event_handler(&mut self, name: &Ident, params: &[Ident], body: &Block) -> CResult<()> {
+    fn event_handler(
+        &mut self,
+        name: &Ident,
+        params: &[Ident],
+        mode: &HandlerMode,
+        body: &Block,
+    ) -> CResult<()> {
         let saved_code = std::mem::take(&mut self.code);
         let saved_scopes = self.scopes.clone();
         self.scopes.push(HashMap::new());
-        let &(event, kind) = self
-            .defs
-            .events
-            .get(name.name.as_str())
-            .ok_or_else(|| internal(name.span, "handler of an undeclared event"))?;
+        let saved_handler = self.handler_scope.replace(self.scopes.len() - 1);
+        let (handles, kind) = if name.name == "start" {
+            (Handles::Start, None)
+        } else {
+            let &(event, kind) = self
+                .defs
+                .events
+                .get(name.name.as_str())
+                .ok_or_else(|| internal(name.span, "handler of an undeclared event"))?;
+            (Handles::Event(event), Some(kind))
+        };
         // The payload arrives in registers, one per field.
         let mut payload = Vec::new();
         let mut fields = Vec::new();
-        for field in kind.fields() {
+        for field in kind.map_or(&[][..], EventKind::fields) {
             let reg = self.reg()?;
             payload.push(reg);
             fields.push(((*field).to_owned(), Operand::Reg(reg)));
         }
-        if let Some(param) = params.first() {
+        if let (Some(param), Some(kind)) = (params.first(), kind) {
             let value = match kind {
                 EventKind::ControlChange => CVal::Scalar(fields[0].1),
                 EventKind::NoteOn | EventKind::NoteOff => CVal::Event(fields),
             };
             self.bind(&param.name, value, false);
         }
+        let mode = match mode {
+            HandlerMode::Plain => Mode::Plain,
+            HandlerMode::Release => Mode::Release,
+            HandlerMode::Claim { tail } => {
+                let seconds = match tail {
+                    Some(t) => self.constant(t)?,
+                    None => 0.1,
+                };
+                Mode::Claim {
+                    tail: (seconds.max(0.0) * self.sample_rate).round() as u32,
+                }
+            }
+        };
         let (_, diverged) = self.block(body)?;
         if diverged {
             return Err(internal(name.span, "event handlers cannot return"));
@@ -1048,12 +1215,222 @@ impl Compiler<'_> {
         let instrs = std::mem::take(&mut self.code);
         self.scopes = saved_scopes;
         self.code = saved_code;
+        self.handler_scope = saved_handler;
         self.events.push(EventCode {
-            event,
+            handles,
             payload,
             instrs,
+            mode,
+            voice: self.voice,
         });
         Ok(())
+    }
+
+    /// `[x; n]`: `x` compiled `n` times, each copy a voice of a new pool.
+    fn repeat(&mut self, x: &Expr, n: u32) -> CResult<CVal> {
+        let pool = self.pools.len() as u16;
+        self.pools.push(Vec::new());
+        let saved = self.voice;
+        let mut out = Vec::with_capacity(n as usize);
+        for copy in 0..n {
+            self.voice = Some((pool, copy as u16));
+            let v = self.expr(x);
+            self.voice = saved;
+            let v = v?;
+            self.pools[usize::from(pool)].push(v.operands());
+            out.push(v);
+        }
+        Ok(CVal::Frame(out))
+    }
+
+    /// `invoke`, `trigger` or `halt` of a sequence, or `invoke` of an event.
+    fn invoke(
+        &mut self,
+        e: &Expr,
+        step: Option<&Expr>,
+        id: Option<&Expr>,
+        target: &Ident,
+        args: &[Arg],
+    ) -> CResult<CVal> {
+        if let Some(&(event, kind)) = self.defs.events.get(target.name.as_str()) {
+            let mut values = [Operand::Const(0.0); 3];
+            for a in args {
+                let Some(name) = &a.name else { continue };
+                let v = self.expr(&a.value)?.scalar();
+                if let Some(i) = kind.fields().iter().position(|f| *f == name.name) {
+                    values[i] = v;
+                }
+            }
+            self.emit(Instr::InvokeEvent { event, values });
+            return Ok(CVal::unit());
+        }
+        let seq = self
+            .defs
+            .seqs
+            .iter()
+            .position(|t| t.name == target.name)
+            .ok_or_else(|| internal(target.span, "unknown sequence"))?;
+        let instances = self.defs.seqs[seq].instances;
+        let id = match id {
+            Some(id) => Some(self.expr(id)?.scalar()),
+            None => None,
+        };
+        let step = match step {
+            Some(s) => Some(self.expr(s)?.scalar()),
+            None => None,
+        };
+        let call = self.calls.len() as u16;
+        let dst = self.reg()?;
+        let mut settings = [Source::Default; 3];
+        let mut repeat = None;
+        let mut looping = None;
+        let mut captures: Vec<Operand> = Vec::new();
+        // Names of the handler's own values, captured per instance.
+        let mut captured: Vec<String> = Vec::new();
+        let mut followed: Vec<(usize, &Expr)> = Vec::new();
+        for a in args {
+            let Some(name) = &a.name else { continue };
+            let index = match name.name.as_str() {
+                "tempo" => super::vm::TEMPO,
+                "gate" => super::vm::GATE,
+                "velocity" => super::vm::VELOCITY,
+                "repeat" => {
+                    repeat = Some(self.expr(&a.value)?.scalar());
+                    continue;
+                }
+                "loop" => {
+                    looping = Some(self.expr(&a.value)?.scalar());
+                    continue;
+                }
+                _ => continue,
+            };
+            // The value now, for starting; and, if it follows a stream,
+            // code that keeps it up to date.
+            let now = self.expr(&a.value)?.scalar();
+            if index == super::vm::TEMPO
+                && let Operand::Const(t) = now
+                && t <= 0.0
+            {
+                return Err(zero_tempo(a.value.span));
+            }
+            let (streams, own) = self.dependencies(&a.value);
+            if !streams || matches!(now, Operand::Const(_)) {
+                settings[index] = Source::Now(now);
+            } else if own.is_empty() {
+                // Only the rill's streams: one register for every instance.
+                let saved = std::mem::replace(&mut self.code, std::mem::take(&mut self.post));
+                let v = self.expr(&a.value);
+                self.post = std::mem::replace(&mut self.code, saved);
+                settings[index] = match v?.scalar() {
+                    Operand::Reg(r) => Source::Follow(r),
+                    c @ Operand::Const(_) => Source::Now(c),
+                };
+            } else {
+                for n in own {
+                    if !captured.contains(&n) {
+                        captured.push(n);
+                    }
+                }
+                settings[index] = Source::PerSlot { initial: now };
+                followed.push((index, &a.value));
+            }
+        }
+        // Values of the handler's own names, in the order captured.
+        let mut layout: Vec<(String, CVal)> = Vec::new();
+        for n in &captured {
+            let v = self
+                .lookup(n)
+                .map(|b| b.val.clone())
+                .ok_or_else(|| internal(e.span, "captured name not found"))?;
+            captures.extend(v.operands());
+            layout.push((n.clone(), v));
+        }
+        if !followed.is_empty() {
+            // Per instance slot: load its captured values, then compute the
+            // settings that follow streams.
+            let saved_code = std::mem::replace(&mut self.code, std::mem::take(&mut self.post));
+            let base = self.handler_scope.unwrap_or(self.scopes.len());
+            let saved_scopes = self.scopes.clone();
+            self.scopes.truncate(base);
+            let result = (|| -> CResult<()> {
+                for slot in 0..instances {
+                    self.scopes.push(HashMap::new());
+                    let mut index = 0u8;
+                    for (n, v) in &layout {
+                        let mut regs = Vec::new();
+                        for _ in v.operands() {
+                            let dst = self.reg()?;
+                            self.emit(Instr::LoadCapture {
+                                dst,
+                                seq: seq as u16,
+                                slot,
+                                index,
+                            });
+                            index += 1;
+                            regs.push(Operand::Reg(dst));
+                        }
+                        let val = v.reshape(regs);
+                        self.bind(n, val, false);
+                    }
+                    for &(setting, x) in &followed {
+                        let value = self.expr(x)?.scalar();
+                        self.emit(Instr::SetSlot {
+                            seq: seq as u16,
+                            slot,
+                            call,
+                            setting: setting as u8,
+                            value,
+                        });
+                    }
+                    self.scopes.pop();
+                }
+                Ok(())
+            })();
+            self.scopes = saved_scopes;
+            self.post = std::mem::replace(&mut self.code, saved_code);
+            result?;
+        }
+        self.calls.push(InvokeCall {
+            seq: seq as u16,
+            id,
+            step,
+            dst,
+            settings,
+            repeat,
+            looping,
+            captures,
+        });
+        self.emit(Instr::InvokeSeq { call });
+        Ok(CVal::Scalar(Operand::Reg(dst)))
+    }
+
+    /// Whether `e` reads any of the rill's streams (values that change over
+    /// time, from outside the handler), and which of the handler's own
+    /// names it reads.
+    fn dependencies(&self, e: &Expr) -> (bool, Vec<String>) {
+        let mut names = Vec::new();
+        names_in(e, &mut names);
+        let base = self.handler_scope.unwrap_or(usize::MAX);
+        let mut streams = false;
+        let mut own = Vec::new();
+        for n in names {
+            let Some(depth) = self.scopes.iter().rposition(|s| s.contains_key(&n)) else {
+                continue;
+            };
+            if depth >= base {
+                if !own.contains(&n) {
+                    own.push(n);
+                }
+            } else if self.scopes[depth][&n]
+                .val
+                .operands()
+                .iter()
+                .any(|o| matches!(o, Operand::Reg(_)))
+            {
+                streams = true;
+            }
+        }
+        (streams, own)
     }
 
     fn if_expr(
@@ -1431,6 +1808,10 @@ impl Compiler<'_> {
         };
         let inner: Vec<usize> = extra.iter().map(|&e| e.saturating_sub(1)).collect();
         let mut out = Vec::with_capacity(n);
+        // The copies form a voice pool.
+        let pool = self.pools.len() as u16;
+        self.pools.push(Vec::new());
+        let saved = self.voice;
         for c in 0..n {
             let per_element: Vec<CVal> = extra
                 .iter()
@@ -1440,7 +1821,12 @@ impl Compiler<'_> {
                     _ => a.clone(),
                 })
                 .collect();
-            out.push(self.lift(&inner, &per_element, f)?);
+            self.voice = Some((pool, c as u16));
+            let v = self.lift(&inner, &per_element, f);
+            self.voice = saved;
+            let v = v?;
+            self.pools[usize::from(pool)].push(v.operands());
+            out.push(v);
         }
         Ok(CVal::Frame(out))
     }
@@ -1646,4 +2032,80 @@ fn range_bound(value: f32, span: Span, name: &str) -> CResult<i32> {
         ));
     }
     Ok(value as i32)
+}
+
+/// A tempo known when building must move the sequence on. One that follows
+/// a stream may still reach 0 while playing; the sequence then holds still.
+fn zero_tempo(span: Span) -> Diagnostic {
+    Diagnostic::error(span, "a tempo is above 0bpm")
+        .with_help("at 0bpm the sequence would never move; to stop it, use `halt`")
+}
+
+/// Every name `e` reads, in order.
+fn names_in(e: &Expr, out: &mut Vec<String>) {
+    match &e.kind {
+        ExprKind::Name(n) => out.push(n.clone()),
+        ExprKind::Number { .. } | ExprKind::Bool(_) => {}
+        ExprKind::Unary(_, x)
+        | ExprKind::Cast(x, _)
+        | ExprKind::Field(x, _)
+        | ExprKind::Repeat(x, _) => names_in(x, out),
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
+            names_in(a, out);
+            names_in(b, out);
+        }
+        ExprKind::Range { start, end, .. } => {
+            names_in(start, out);
+            names_in(end, out);
+        }
+        ExprKind::Call { args, .. } => {
+            for a in args {
+                names_in(&a.value, out);
+            }
+        }
+        ExprKind::Frame(xs) => {
+            for x in xs {
+                names_in(x, out);
+            }
+        }
+        ExprKind::If { cond, then, els } => {
+            names_in(cond, out);
+            names_in_block(then, out);
+            if let Some(els) = els {
+                names_in(els, out);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Fn { body: b, .. } => names_in_block(b, out),
+        ExprKind::Invoke { step, id, args, .. } => {
+            for x in step.iter().chain(id.iter()) {
+                names_in(x, out);
+            }
+            for a in args {
+                names_in(&a.value, out);
+            }
+        }
+        ExprKind::Halt { id, .. } => {
+            if let Some(x) = id {
+                names_in(x, out);
+            }
+        }
+    }
+}
+
+fn names_in_block(b: &Block, out: &mut Vec<String>) {
+    for s in &b.stmts {
+        match s {
+            Stmt::Let { value: Some(e), .. }
+            | Stmt::State { init: e, .. }
+            | Stmt::Assign { value: e, .. }
+            | Stmt::Return { value: e, .. }
+            | Stmt::Expr(e) => names_in(e, out),
+            Stmt::Let { value: None, .. } => {}
+            Stmt::EventHandler { body, .. } => names_in_block(body, out),
+            Stmt::For { iter, body, .. } => {
+                names_in(iter, out);
+                names_in_block(body, out);
+            }
+        }
+    }
 }

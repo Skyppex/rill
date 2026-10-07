@@ -146,6 +146,7 @@ pub fn tree(src: &str, program: &Program, checked: &Checked, color: bool) -> Str
         .iter()
         .map(|item| (item.def().span.start, p.item(item)))
         .chain(program.events.iter().map(|e| (e.span.start, p.event(e))))
+        .chain(program.seqs.iter().map(|s| (s.span.start, p.seq(s))))
         .collect();
     nodes.sort_by_key(|(start, _)| *start);
     let mut out = String::new();
@@ -303,7 +304,11 @@ impl Printer<'_> {
             ),
             Stmt::Return { value, .. } => Node::new(kw("return"), vec![self.expr(value)]),
             Stmt::EventHandler {
-                name, params, body, ..
+                name,
+                params,
+                mode,
+                body,
+                ..
             } => {
                 let mut label = kw("on").plain(" ").callable(&name.name).plain("(");
                 for (i, param) in params.iter().enumerate() {
@@ -312,7 +317,19 @@ impl Printer<'_> {
                     }
                     label = label.ident(&param.name);
                 }
-                Node::new(label.plain(")"), vec![self.block(prop("body"), body)])
+                label = label.plain(")");
+                label = match mode {
+                    HandlerMode::Plain => label,
+                    HandlerMode::Claim { tail: None } => label.plain(" ").kw("claim"),
+                    HandlerMode::Claim { tail: Some(t) } => label
+                        .plain(" ")
+                        .kw("claim")
+                        .plain("(tail: ")
+                        .value(self.text(t.span))
+                        .plain(")"),
+                    HandlerMode::Release => label.plain(" ").kw("release"),
+                };
+                Node::new(label, vec![self.block(prop("body"), body)])
             }
             Stmt::For {
                 name, iter, body, ..
@@ -461,7 +478,74 @@ impl Printer<'_> {
                 children.push(self.block(prop("body"), body));
                 Node::new(typed(kw("fn")), children)
             }
+            ExprKind::Repeat(x, n) => Node::new(
+                typed(prop("repeat").plain(" ").value(n.to_string())),
+                vec![self.expr(x)],
+            ),
+            ExprKind::Invoke {
+                step,
+                id,
+                target,
+                args,
+            } => {
+                let word = if step.is_some() { "trigger" } else { "invoke" };
+                let mut children = Vec::new();
+                if let Some(step) = step {
+                    children.push(Node::new(prop("step"), vec![self.expr(step)]));
+                }
+                if let Some(id) = id {
+                    children.push(Node::new(prop("id"), vec![self.expr(id)]));
+                }
+                for a in args {
+                    let label = match &a.name {
+                        Some(n) => prop("arg").plain(" ").ident(&n.name),
+                        None => prop("arg"),
+                    };
+                    children.push(Node::new(label, vec![self.expr(&a.value)]));
+                }
+                Node::new(typed(kw(word).plain(" ").callable(&target.name)), children)
+            }
+            ExprKind::Halt { id, target } => Node::new(
+                typed(kw("halt").plain(" ").callable(&target.name)),
+                id.iter()
+                    .map(|id| Node::new(prop("id"), vec![self.expr(id)]))
+                    .collect(),
+            ),
         }
+    }
+
+    /// `seq riff(step: 1/8)` with one child per step.
+    fn seq(&self, s: &SeqDecl) -> Node {
+        let mut label = kw("seq").plain(" ").callable(&s.name.name);
+        if !s.settings.is_empty() {
+            label = label.plain("(");
+            for (i, f) in s.settings.iter().enumerate() {
+                if i > 0 {
+                    label = label.plain(", ");
+                }
+                label = label
+                    .ident(&f.name.name)
+                    .plain(": ")
+                    .value(self.text(f.value.span));
+            }
+            label = label.plain(")");
+        }
+        let steps = s
+            .steps
+            .iter()
+            .map(|st| {
+                let mut l = prop("step").plain(" ");
+                l = match &st.notes {
+                    Some(n) => l.value(self.text(n.span)),
+                    None => l.plain("_"),
+                };
+                if let Some(v) = &st.velocity {
+                    l = l.plain(" ").op("@").value(self.text(v.span));
+                }
+                Node::leaf(l)
+            })
+            .collect();
+        Node::new(label, steps)
     }
 }
 

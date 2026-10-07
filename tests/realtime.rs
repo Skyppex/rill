@@ -79,7 +79,7 @@ fn rendering_does_not_allocate() {
 
 #[test]
 fn compiled_rill_programs_do_not_allocate() {
-    for name in ["sketch", "stereo", "polyphony"] {
+    for name in ["sketch", "stereo", "polyphony", "sequencer"] {
         let path = format!("{}/examples/{name}.rill", env!("CARGO_MANIFEST_DIR"));
         let src = std::fs::read_to_string(path).unwrap();
         let config = Config {
@@ -119,6 +119,7 @@ fn matching_and_handling_events_does_not_allocate() {
         payload: Payload::NoteOn {
             pitch: 64.0,
             velocity: 0.8,
+            instance: 0,
         },
     };
     let brightness = Event {
@@ -142,4 +143,39 @@ fn matching_and_handling_events_does_not_allocate() {
         engine.send(&press);
     });
     assert_eq!(count, 0);
+}
+
+#[test]
+fn playing_sequences_does_not_allocate() {
+    use rill::{Event, Payload};
+    let path = format!("{}/examples/sequencer.rill", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(path).unwrap();
+    let config = Config {
+        sample_rate: 48_000,
+        max_frames: 256,
+        out_channels: 2,
+    };
+    let (graph, _) = rill::lang::load(&src, &config, "main").unwrap();
+    let mut engine = Engine::new(graph, config).unwrap();
+    let pad = Event {
+        sender: 2,
+        channel: 10,
+        payload: Payload::NoteOn {
+            pitch: 60.0,
+            velocity: 1.0,
+            instance: 0,
+        },
+    };
+    let mut out = vec![0.0f32; 2 * 48_000];
+    let count = allocations_during(|| {
+        // Four seconds: every step, the loop around, and a restart.
+        for second in 0..4 {
+            if second == 2 {
+                engine.send(&pad);
+            }
+            engine.render_interleaved(&mut out);
+        }
+    });
+    assert_eq!(count, 0);
+    assert!(out.iter().any(|&x| x != 0.0));
 }

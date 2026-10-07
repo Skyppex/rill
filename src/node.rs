@@ -1,6 +1,6 @@
 //! The run-stage interface every node implements.
 
-use crate::event::{EventId, Payload};
+use crate::event::{EventId, Payload, Sender};
 
 /// Per-block information handed to every node.
 #[derive(Clone, Copy, Debug)]
@@ -137,9 +137,15 @@ pub trait Node: Send {
         false
     }
 
-    /// Run the handlers for the declared event `event`, between samples.
-    /// Returns whether the node has any.
-    fn handle_event(&mut self, _event: EventId, _payload: &Payload, _sample_rate: f32) -> bool {
+    /// Run the handlers for the declared event `event`, sent by `from`,
+    /// between samples. Returns whether the node has any.
+    fn handle_event(
+        &mut self,
+        _event: EventId,
+        _payload: &Payload,
+        _from: Sender,
+        _sample_rate: f32,
+    ) -> bool {
         false
     }
 }

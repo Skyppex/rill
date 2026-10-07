@@ -1,0 +1,62 @@
+// Sequencing: patterns that play when told to, each at its own tempo.
+
+// Eighth notes at 120bpm in 4/4. `@` sets a step's velocity; `_` is a rest.
+seq riff(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.6, velocity: 0.7) {
+    C4, _, E4@0.4, _, [G4, B4]@1, E4, _, C5,
+}
+
+// A slower bass line in 3/4, a step per beat.
+seq bass(meter: 3/4, step: 1/4, tempo: 90bpm, gate: 0.9) {
+    C2, G2@0.5, G2@0.5,
+}
+
+// A sequence is a sender: these hear only its notes.
+event lead_on note_on(sender: riff)
+event lead_off note_off(sender: riff)
+event low_on note_on(sender: bass)
+event low_off note_off(sender: bass)
+
+// A pad on host sender 2 restarts the riff from step 5.
+event pad note_on(sender: 2, channel: 10)
+
+rill sine(freq: Freq) Sample {
+    state phase: Float = 0
+    phase = wrap(phase + freq / RATE)
+    return sin(phase * TAU)
+}
+
+// A voice that takes one note at a time and fades out after its release.
+rill lead() Sample {
+    state pitch: Pitch = C4
+    state level: Float = 0
+    state gate: Float = 0
+    on lead_on(note) claim { pitch = note.pitch; level = note.velocity; gate = 1 }
+    on lead_off release { gate = 0 }
+    level = if gate > 0 { level } else { level * 0.9995 }
+    return (pitch |> equal |> sine) * level
+}
+
+rill low() Sample {
+    state pitch: Pitch = C2
+    state level: Float = 0
+    on low_on(note) { pitch = note.pitch; level = note.velocity }
+    on low_off { level = 0 }
+    return (pitch |> equal |> sine) * level
+}
+
+rill main(speed: Freq = 120bpm, volume: Gain = -12dB) [Sample; 2] {
+    state current: Int = 0
+
+    on start {
+        current = invoke riff(tempo: speed, loop: true)
+        invoke bass(loop: true)
+    }
+    on pad {
+        trigger 5 current riff
+    }
+
+    // Eight voices share the riff's notes, one note each.
+    let voices = [lead(); 8]
+    let mix = sum(voices) * 0.3 + low() * 0.5
+    return [mix, mix] + volume
+}

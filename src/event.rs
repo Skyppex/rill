@@ -2,7 +2,8 @@
 //!
 //! Every incoming [`Event`] comes from a `sender` on a `channel` and carries
 //! a [`Payload`] whose variant is its kind. What senders and channels mean is
-//! up to the host; Rill only compares the numbers. A program declares the
+//! up to the host; Rill only compares the numbers. A program's sequences are
+//! senders too ([`Sender::Seq`]). A program declares the
 //! events it handles ([`EventDecl`]), each one a kind with optional filters,
 //! and the engine runs the handlers of every declaration an event matches.
 
@@ -39,8 +40,8 @@ impl EventKind {
     /// Names of the payload's values, in the order a handler receives them.
     pub fn fields(self) -> &'static [&'static str] {
         match self {
-            EventKind::NoteOn => &["pitch", "velocity"],
-            EventKind::NoteOff => &["pitch", "release"],
+            EventKind::NoteOn => &["pitch", "velocity", "instance"],
+            EventKind::NoteOff => &["pitch", "release", "instance"],
             EventKind::ControlChange => &["value"],
         }
     }
@@ -53,11 +54,21 @@ impl fmt::Display for EventKind {
 }
 
 /// What happened. Pitches are Rill `Pitch` values, which count semitones
-/// like MIDI note numbers (A4 is 69); velocities and releases are 0–1. A control change's value is passed on as it is.
+/// like MIDI note numbers (A4 is 69); velocities and releases are 0–1.
+/// `instance` is the id of the sequence instance that played a note, and 0
+/// for notes from the host. A control change's value is passed on as it is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Payload {
-    NoteOn { pitch: f32, velocity: f32 },
-    NoteOff { pitch: f32, release: f32 },
+    NoteOn {
+        pitch: f32,
+        velocity: f32,
+        instance: i32,
+    },
+    NoteOff {
+        pitch: f32,
+        release: f32,
+        instance: i32,
+    },
     Control(f32),
 }
 
@@ -71,11 +82,50 @@ impl Payload {
     }
 
     /// The values in [`EventKind::fields`] order.
-    pub fn values(&self) -> [f32; 2] {
+    pub fn values(&self) -> [f32; 3] {
         match *self {
-            Payload::NoteOn { pitch, velocity } => [pitch, velocity],
-            Payload::NoteOff { pitch, release } => [pitch, release],
-            Payload::Control(value) => [value, 0.0],
+            Payload::NoteOn {
+                pitch,
+                velocity,
+                instance,
+            } => [pitch, velocity, instance as f32],
+            Payload::NoteOff {
+                pitch,
+                release,
+                instance,
+            } => [pitch, release, instance as f32],
+            Payload::Control(value) => [value, 0.0, 0.0],
+        }
+    }
+
+    /// The payload of kind `kind` with `values` in [`EventKind::fields`]
+    /// order.
+    pub fn from_values(kind: EventKind, values: [f32; 3]) -> Payload {
+        match kind {
+            EventKind::NoteOn => Payload::NoteOn {
+                pitch: values[0],
+                velocity: values[1],
+                instance: values[2] as i32,
+            },
+            EventKind::NoteOff => Payload::NoteOff {
+                pitch: values[0],
+                release: values[1],
+                instance: values[2] as i32,
+            },
+            EventKind::ControlChange => Payload::Control(values[0]),
+        }
+    }
+
+    /// The pitch and instance of a note, for telling notes apart.
+    pub fn note(&self) -> Option<(f32, i32)> {
+        match *self {
+            Payload::NoteOn {
+                pitch, instance, ..
+            }
+            | Payload::NoteOff {
+                pitch, instance, ..
+            } => Some((pitch, instance)),
+            Payload::Control(_) => None,
         }
     }
 }
@@ -88,6 +138,14 @@ pub struct Event {
     pub payload: Payload,
 }
 
+/// Who sent an event: a host sender by number, or one of the program's
+/// sequences by index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Sender {
+    Host(u32),
+    Seq(u16),
+}
+
 /// A declared event, by index into the program's declarations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EventId(pub u16);
@@ -98,15 +156,25 @@ pub struct EventId(pub u16);
 pub struct EventDecl {
     pub name: String,
     pub kind: EventKind,
-    pub sender: Option<u32>,
+    pub sender: Option<Sender>,
     pub channel: Option<u32>,
 }
 
 impl EventDecl {
+    /// Does an event from the host match?
     pub fn matches(&self, event: &Event) -> bool {
-        self.kind == event.payload.kind()
-            && self.sender.is_none_or(|s| s == event.sender)
-            && self.channel.is_none_or(|c| c == event.channel)
+        self.accepts(
+            Sender::Host(event.sender),
+            event.channel,
+            event.payload.kind(),
+        )
+    }
+
+    /// Does an event of `kind` from `sender` on `channel` match?
+    pub fn accepts(&self, sender: Sender, channel: u32, kind: EventKind) -> bool {
+        self.kind == kind
+            && self.sender.is_none_or(|s| s == sender)
+            && self.channel.is_none_or(|c| c == channel)
     }
 }
 
@@ -144,7 +212,7 @@ pub fn parse_dispatch(
             }
         },
     };
-    let mut values = [0.0f32; 2];
+    let mut values = [0.0f32; 3];
     let (mut sender, mut channel) = (0u32, 0u32);
     for (name, value) in fields {
         let whole = |what: &str| {
@@ -173,17 +241,7 @@ pub fn parse_dispatch(
             },
         }
     }
-    let payload = match kind {
-        EventKind::NoteOn => Payload::NoteOn {
-            pitch: values[0],
-            velocity: values[1],
-        },
-        EventKind::NoteOff => Payload::NoteOff {
-            pitch: values[0],
-            release: values[1],
-        },
-        EventKind::ControlChange => Payload::Control(values[0]),
-    };
+    let payload = Payload::from_values(kind, values);
     Ok(match to {
         Some(id) => Dispatch::To(id, payload),
         None => Dispatch::Incoming(Event {
@@ -202,7 +260,7 @@ mod tests {
         vec![EventDecl {
             name: "keys".into(),
             kind: EventKind::NoteOn,
-            sender: Some(5),
+            sender: Some(Sender::Host(5)),
             channel: None,
         }]
     }
@@ -220,6 +278,7 @@ mod tests {
             payload: Payload::NoteOn {
                 pitch: 0.0,
                 velocity: 1.0,
+                instance: 0,
             },
         };
         assert!(d.matches(&note(5, 0)));
@@ -229,6 +288,7 @@ mod tests {
             payload: Payload::NoteOff {
                 pitch: 0.0,
                 release: 0.0,
+                instance: 0,
             },
             ..note(5, 0)
         };
@@ -248,7 +308,8 @@ mod tests {
                 channel: 0,
                 payload: Payload::NoteOn {
                     pitch: 69.0,
-                    velocity: 0.5
+                    velocity: 0.5,
+                    instance: 0,
                 },
             }))
         );
@@ -258,13 +319,14 @@ mod tests {
                 EventId(0),
                 Payload::NoteOn {
                     pitch: 60.0,
-                    velocity: 0.0
+                    velocity: 0.0,
+                    instance: 0,
                 }
             ))
         );
         assert_eq!(
             parse_dispatch(&decls(), "note_on", &fields(&[("release", 1.0)])),
-            Err("a note_on event has no field `release` (it has pitch, velocity)".into())
+            Err("a note_on event has no field `release` (it has pitch, velocity, instance)".into())
         );
         assert!(parse_dispatch(&decls(), "keys", &fields(&[("channel", 1.0)])).is_err());
         assert!(parse_dispatch(&decls(), "nope", &[]).is_err());

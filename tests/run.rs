@@ -219,6 +219,7 @@ fn rill_events_run_handlers_at_sample_offsets() {
                 payload: Payload::NoteOn {
                     pitch: e5,
                     velocity: 1.0,
+                    instance: 0,
                 },
             }),
         }],
@@ -948,6 +949,7 @@ fn note_on(sender: u32, channel: u32, velocity: f32) -> Event {
         payload: Payload::NoteOn {
             pitch: 60.0,
             velocity,
+            instance: 0,
         },
     }
 }
@@ -977,6 +979,7 @@ fn declarations_filter_by_sender_and_channel() {
         payload: Payload::NoteOff {
             pitch: 60.0,
             release: 0.25,
+            instance: 0,
         },
     };
     assert_eq!(after(&[off]), [0.0, 0.0, 0.25, 0.0]);
@@ -1003,6 +1006,7 @@ fn sending_to_a_declared_event_skips_its_filters() {
     let on = Payload::NoteOn {
         pitch: 60.0,
         velocity: 0.5,
+        instance: 0,
     };
     assert!(engine.send_to(keys, on));
     // A payload of another kind is refused.
@@ -1031,4 +1035,440 @@ fn every_lifted_instance_handles_the_event() {
     let mut out = [0.0f32; 2];
     engine.render_interleaved(&mut out);
     assert_eq!(out, [2.0, 20.0]);
+}
+
+// ---- sequences ----------------------------------------------------------
+
+/// A rill that shows the pitch of the note playing (semitones above C4, plus
+/// one) and 0 when none is, for `seq` started by `on start { start }`.
+fn sequence_probe(seq: &str, start: &str) -> String {
+    format!(
+        "{seq}
+        event on_ note_on(sender: s)
+        event off_ note_off(sender: s)
+        rill main() Sample {{
+            state p: Float = 0
+            on start {{ {start} }}
+            on on_(note) {{ p = (note.pitch - C4) / 1st + 1 }}
+            on off_ {{ p = 0 }}
+            return p
+        }}"
+    )
+}
+
+/// Where the output changes: (sample, new value).
+fn changes(out: &[f32]) -> Vec<(usize, f32)> {
+    let mut last = 0.0;
+    let mut found = Vec::new();
+    for (i, &x) in out.iter().enumerate() {
+        if x != last {
+            found.push((i, x));
+            last = x;
+        }
+    }
+    found
+}
+
+#[test]
+fn sequence_steps_land_on_exact_samples() {
+    // 120bpm in 4/4: an eighth is a quarter of a second, 12000 samples.
+    let src = sequence_probe(
+        "seq s(step: 1/8, tempo: 120bpm, gate: 0.5) { C4, D4, _, E4 }",
+        "invoke s",
+    );
+    let want = [
+        (0, 1.0),
+        (6_000, 0.0),
+        (12_000, 3.0),
+        (18_000, 0.0),
+        (36_000, 5.0),
+        (42_000, 0.0),
+    ];
+    for blocks in [Blocks::Fixed(64), Blocks::Fixed(1), Blocks::Fixed(997)] {
+        assert_eq!(
+            changes(&render_with(&src, 1, 60_000, blocks.clone())),
+            want,
+            "{blocks:?}"
+        );
+    }
+
+    // In 7/8 a beat is an eighth: at 120bpm a step is half a second.
+    let src = sequence_probe(
+        "seq s(meter: 7/8, step: 1/8, tempo: 120bpm, gate: 1) { C4, D4 }",
+        "invoke s",
+    );
+    assert_eq!(
+        changes(&render(&src, 60_000)),
+        [(0, 1.0), (24_000, 3.0), (48_000, 0.0)]
+    );
+
+    // Dotted steps: three sixteenths at 60bpm are 0.75s.
+    let src = sequence_probe(
+        "seq s(step: 3/16, tempo: 60bpm, gate: 1) { C4, D4 }",
+        "invoke s",
+    );
+    assert_eq!(
+        changes(&render(&src, 80_000)),
+        [(0, 1.0), (36_000, 3.0), (72_000, 0.0)]
+    );
+}
+
+#[test]
+fn chords_velocities_and_repeats() {
+    let src = "
+        seq s(step: 1/4, tempo: 240bpm, velocity: 0.5, repeat: 2) { [C4, E4, G4], C4@0.25 }
+        event on_ note_on(sender: s)
+        rill main() [Sample; 2] {
+            state notes: Float = 0
+            state level: Float = 0
+            on start { invoke s }
+            on on_(note) { notes = notes + 1; level = note.velocity }
+            return [notes, level]
+        }
+    ";
+    // A quarter at 240bpm is 12000 samples; the sequence plays twice.
+    let out = render_with(src, 2, 60_000, Blocks::Fixed(64));
+    let at = |i: usize| [out[2 * i], out[2 * i + 1]];
+    assert_eq!(at(0), [3.0, 0.5]);
+    assert_eq!(at(12_000), [4.0, 0.25]);
+    assert_eq!(at(24_000), [7.0, 0.5]);
+    assert_eq!(at(36_000), [8.0, 0.25]);
+    assert_eq!(at(59_999), [8.0, 0.25], "two passes, then it stops");
+}
+
+/// Counts note-ons from `s`, after `handlers` ran.
+fn note_counter(seqs: &str, handlers: &str) -> String {
+    format!(
+        "{seqs}
+        event on_ note_on(sender: s)
+        event pad note_on(sender: 1)
+        rill main() [Sample; 2] {{
+            state count: Float = 0
+            state last: Float = 0
+            {handlers}
+            on on_(note) {{ count = count + 1; last = note.instance as Float }}
+            return [count, last]
+        }}"
+    )
+}
+
+fn pad(engine: &mut Engine) {
+    engine.send(&Event {
+        sender: 1,
+        channel: 0,
+        payload: Payload::NoteOn {
+            pitch: 60.0,
+            velocity: 1.0,
+            instance: 0,
+        },
+    });
+}
+
+/// Run `src`, pressing the pad at each of `presses` (samples), and return
+/// the last frame.
+fn run_with_pads(src: &str, presses: &[usize], frames: usize) -> [f32; 2] {
+    let mut engine = Engine::new(graph(src, 2), config(2)).unwrap();
+    let mut out = vec![0.0f32; 2];
+    let mut done = 0;
+    for &at in presses.iter().chain(std::iter::once(&frames)) {
+        let mut chunk = vec![0.0f32; 2 * (at - done)];
+        engine.render_interleaved(&mut chunk);
+        if let [.., l, r] = chunk[..] {
+            out = vec![l, r];
+        }
+        done = at;
+        if at < frames {
+            pad(&mut engine);
+        }
+    }
+    [out[0], out[1]]
+}
+
+#[test]
+fn instances_and_ids() {
+    let seq = "seq s(step: 1/4, tempo: 60bpm) { C4, D4 }";
+    // Fresh ids: two overlapping copies, the second numbered -2.
+    let src = note_counter(seq, "on pad { invoke s }");
+    assert_eq!(run_with_pads(&src, &[0, 100], 1_000), [2.0, -2.0]);
+    // An id of your own is left alone while it plays.
+    let src = note_counter(seq, "on pad { invoke 7 s }");
+    assert_eq!(run_with_pads(&src, &[0, 100], 1_000), [1.0, 7.0]);
+    // ... and starts again once it has finished.
+    assert_eq!(run_with_pads(&src, &[0, 100_000], 101_000), [3.0, 7.0]);
+    // The same id with another sequence is another instance.
+    let src = note_counter(
+        &format!("{seq}\nseq t(step: 1/4) {{ C4 }}\nevent t_on note_on(sender: t)"),
+        "on pad { invoke 7 s; invoke 7 t }\non t_on { count = count + 10 }",
+    );
+    assert_eq!(run_with_pads(&src, &[0], 1_000), [11.0, 7.0]);
+    // `invoke` returns the id it used.
+    let src = note_counter(
+        seq,
+        "state id: Int = 0\non pad { id = invoke s; last = id as Float }",
+    );
+    assert_eq!(run_with_pads(&src, &[0], 10), [1.0, -1.0]);
+}
+
+#[test]
+fn trigger_starts_at_a_step_and_halt_stops() {
+    let seq = "seq s(step: 1/4, tempo: 60bpm, gate: 1) { C4, D4, E4, F4 }";
+    // `trigger 3` starts at E4.
+    let src = sequence_probe(seq, "trigger 3 s");
+    assert_eq!(
+        changes(&render(&src, 100_000)),
+        [(0, 5.0), (48_000, 6.0), (96_000, 0.0)]
+    );
+    // A step computed while playing wraps around: 6 of 4 is 2.
+    let src = sequence_probe(seq, "let k = 6\ntrigger k s");
+    assert_eq!(changes(&render(&src, 10))[0], (0, 3.0));
+    // `trigger` restarts an instance that is playing.
+    let src = note_counter(seq, "on pad { trigger 1 5 s }");
+    assert_eq!(run_with_pads(&src, &[0, 100], 1_000), [2.0, 5.0]);
+    // `halt` ends the notes it holds.
+    let src = "
+        seq s(step: 1/4, tempo: 60bpm, loop: true) { C4 }
+        event on_ note_on(sender: s)
+        event off_ note_off(sender: s)
+        event pad note_on(sender: 1)
+        rill main() Sample {
+            state p: Float = 0
+            on start { invoke 3 s }
+            on pad { halt 3 s }
+            on on_ { p = 1 }
+            on off_ { p = 0 }
+            return p
+        }
+    ";
+    let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
+    let mut out = [0.0f32; 100];
+    engine.render_interleaved(&mut out);
+    assert_eq!(out[99], 1.0);
+    pad(&mut engine);
+    engine.render_interleaved(&mut out);
+    assert!(out.iter().all(|&x| x == 0.0));
+}
+
+#[test]
+fn tempo_can_follow_a_stream() {
+    // `speed` is a live control; the sequence follows it while playing.
+    let src = "
+        seq s(step: 1/4, gate: 1, loop: true) { C4, D4 }
+        event on_ note_on(sender: s)
+        rill main(speed: Freq = 60bpm) Sample {
+            state p: Float = 0
+            on start { invoke s(tempo: speed) }
+            on on_(note) { p = (note.pitch - C4) / 1st + 1 }
+            return p
+        }
+    ";
+    let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
+    let mut out = vec![0.0f32; 48_000];
+    engine.render_interleaved(&mut out);
+    // One step per second at 60bpm.
+    assert_eq!(changes(&out), [(0, 1.0)]);
+    engine.set_param("speed", 4.0); // 240bpm, in Hz
+    let mut out = vec![0.0f32; 48_000];
+    engine.render_interleaved(&mut out);
+    // The change is smoothed, but the steps soon come four times as fast.
+    let steps = changes(&out).len();
+    assert!(steps >= 3, "{:?}", changes(&out));
+}
+
+#[test]
+fn invoking_at_zero_bpm_starts_nothing() {
+    // The tempo comes from a live control at 0: no instance, no sound.
+    let src = "
+        seq s(step: 1/4, gate: 1) { C4 }
+        event on_ note_on(sender: s)
+        rill main(speed: Freq = 0Hz) Sample {
+            state count: Float = 0
+            state id: Int = 0
+            on start { id = invoke s(tempo: speed) }
+            on on_ { count = count + 1 }
+            return count + id as Float * 0
+        }
+    ";
+    assert!(render(src, 1_000).iter().all(|&x| x == 0.0));
+}
+
+#[test]
+fn captured_values_stay_with_their_instance() {
+    // The tempo mixes a stream (`speed`) with the pad's velocity, captured
+    // when each instance starts.
+    let src = "
+        seq s(step: 1/4, gate: 1) { C4, C4, C4, C4 }
+        event on_ note_on(sender: s)
+        event pad note_on(sender: 1)
+        rill main(speed: Freq = 60bpm) Sample {
+            state count: Float = 0
+            on pad(hit) { invoke s(tempo: speed * hit.velocity * 4) }
+            on on_ { count = count + 1 }
+            return count
+        }
+    ";
+    let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
+    engine.send(&Event {
+        sender: 1,
+        channel: 0,
+        payload: Payload::NoteOn {
+            pitch: 60.0,
+            velocity: 0.5,
+            instance: 0,
+        },
+    });
+    // 60bpm × 0.5 × 4 = 120bpm: a step every half second.
+    let mut out = vec![0.0f32; 48_000];
+    engine.render_interleaved(&mut out);
+    assert_eq!(changes(&out), [(0, 1.0), (24_000, 2.0)]);
+}
+
+#[test]
+fn notes_carry_their_instance() {
+    let src = "
+        seq s { C4 }
+        event any note_on
+        rill main() Sample {
+            state last: Float = 99
+            on start { invoke 4 s }
+            on any(note) { last = note.instance as Float }
+            return last
+        }
+    ";
+    let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
+    let mut out = [0.0f32; 1];
+    engine.render_interleaved(&mut out);
+    assert_eq!(out[0], 4.0);
+    pad(&mut engine);
+    engine.render_interleaved(&mut out);
+    assert_eq!(out[0], 0.0, "host notes have instance 0");
+}
+
+#[test]
+fn start_and_invoked_events() {
+    let src = "
+        event ping control_change(channel: 1)
+        event pong control_change(channel: 2)
+        rill main() [Sample; 2] {
+            state a: Float = 0
+            state b: Float = 0
+            on start { a = 1; invoke ping(value: 0.5) }
+            on ping(v) { b = v; invoke pong(value: v * 2) }
+            on pong(v) { a = a + v }
+            return [a, b]
+        }
+    ";
+    assert_eq!(render_with(src, 2, 1, Blocks::Fixed(1)), [2.0, 0.5]);
+}
+
+// ---- voices -------------------------------------------------------------
+
+const VOICE: &str = "
+event keys_on note_on(sender: 1)
+event keys_off note_off(sender: 1)
+rill voice() Sample {
+    state pitch: Float = 0
+    state level: Float = 0
+    state gate: Float = 0
+    on keys_on(note) claim { pitch = (note.pitch - C4) / 1st + 1; level = 1; gate = 1 }
+    on keys_off release { gate = 0 }
+    // After release the sound dies away slowly, like a reverb tail.
+    level = if gate > 0 { level } else { level * 0.5 }
+    return pitch * level
+}
+";
+
+fn key(engine: &mut Engine, on: bool, pitch: f32) {
+    let payload = if on {
+        Payload::NoteOn {
+            pitch,
+            velocity: 1.0,
+            instance: 0,
+        }
+    } else {
+        Payload::NoteOff {
+            pitch,
+            release: 0.0,
+            instance: 0,
+        }
+    };
+    engine.send(&Event {
+        sender: 1,
+        channel: 0,
+        payload,
+    });
+}
+
+fn voices(engine: &mut Engine) -> Vec<f32> {
+    let mut out = [0.0f32; 2];
+    engine.render_interleaved(&mut out[..2]);
+    out.to_vec()
+}
+
+#[test]
+fn claimed_notes_go_to_one_voice_each() {
+    let src = format!("{VOICE}\nrill main() [Sample; 2] {{ return [voice(); 2] }}");
+    let mut engine = Engine::new(graph(&src, 2), config(2)).unwrap();
+    let (c4, e4, g4) = (60.0, 64.0, 67.0);
+    key(&mut engine, true, c4);
+    key(&mut engine, true, e4);
+    assert_eq!(voices(&mut engine), [1.0, 5.0], "one note per voice");
+    // The release goes to the voice holding E4 only.
+    key(&mut engine, false, e4);
+    let after = voices(&mut engine);
+    assert_eq!(after[0], 1.0);
+    assert!(after[1] < 5.0, "E4 is fading: {after:?}");
+    // The fading voice is still busy, so a new note while both are taken
+    // steals the voice released longest ago: the fading one.
+    key(&mut engine, true, g4);
+    assert_eq!(voices(&mut engine), [1.0, 8.0]);
+    // With everything held, the oldest note is stolen.
+    key(&mut engine, true, e4);
+    assert_eq!(voices(&mut engine), [5.0, 8.0]);
+}
+
+#[test]
+fn a_voice_is_free_once_silent_for_its_tail() {
+    let src = format!(
+        "{}\nrill main() [Sample; 3] {{ return [voice(); 3] }}",
+        VOICE.replace("claim {", "claim(tail: 1ms) {")
+    );
+    let mut engine = Engine::new(graph(&src, 3), config(3)).unwrap();
+    key(&mut engine, true, 60.0);
+    key(&mut engine, false, 60.0);
+    // The tail halves every sample: below -90dB after about 30 samples, then
+    // 1ms (48 samples) of silence.
+    let mut out = vec![0.0f32; 3 * 60];
+    engine.render_interleaved(&mut out);
+    key(&mut engine, true, 62.0);
+    let mut out = [0.0f32; 3];
+    engine.render_interleaved(&mut out);
+    // Voice 1 is still releasing, so the free voice 2 takes the note.
+    assert_eq!(out[1..], [3.0, 0.0], "{out:?}");
+    let mut out = vec![0.0f32; 3 * 100];
+    engine.render_interleaved(&mut out);
+    key(&mut engine, true, 64.0);
+    let mut out = [0.0f32; 3];
+    engine.render_interleaved(&mut out);
+    // Voice 1 became free, so it takes the next note before voice 3.
+    assert_eq!(out, [5.0, 3.0, 0.0]);
+}
+
+#[test]
+fn sequences_play_chords_over_voices() {
+    let src = "
+        seq s(step: 1/4, gate: 0.5) { [C4, E4, G4] }
+        event on_ note_on(sender: s)
+        event off_ note_off(sender: s)
+        rill voice() Sample {
+            state p: Float = 0
+            on on_(note) claim { p = (note.pitch - C4) / 1st + 1 }
+            on off_ release { p = 0 }
+            return p
+        }
+        rill main() [Sample; 3] {
+            on start { invoke s }
+            return [voice(); 3]
+        }
+    ";
+    assert_eq!(render_with(src, 3, 1, Blocks::Fixed(1)), [1.0, 5.0, 8.0]);
 }

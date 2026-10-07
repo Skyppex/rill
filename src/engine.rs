@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::denormal::FlushDenormals;
-use crate::event::{Dispatch, Event, EventDecl, EventId, Payload};
+use crate::event::{Dispatch, Event, EventDecl, EventId, Payload, Sender};
 use crate::format::OutSample;
 use crate::graph::{Graph, Input, Output};
 use crate::node::{Context, Inputs, Node, Outputs, Port};
@@ -316,7 +316,8 @@ impl Engine {
         let mut handled = false;
         for i in 0..self.events.len() {
             if self.events[i].matches(event) {
-                handled |= self.send_to(EventId(i as u16), event.payload);
+                handled |=
+                    self.deliver(EventId(i as u16), event.payload, Sender::Host(event.sender));
             }
         }
         handled
@@ -325,14 +326,19 @@ impl Engine {
     /// Run the handlers of the declared event `id`, skipping its filters.
     /// Returns `false` if there is no such event, the payload is of another
     /// kind, or nothing handles it.
+    /// It counts as sent by host sender 0.
     pub fn send_to(&mut self, id: EventId, payload: Payload) -> bool {
         match self.events.get(usize::from(id.0)) {
             Some(decl) if decl.kind == payload.kind() => {}
             _ => return false,
         }
+        self.deliver(id, payload, Sender::Host(0))
+    }
+
+    fn deliver(&mut self, id: EventId, payload: Payload, from: Sender) -> bool {
         let mut handled = false;
         for node in &mut self.nodes {
-            handled |= node.handle_event(id, &payload, self.config.sample_rate as f32);
+            handled |= node.handle_event(id, &payload, from, self.config.sample_rate as f32);
         }
         handled
     }

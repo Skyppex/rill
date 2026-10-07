@@ -26,7 +26,7 @@ use super::ast::*;
 use super::builtins;
 use super::diag::{Diagnostic, Span, suggest};
 use super::types::{DefKind, ParamSig, Signature, Size, Type, coerces, join};
-use crate::event::{EventDecl as Declared, EventKind};
+use crate::event::{EventDecl as Declared, EventKind, Sender};
 
 /// Result of a successful check.
 #[derive(Clone, Debug)]
@@ -95,6 +95,8 @@ pub enum Resolution {
     Type,
     /// A declared event, by index into [`Checked::events`].
     Event(usize),
+    /// A sequence, by index into the program's sequences.
+    Seq(usize),
 }
 
 /// Check `program`. On failure the list holds the errors and any warnings.
@@ -133,15 +135,21 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         current_def: 0,
         events: Vec::new(),
         event_used: Vec::new(),
+        seq_names: program.seqs.iter().map(|s| s.name.name.clone()).collect(),
+        seq_steps: program.seqs.iter().map(|s| s.steps.len()).collect(),
+        seq_used: vec![false; program.seqs.len()],
+        handler: None,
+        invokes: Vec::new(),
     };
 
-    c.declare_events(&program.events);
+    c.declare_events(&program.events, &program.seqs);
     for item in &program.items {
         match item {
             Item::Fn(d) => c.declare(d, DefKind::Fn),
             Item::Rill(d) => c.declare(d, DefKind::Rill),
         }
     }
+    c.check_seqs(&program.seqs, &program.events);
     for (i, decl) in program.events.iter().enumerate() {
         if c.events[i].is_some() && c.defs.contains_key(&decl.name.name) {
             let e = c.error(
@@ -156,6 +164,15 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
     }
 
     c.check_recursion();
+    c.check_invoke_loops(program);
+    for (seq, used) in program.seqs.iter().zip(c.seq_used.clone()) {
+        if !used {
+            c.report(Diagnostic::warning(
+                seq.name.span,
+                format!("sequence `{}` is never invoked", seq.name.name),
+            ));
+        }
+    }
     for (decl, used) in program.events.iter().zip(c.event_used.clone()) {
         if !used {
             c.report(Diagnostic::warning(
@@ -253,6 +270,25 @@ struct Checker {
     events: Vec<Option<Declared>>,
     /// Per declaration: whether a handler uses it.
     event_used: Vec<bool>,
+    /// Names of the program's sequences, by index.
+    seq_names: Vec<String>,
+    /// Per sequence: its number of steps.
+    seq_steps: Vec<usize>,
+    /// Per sequence: whether anything invokes it.
+    seq_used: Vec<bool>,
+    /// The `on` handler being checked: what it handles.
+    handler: Option<Node>,
+    /// Every `invoke` and `trigger`: from the handler it is in, to what it
+    /// starts, for the loop check.
+    invokes: Vec<(Node, Node, Span)>,
+}
+
+/// Something that runs handlers, for the invoke-loop check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Node {
+    Start,
+    Event(usize),
+    Seq(usize),
 }
 
 impl Checker {
@@ -289,12 +325,25 @@ impl Checker {
 
     // ---- declarations -------------------------------------------------
 
-    fn declare_events(&mut self, decls: &[EventDecl]) {
+    fn declare_events(&mut self, decls: &[EventDecl], seqs: &[SeqDecl]) {
         for (i, d) in decls.iter().enumerate() {
             if decls[..i].iter().any(|p| p.name.name == d.name.name) {
                 let e = self.error(
                     d.name.span,
                     format!("event `{}` is declared more than once", d.name.name),
+                );
+                self.report(e);
+            } else if d.name.name == "start" {
+                let e = self
+                    .error(d.name.span, "`start` is a built-in event")
+                    .with_help(
+                        "handle it with `on start { ... }`; it runs once, before the first sample",
+                    );
+                self.report(e);
+            } else if seqs.iter().any(|s| s.name.name == d.name.name) {
+                let e = self.error(
+                    d.name.span,
+                    format!("`{}` is already the name of a sequence", d.name.name),
                 );
                 self.report(e);
             }
@@ -311,7 +360,8 @@ impl Checker {
             }
             let (mut sender, mut channel) = (None, None);
             for f in &d.filters {
-                let value = match &f.value.kind {
+                self.types[f.value.id as usize] = Type::Int;
+                let number = match &f.value.kind {
                     ExprKind::Number {
                         value,
                         unit: None,
@@ -319,35 +369,62 @@ impl Checker {
                     } if *value <= f64::from(u32::MAX) => Some(*value as u32),
                     _ => None,
                 };
-                self.types[f.value.id as usize] = Type::Int;
-                let Some(value) = value else {
-                    let e = self
-                        .error(f.value.span, "a filter is a whole number ≥ 0")
-                        .with_help(
-                            "filters are fixed when the program is built, as in `channel: 1`",
-                        );
-                    self.report(e);
-                    continue;
-                };
-                let slot = match f.name.name.as_str() {
-                    "sender" => &mut sender,
-                    "channel" => &mut channel,
+                match f.name.name.as_str() {
+                    "sender" => {
+                        let value = match (&f.value.kind, number) {
+                            (_, Some(n)) => Sender::Host(n),
+                            (ExprKind::Name(n), _) => {
+                                match self.seq_names.iter().position(|s| s == n) {
+                                    Some(j) => {
+                                        self.resolve(f.value.span, Resolution::Seq(j));
+                                        Sender::Seq(j as u16)
+                                    }
+                                    None => {
+                                        let e = self
+                                            .error(f.value.span, format!("unknown sequence `{n}`"))
+                                            .with_help("a sender is a whole number from the host, or a sequence's name");
+                                        self.report(e);
+                                        continue;
+                                    }
+                                }
+                            }
+                            _ => {
+                                let e = self
+                                    .error(f.value.span, "a sender is a whole number ≥ 0 or a sequence's name")
+                                    .with_help("filters are fixed when the program is built, as in `sender: 1` or `sender: riff`");
+                                self.report(e);
+                                continue;
+                            }
+                        };
+                        if sender.replace(value).is_some() {
+                            let e =
+                                self.error(f.name.span, "filter `sender` is given more than once");
+                            self.report(e);
+                        }
+                    }
+                    "channel" => {
+                        let Some(value) = number else {
+                            let e = self
+                                .error(f.value.span, "a filter is a whole number ≥ 0")
+                                .with_help(
+                                    "filters are fixed when the program is built, as in `channel: 1`",
+                                );
+                            self.report(e);
+                            continue;
+                        };
+                        if channel.replace(value).is_some() {
+                            let e =
+                                self.error(f.name.span, "filter `channel` is given more than once");
+                            self.report(e);
+                        }
+                    }
                     other => {
                         let e = self
                             .error(f.name.span, format!("unknown filter `{other}`"))
                             .with_help("events can be filtered by `sender` and `channel`");
                         self.report(e);
-                        continue;
                     }
-                };
-                if slot.is_some() {
-                    let e = self.error(
-                        f.name.span,
-                        format!("filter `{}` is given more than once", f.name.name),
-                    );
-                    self.report(e);
                 }
-                *slot = Some(value);
             }
             self.events.push(kind.map(|kind| Declared {
                 name: d.name.name.clone(),
@@ -356,6 +433,460 @@ impl Checker {
                 channel,
             }));
             self.event_used.push(false);
+        }
+    }
+
+    /// `invoke`, `trigger` and `halt` start and stop things at a moment, so
+    /// they belong in handlers; a rill body runs every sample.
+    fn in_handler_only(&mut self, span: Span, word: &str) {
+        if !self.in_event {
+            let e = self
+                .error(span, format!("`{word}` only works inside an `on` handler"))
+                .with_help("a rill body runs every sample, so it would start again every sample; react to an event instead, as in `on start { invoke riff }`");
+            self.report(e);
+        }
+    }
+
+    /// An instance id: a whole number, ≥ 1 if written out.
+    fn instance_id(&mut self, id: &Expr) {
+        let t = self.expr(id);
+        if !t.is_wild() && !matches!(t, Type::Int | Type::Num) {
+            let e = self
+                .error(id.span, format!("an instance id is an `Int`, not `{t}`"))
+                .with_help("ids you pick are whole numbers ≥ 1; `invoke` returns the id it used");
+            self.report(e);
+        } else if let ExprKind::Number { value, .. } = id.kind
+            && (value < 1.0 || value.fract() != 0.0)
+        {
+            let e = self
+                .error(id.span, "an id you pick is a whole number ≥ 1")
+                .with_help(
+                    "0 marks notes that did not come from a sequence, and fresh ids are negative",
+                );
+            self.report(e);
+        }
+    }
+
+    fn unknown_seq(&mut self, target: &Ident) -> Diagnostic {
+        let near =
+            suggest(&target.name, self.seq_names.iter().map(String::as_str)).map(str::to_owned);
+        let e = self.error(target.span, format!("unknown sequence `{}`", target.name));
+        match near {
+            Some(n) => e.with_help(format!("did you mean `{n}`?")),
+            None => e.with_help(format!(
+                "declare it at the top level, as in `seq {} {{ C4, E4, G4 }}`",
+                target.name
+            )),
+        }
+    }
+
+    fn invoke(
+        &mut self,
+        span: Span,
+        step: Option<&Expr>,
+        id: Option<&Expr>,
+        target: &Ident,
+        args: &[Arg],
+    ) -> Type {
+        let word = if step.is_some() { "trigger" } else { "invoke" };
+        self.in_handler_only(span, word);
+        if let Some(j) = self.seq_names.iter().position(|n| *n == target.name) {
+            self.resolve(target.span, Resolution::Seq(j));
+            self.seq_used[j] = true;
+            if let Some(from) = self.handler {
+                self.invokes.push((from, Node::Seq(j), target.span));
+            }
+            if let Some(id) = id {
+                self.instance_id(id);
+            }
+            if let Some(step) = step {
+                let t = self.expr(step);
+                if !t.is_wild() && !matches!(t, Type::Int | Type::Num) {
+                    let e = self.error(step.span, format!("a step is an `Int`, not `{t}`"));
+                    self.report(e);
+                } else if let ExprKind::Number { value, .. } = step.kind {
+                    let steps = self.seq_steps[j];
+                    if value < 1.0 || value.fract() != 0.0 || value > steps as f64 {
+                        let e = self
+                            .error(
+                                step.span,
+                                format!(
+                                    "step {value} is outside `{}`, which has {steps} steps",
+                                    target.name
+                                ),
+                            )
+                            .with_help("steps count from 1");
+                        self.report(e);
+                    }
+                }
+            }
+            let mut seen: Vec<String> = Vec::new();
+            for a in args {
+                let Some(name) = &a.name else {
+                    let e = self
+                        .error(a.value.span, "settings are given by name")
+                        .with_help(format!("as in `{word} {}(tempo: 90bpm)`", target.name));
+                    self.report(e);
+                    self.expr(&a.value);
+                    continue;
+                };
+                if seen.contains(&name.name) {
+                    let e = self.error(
+                        name.span,
+                        format!("setting `{}` is given more than once", name.name),
+                    );
+                    self.report(e);
+                }
+                seen.push(name.name.clone());
+                let fixed = matches!(name.name.as_str(), "meter" | "step" | "instances");
+                match seq_setting(&name.name) {
+                    _ if fixed => {
+                        let e = self
+                            .error(
+                                name.span,
+                                format!(
+                                    "`{}` is fixed when `{}` is declared",
+                                    name.name, target.name
+                                ),
+                            )
+                            .with_help("only `tempo`, `gate`, `velocity`, `repeat` and `loop` can be given when invoking");
+                        self.report(e);
+                        self.expr(&a.value);
+                    }
+                    Some((ty, _)) => {
+                        let t = self.expr_expect(&a.value, Some(&ty));
+                        if !coerces(&t, &ty) {
+                            let e = mismatch(
+                                a.value.span,
+                                &format!("setting `{}`", name.name),
+                                &ty,
+                                &t,
+                            );
+                            self.report(e);
+                        } else {
+                            self.check_setting_range(&name.name, &a.value);
+                        }
+                    }
+                    None => {
+                        let e = self
+                            .error(name.span, format!("unknown setting `{}`", name.name))
+                            .with_help("when invoking, a sequence takes `tempo`, `gate`, `velocity`, `repeat` and `loop`");
+                        self.report(e);
+                        self.expr(&a.value);
+                    }
+                }
+            }
+            return Type::Int;
+        }
+        let event = self
+            .events
+            .iter()
+            .position(|d| d.as_ref().is_some_and(|d| d.name == target.name));
+        let Some(i) = event else {
+            let e = if target.name == "start" {
+                self.error(target.span, "`start` cannot be invoked")
+                    .with_help("it runs once, before the first sample")
+            } else {
+                self.unknown_seq(target)
+            };
+            self.report(e);
+            for a in args {
+                self.expr(&a.value);
+            }
+            return Type::Error;
+        };
+        self.resolve(target.span, Resolution::Event(i));
+        if let Some(from) = self.handler {
+            self.invokes.push((from, Node::Event(i), target.span));
+        }
+        if step.is_some() || id.is_some() {
+            let e = self
+                .error(
+                    span,
+                    format!(
+                        "`{}` is an event; only sequences have steps and instances",
+                        target.name
+                    ),
+                )
+                .with_help(format!("send it with `invoke {}(...)`", target.name));
+            self.report(e);
+        }
+        let kind = self.events[i].as_ref().expect("found above").kind;
+        for a in args {
+            let Some(n) = &a.name else {
+                let e = self
+                    .error(a.value.span, "an event's fields are given by name")
+                    .with_help(format!(
+                        "as in `invoke {}(pitch: C4, velocity: 1)`",
+                        target.name
+                    ));
+                self.report(e);
+                self.expr(&a.value);
+                continue;
+            };
+            let ty = match (kind, n.name.as_str()) {
+                (EventKind::ControlChange, "value") => Some(Type::Float),
+                _ => event_field_type(kind, &n.name),
+            };
+            match ty {
+                Some(ty) => {
+                    let t = self.expr_expect(&a.value, Some(&ty));
+                    if !coerces(&t, &ty) {
+                        let e = mismatch(a.value.span, &format!("field `{}`", n.name), &ty, &t);
+                        self.report(e);
+                    }
+                }
+                None => {
+                    let fields = kind
+                        .fields()
+                        .iter()
+                        .map(|f| format!("`{f}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let e = self
+                        .error(n.span, format!("a {kind} event has no field `{}`", n.name))
+                        .with_help(format!("it has {fields}"));
+                    self.report(e);
+                    self.expr(&a.value);
+                }
+            }
+        }
+        Type::Unit
+    }
+
+    /// Reject handlers that can invoke, through events and sequences, the
+    /// event that runs them. A sequence's notes reach every declaration
+    /// that accepts them.
+    fn check_invoke_loops(&mut self, program: &Program) {
+        let mut edges: HashMap<Node, Vec<(Node, Span)>> = HashMap::new();
+        for &(from, to, at) in &self.invokes {
+            edges.entry(from).or_default().push((to, at));
+        }
+        for j in 0..program.seqs.len() {
+            let from = Sender::Seq(j as u16);
+            for (i, d) in self.events.iter().enumerate() {
+                if let Some(d) = d
+                    && (d.accepts(from, 0, EventKind::NoteOn)
+                        || d.accepts(from, 0, EventKind::NoteOff))
+                {
+                    let span = program.seqs[j].name.span;
+                    edges
+                        .entry(Node::Seq(j))
+                        .or_default()
+                        .push((Node::Event(i), span));
+                }
+            }
+        }
+        let name = |n: Node| match n {
+            Node::Start => "start".to_owned(),
+            Node::Event(i) => program.events[i].name.name.clone(),
+            Node::Seq(j) => program.seqs[j].name.name.clone(),
+        };
+        let mut reported: HashSet<Vec<String>> = HashSet::new();
+        for start in (0..program.events.len()).map(Node::Event) {
+            // Depth-first search for a path back to `start`. `path` holds
+            // the nodes after `start`, each with the invoke that led there.
+            let mut path: Vec<(Node, Span)> = Vec::new();
+            let mut stack: Vec<(Node, usize)> = vec![(start, 0)];
+            while let Some((node, next)) = stack.pop() {
+                let out = edges.get(&node).map_or(&[][..], Vec::as_slice);
+                if next >= out.len() {
+                    if node != start {
+                        path.pop();
+                    }
+                    continue;
+                }
+                stack.push((node, next + 1));
+                let (to, at) = out[next];
+                if to == start {
+                    let mut chain: Vec<String> = vec![name(start)];
+                    chain.extend(path.iter().map(|(n, _)| name(*n)));
+                    chain.push(name(start));
+                    let mut key = chain.clone();
+                    key.sort();
+                    key.dedup();
+                    if reported.insert(key) {
+                        // Point at the first invoke on the way round.
+                        let site = path.first().map_or(at, |(_, s)| *s);
+                        let chain = chain
+                            .iter()
+                            .map(|n| format!("`{n}`"))
+                            .collect::<Vec<_>>()
+                            .join(" -> ");
+                        let e = self
+                            .error(site, format!("invoking here can lead back to the same handler: {chain}"))
+                            .with_help("a sequence's first notes and invoked events arrive at the same sample, so this would never end");
+                        self.report(e);
+                    }
+                    continue;
+                }
+                if to == start || path.iter().any(|(n, _)| *n == to) {
+                    continue;
+                }
+                path.push((to, at));
+                stack.push((to, 0));
+            }
+        }
+    }
+
+    /// Check every sequence's settings and steps.
+    fn check_seqs(&mut self, seqs: &[SeqDecl], events: &[EventDecl]) {
+        let saved = std::mem::replace(&mut self.place, Place::Fn);
+        self.scopes.push(HashMap::new());
+        for (i, seq) in seqs.iter().enumerate() {
+            let name = &seq.name.name;
+            if seqs[..i].iter().any(|p| p.name.name == *name) {
+                let e = self.error(
+                    seq.name.span,
+                    format!("sequence `{name}` is declared more than once"),
+                );
+                self.report(e);
+            } else if self.defs.contains_key(name) {
+                let e = self.error(
+                    seq.name.span,
+                    format!("`{name}` is already the name of a fn or rill"),
+                );
+                self.report(e);
+            } else if name == "start" {
+                let e = self.error(seq.name.span, "`start` is a built-in event");
+                self.report(e);
+            }
+            let _ = events;
+            if seq.steps.is_empty() {
+                let e = self
+                    .error(seq.name.span, format!("sequence `{name}` has no steps"))
+                    .with_help("add steps between the braces, as in `{ C4, _, E4 }`");
+                self.report(e);
+            }
+            for (j, setting) in seq.settings.iter().enumerate() {
+                let sname = setting.name.name.as_str();
+                if seq.settings[..j].iter().any(|p| p.name.name == sname) {
+                    let e = self.error(
+                        setting.name.span,
+                        format!("setting `{sname}` is given more than once"),
+                    );
+                    self.report(e);
+                }
+                match sname {
+                    "meter" | "step" => {
+                        self.types[setting.value.id as usize] = Type::Num;
+                        let ok = match fraction(&setting.value) {
+                            Some((n, d)) => n >= 1 && d >= 1,
+                            None => false,
+                        };
+                        if !ok {
+                            let example = if sname == "meter" { "4/4" } else { "1/8" };
+                            let what = if sname == "meter" {
+                                "a time signature"
+                            } else {
+                                "a note value"
+                            };
+                            let e = self
+                                .error(
+                                    setting.value.span,
+                                    format!("`{sname}` is {what}, written as two whole numbers"),
+                                )
+                                .with_help(format!("as in `{sname}: {example}`"));
+                            self.report(e);
+                        }
+                    }
+                    _ => {
+                        let Some((ty, _)) = seq_setting(sname) else {
+                            let e = self
+                                .error(setting.name.span, format!("unknown setting `{sname}`"))
+                                .with_help(format!("a sequence's settings are {}", SEQ_SETTINGS));
+                            self.report(e);
+                            self.expr(&setting.value);
+                            continue;
+                        };
+                        let t = self.expr_expect(&setting.value, Some(&ty));
+                        if !coerces(&t, &ty) {
+                            let e = mismatch(
+                                setting.value.span,
+                                &format!("setting `{sname}`"),
+                                &ty,
+                                &t,
+                            );
+                            self.report(e);
+                        } else if !self.is_const(&setting.value) {
+                            let e = self
+                                .error(setting.value.span, format!("setting `{sname}` must be a constant"))
+                                .with_help("these are defaults, fixed when the program is built; pass a value that changes when invoking, as in `invoke riff(tempo: speed)`");
+                            self.report(e);
+                        } else {
+                            self.check_setting_range(sname, &setting.value);
+                        }
+                    }
+                }
+            }
+            for step in &seq.steps {
+                if let Some(notes) = &step.notes {
+                    let t = self.expr(notes);
+                    let ok = match &t {
+                        Type::Pitch => true,
+                        Type::Frame(elem, _) => **elem == Type::Pitch,
+                        t => t.is_wild(),
+                    };
+                    if !ok {
+                        let e = self
+                            .error(
+                                notes.span,
+                                format!("a step is a pitch, a chord or `_`, not `{t}`"),
+                            )
+                            .with_help("as in `C4`, `[C4, E4, G4]` or `_` for a rest");
+                        self.report(e);
+                    } else if !self.is_const(notes) {
+                        let e = self.error(notes.span, "a step must be a constant");
+                        self.report(e);
+                    }
+                }
+                if let Some(v) = &step.velocity {
+                    let t = self.expr_expect(v, Some(&Type::Float));
+                    if !coerces(&t, &Type::Float) {
+                        let e = mismatch(v.span, "the velocity", &Type::Float, &t);
+                        self.report(e);
+                    } else if !self.is_const(v) {
+                        let e = self.error(v.span, "a step's velocity must be a constant");
+                        self.report(e);
+                    } else {
+                        self.check_setting_range("velocity", v);
+                    }
+                    if step.notes.is_none() {
+                        let e = self.error(v.span, "a rest has no velocity");
+                        self.report(e);
+                    }
+                }
+            }
+        }
+        self.scopes.pop();
+        self.place = saved;
+    }
+
+    /// Range checks for literal setting values.
+    fn check_setting_range(&mut self, name: &str, value: &Expr) {
+        let v = match &value.kind {
+            ExprKind::Number { value: v, .. } => *v,
+            ExprKind::Unary(UnOp::Neg, x) => match x.kind {
+                ExprKind::Number { value: v, .. } => -v,
+                _ => return,
+            },
+            _ => return,
+        };
+        let problem = match name {
+            "tempo" if v <= 0.0 => Some("a tempo is above 0bpm"),
+            "gate" if !(v > 0.0 && v <= 1.0) => {
+                Some("`gate` is a fraction of the step, above 0 and at most 1")
+            }
+            "velocity" if !(0.0..=1.0).contains(&v) => Some("a velocity is from 0 to 1"),
+            "repeat" | "instances" if v < 1.0 || v.fract() != 0.0 => {
+                Some("this is a whole number, at least 1")
+            }
+            "instances" if v > 65_535.0 => Some("at most 65535 instances"),
+            _ => None,
+        };
+        if let Some(p) = problem {
+            let e = self.error(value.span, p);
+            self.report(e);
         }
     }
 
@@ -895,17 +1426,66 @@ impl Checker {
                 (Type::Never, true)
             }
             Stmt::EventHandler {
-                name, params, body, ..
+                name,
+                params,
+                mode,
+                body,
+                ..
             } => {
                 if self.place != Place::Rill {
                     let e = self.error(s.span(), "event handlers are only allowed in rills");
                     self.report(e);
                     return (Type::Unit, false);
                 }
-                let kind = self
-                    .handled_event(name)
-                    .and_then(|i| self.events[i].as_ref())
-                    .map(|d| d.kind);
+                let (node, kind) = if name.name == "start" {
+                    if let Some(p) = params.first() {
+                        let e = self
+                            .error(p.span, "`start` has no payload")
+                            .with_help("write `on start { ... }`");
+                        self.report(e);
+                    }
+                    if *mode != HandlerMode::Plain {
+                        let e = self.error(
+                            name.span,
+                            "`on start` runs in every copy; it cannot `claim` or `release`",
+                        );
+                        self.report(e);
+                    }
+                    (Some(Node::Start), None)
+                } else {
+                    let i = self.handled_event(name);
+                    (
+                        i.map(Node::Event),
+                        i.and_then(|i| self.events[i].as_ref()).map(|d| d.kind),
+                    )
+                };
+                match mode {
+                    HandlerMode::Claim { tail } => {
+                        if kind.is_some_and(|k| k != EventKind::NoteOn) {
+                            let e = self
+                                .error(name.span, "only a `note_on` event can be claimed")
+                                .with_help("a voice claims a note when it starts, and releases it on a `note_off` event");
+                            self.report(e);
+                        }
+                        if let Some(tail) = tail {
+                            let t = self.expr(tail);
+                            if !coerces(&t, &Type::Time) {
+                                let e = mismatch(tail.span, "`tail`", &Type::Time, &t);
+                                self.report(e);
+                            } else if !self.is_const(tail) {
+                                let e = self.error(tail.span, "`tail` must be a constant");
+                                self.report(e);
+                            }
+                        }
+                    }
+                    HandlerMode::Release if kind.is_some_and(|k| k != EventKind::NoteOff) => {
+                        let e = self
+                            .error(name.span, "only a `note_off` event can release a voice")
+                            .with_help("use `claim` on the `note_on` event and `release` on its `note_off`");
+                        self.report(e);
+                    }
+                    _ => {}
+                }
                 if let Some(extra) = params.get(1) {
                     let e = self
                         .error(
@@ -932,8 +1512,10 @@ impl Checker {
                     self.bind(param, ty, VarKind::EventParam, param.span.end);
                 }
                 let saved = std::mem::replace(&mut self.in_event, true);
+                let saved_handler = std::mem::replace(&mut self.handler, node);
                 let (_, diverged) = self.block(body, false);
                 self.in_event = saved;
+                self.handler = saved_handler;
                 self.scopes.pop();
                 self.scope_spans.pop();
                 (Type::Unit, diverged)
@@ -1217,6 +1799,45 @@ impl Checker {
                 }
             }
             ExprKind::Fn { params, ret, body } => self.lambda(e, params, ret.as_ref(), body, None),
+            ExprKind::Repeat(x, n) => {
+                let t = self.expr(x);
+                if t.is_wild() {
+                    Type::Error
+                } else if !t.leaf().is_quantity() {
+                    let d = self.error(
+                        x.span,
+                        format!("a frame channel must be a number or a frame, found `{t}`"),
+                    );
+                    self.report(d);
+                    Type::Error
+                } else if *n == 0 {
+                    let d = self.error(e.span, "a frame needs at least one channel");
+                    self.report(d);
+                    Type::Error
+                } else {
+                    Type::Frame(Box::new(t), Size::Const(*n))
+                }
+            }
+            ExprKind::Invoke {
+                step,
+                id,
+                target,
+                args,
+            } => self.invoke(e.span, step.as_deref(), id.as_deref(), target, args),
+            ExprKind::Halt { id, target } => {
+                self.in_handler_only(e.span, "halt");
+                if let Some(id) = id {
+                    self.instance_id(id);
+                }
+                match self.seq_names.iter().position(|n| *n == target.name) {
+                    Some(j) => self.resolve(target.span, Resolution::Seq(j)),
+                    None => {
+                        let d = self.unknown_seq(target);
+                        self.report(d);
+                    }
+                }
+                Type::Unit
+            }
             ExprKind::Cast(x, te) => {
                 let from = self.expr(x);
                 let to = self.resolve_type(te, &self.generics());
@@ -1228,12 +1849,7 @@ impl Checker {
                     match event_field_type(kind, &field.name) {
                         Some(t) => t,
                         None => {
-                            let has = kind
-                                .fields()
-                                .iter()
-                                .map(|f| format!("`{f}`"))
-                                .collect::<Vec<_>>()
-                                .join(" and ");
+                            let has = listing(kind.fields());
                             let mut e = self.error(
                                 field.span,
                                 format!("a `{base_ty}` has no field `{}`", field.name),
@@ -1936,6 +2552,7 @@ impl Checker {
             ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => self.is_const(x),
             ExprKind::Binary(_, a, b) => self.is_const(a) && self.is_const(b),
             ExprKind::Frame(xs) => xs.iter().all(|x| self.is_const(x)),
+            ExprKind::Repeat(x, _) => self.is_const(x),
             ExprKind::Name(n) => match self.lookup(n) {
                 Some(v) => v.kind == VarKind::Size,
                 None => {
@@ -1958,7 +2575,9 @@ impl Checker {
             | ExprKind::Index(..)
             | ExprKind::Field(..)
             | ExprKind::Range { .. }
-            | ExprKind::Fn { .. } => false,
+            | ExprKind::Fn { .. }
+            | ExprKind::Invoke { .. }
+            | ExprKind::Halt { .. } => false,
         }
     }
 
@@ -2413,10 +3032,53 @@ fn gain_arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
     }
 }
 
+/// `a`, `b` and `c`
+fn listing(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => quoted.join(""),
+    }
+}
+
+/// `4/4` or `1/8`: two whole numbers divided, as a time signature or a note
+/// value.
+pub fn fraction(e: &Expr) -> Option<(u32, u32)> {
+    let ExprKind::Binary(BinOp::Div, a, b) = &e.kind else {
+        return None;
+    };
+    let whole = |x: &Expr| match x.kind {
+        ExprKind::Number {
+            value,
+            unit: None,
+            integral: true,
+        } if value <= f64::from(u32::MAX) => Some(value as u32),
+        _ => None,
+    };
+    Some((whole(a)?, whole(b)?))
+}
+
+/// The settings of a sequence apart from `meter` and `step`: their type,
+/// and whether they are fixed when the sequence is declared.
+pub fn seq_setting(name: &str) -> Option<(Type, bool)> {
+    Some(match name {
+        "tempo" => (Type::Freq, false),
+        "gate" | "velocity" => (Type::Float, false),
+        "repeat" => (Type::Int, false),
+        "loop" => (Type::Bool, false),
+        "instances" => (Type::Int, true),
+        _ => return None,
+    })
+}
+
+const SEQ_SETTINGS: &str =
+    "`meter`, `step`, `tempo`, `gate`, `velocity`, `repeat`, `loop` and `instances`";
+
 /// The type of field `name` of an event payload of kind `kind`.
 fn event_field_type(kind: EventKind, name: &str) -> Option<Type> {
     match (kind, name) {
         (EventKind::NoteOn | EventKind::NoteOff, "pitch") => Some(Type::Pitch),
+        (EventKind::NoteOn | EventKind::NoteOff, "instance") => Some(Type::Int),
         (EventKind::NoteOn, "velocity") | (EventKind::NoteOff, "release") => Some(Type::Float),
         _ => None,
     }

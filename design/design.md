@@ -75,7 +75,7 @@ rill main(depth: Freq = 20Hz) Sample {
 }
 ```
 
-Literals carry units: `440Hz`, `300ms`, `2s`, `+7st`, `+50cents`, `-6dB`, `3/2`. Units convert to samples using the host rate at build time.
+Literals carry units: `440Hz`, `120bpm`, `300ms`, `2s`, `+7st`, `+50cents`, `-6dB`, `3/2`. A tempo is a frequency, so `120bpm` is `2Hz`. Units convert to samples using the host rate at build time.
 
 ## Type system
 
@@ -177,7 +177,7 @@ Rules:
 
 ## Events
 
-Events come from outside the program: a keyboard, a plugin host, a test, later the sequencer. Every incoming event has a **kind**, a `sender`, a `channel` and a payload. What senders and channels mean is up to whoever sends the event; Rill only compares the numbers. Nothing is tied to MIDI: a MIDI host would use a number per device as the sender, and put control change 11 on channel 11.
+Events come from outside the program (a keyboard, a plugin host, a test) or from its own sequences. Every incoming event has a **kind**, a `sender`, a `channel` and a payload. What senders and channels mean is up to whoever sends the event; Rill only compares the numbers. Nothing is tied to MIDI: a MIDI host would use a number per device as the sender, and put control change 11 on channel 11.
 
 A program declares the events it handles, once, at the top level: a name, a kind, and optional filters. Handlers name the declaration, so the routing lives in one place and the code that reacts never sees sender or channel numbers.
 
@@ -201,18 +201,83 @@ rill synth() Sample {
 
 | Kind | Handler receives | Fields |
 | --- | --- | --- |
-| `note_on` | `NoteOn` | `pitch: Pitch`, `velocity: Float` (0–1) |
-| `note_off` | `NoteOff` | `pitch: Pitch`, `release: Float` (0–1) |
+| `note_on` | `NoteOn` | `pitch: Pitch`, `velocity: Float` (0–1), `instance: Int` |
+| `note_off` | `NoteOff` | `pitch: Pitch`, `release: Float` (0–1), `instance: Int` |
 | `control_change` | `Float` | the value, as sent |
 
 Rules:
 
-- The filters are `sender` and `channel`, whole-number constants. A filter left out matches anything.
+- The filters are `sender` and `channel`, whole-number constants; a sender can also be a sequence's name (see Sequences). A filter left out matches anything.
+- `instance` is the id of the sequence instance that played a note, and 0 for notes from the host.
 - An incoming event runs the handlers of every declaration it matches, in declaration order. A host can also send straight to a declaration by name, skipping its filters; tests and the sequencer do that.
 - `on NAME(param)` takes at most one parameter, typed by the event's kind whatever it is called; `on NAME { ... }` ignores the payload. Each payload has only its own kind's fields: `note.release` in a `note_on` handler is an error.
 - Handlers live in rills. Every instance handles the event, so a lifted rill reacts once per copy.
 - Pitch bend, aftertouch and any other controller are control changes on their own channel.
 - A declaration nothing handles is a warning.
+- `on start { ... }` is built in: it runs once, before the first sample, in every rill instance that has it.
+
+## Sequences
+
+A sequence is a pattern of notes that plays only when the program says so, at its own tempo and meter. Several can play at once.
+
+```rill
+seq riff(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.9, velocity: 0.8) {
+    C4, _, E4@0.5, _, [G4, B4]@1, E4, _, C5
+}
+
+event lead_on note_on(sender: riff)     // only the riff's notes
+event lead_off note_off(sender: riff)
+event pad note_on(sender: 2, channel: 10)
+
+rill main(speed: Freq = 120bpm) Sample {
+    state current: Int = 0
+    on start { current = invoke riff(loop: true) }
+    on pad(hit) { trigger 5 current riff(tempo: speed * hit.velocity) }
+    ...
+}
+```
+
+- **Steps** are separated by commas: a pitch, a chord (`[G4, B4]`) or a rest (`_`). `@0.5` sets a step's velocity, from 0 to 1. Each note sends a `note_on` at the start of its step and a `note_off` `gate` × `step` later.
+- **Settings** are all optional:
+
+  | Setting | Default | When |
+  | --- | --- | --- |
+  | `meter` | `4/4` | fixed when declared; the beat is its denominator (a quarter in 4/4, an eighth in 7/8) |
+  | `step` | `1/8` | fixed; a note value (`3/16` is a dotted eighth) |
+  | `tempo` | `120bpm` | per invocation; can follow a stream while playing |
+  | `gate`, `velocity` | `0.9`, `0.8` | per invocation |
+  | `repeat`, `loop` | `1`, `false` | per invocation |
+  | `instances` | `64` | fixed; how many copies can play at once |
+
+- **A sequence is a sender**, so its notes reach rills through declared events like any others: `sender: riff` hears only the riff, and a declaration without a `sender` filter hears every sequence and the host.
+- **Invoking** happens in `on` handlers, which are moments; a rill body runs every sample:
+  - `invoke riff` starts a new instance and returns its id, an `Int`. Invoking twice plays two overlapping copies.
+  - `invoke id riff` uses instance `id` of `riff`, and does nothing while it is playing. Ids you pick are whole numbers ≥ 1; fresh ids are negative.
+  - `trigger 5 id riff` starts at step 5 (steps count from 1), restarting the instance if it is playing. A step computed while playing wraps around.
+  - `halt id riff` or `halt riff` stops instances; the notes they hold end.
+  - Settings can be given at invocation: `invoke riff(tempo: 90bpm, repeat: 4)`. A tempo that reads the rill's streams follows them while playing; values from the handler, like `hit.velocity`, are kept from the moment of invoking.
+  - `invoke lead_on(pitch: C4, velocity: 1)` sends a declared event directly. Invoked events and a sequence's first notes arrive at the same sample, after the current handler; a handler that could invoke itself again, through events or sequences, is an error.
+- **Tempo:** a tempo known when the program is built must be above 0bpm. While playing, an invocation whose tempo is 0bpm or below does nothing, so it never sends a note; a running sequence whose tempo stream drops to 0 holds still.
+- At most `instances` copies of a sequence play at once; a new one beyond that replaces the oldest.
+
+## Voices
+
+A pool of voices is a frame of separate rill instances, written like the frame type: `[lead(); 8]` is eight `lead`s, each with its own state. Lifting a rill over a frame makes a pool too.
+
+```rill
+rill lead() Sample {
+    state pitch: Pitch = C4
+    state level: Float = 0
+    on lead_on(note) claim { pitch = note.pitch; level = note.velocity }
+    on lead_off release { level = 0 }
+    return (pitch |> equal |> sine) * level
+}
+```
+
+- `on EVENT claim { ... }` (on a `note_on` event) runs in **one** copy, which then holds the note. `on EVENT release { ... }` (on a `note_off` event) runs only in the copy holding a note with the same pitch, sender and instance.
+- A released copy stays busy while it still makes sound: it is free once its output has stayed below -90dB for its tail, 100ms unless `claim(tail: 2s)` says otherwise. Effects inside the voice (a reverb tail) keep it busy; effects after the pool do not.
+- A new note goes to a free copy; else the copy released longest ago; else the one that has held its note longest.
+- Plain `on` handlers run in every copy, as before. Outside a pool, `claim` and `release` behave like plain handlers.
 
 ## Functions as values
 
@@ -290,13 +355,13 @@ On microcontrollers the host calls `rill_render` from the DMA half-complete and 
 
 ## Non-goals and open questions
 
-Not in v0.1: plugin formats (CLAP comes later), FFT and other block-level rills, variable-ratio resampling, polyphonic voice management, a JIT, and a fixed-point backend.
+Not in v0.1: plugin formats (CLAP comes later), FFT and other block-level rills, variable-ratio resampling, a JIT, and a fixed-point backend.
 
 Open questions:
 
 - **Headroom on integer targets.** `f32` can exceed 1.0 mid-graph and come back down; fixed-point clips. Options: guard bits in the internal format, or saturating arithmetic with a compiler warning.
 - **Feedback in block processing.** Process cycles sample by sample, or fuse each cycle into one node that loops internally?
-- **Sequencing.** How notes and events over time fit beside streams: event streams, a scheduler API, or ChucK-style `=> now`.
+- ~~**Sequencing.**~~ Settled: sequences are senders of note events, started and stopped from handlers (see Sequences).
 - **Block-level escape hatch.** Syntax for rills that need a whole buffer, such as FFT effects, and how they report latency.
 - ~~**Sharing semantics.**~~ Settled: `let` binds a value, so a bound stream used twice is one instance; every call is a new instance.
 - **Time stretching.** Whether variable-rate rills are allowed on live input or only on stored buffers.

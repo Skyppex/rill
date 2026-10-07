@@ -87,7 +87,8 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `[sample; N]` | A frame of N channels | N is a compile-time constant |
 | `f32`, `i32`, `bool` | Plain values for control logic | Not converted at I/O |
 | `Hz`, `Time` | Unit-carrying numbers | Convert to samples via the host rate |
-| `Pitch`, `Interval`, `Chord` | Abstract musical values | Resolved through a `Tuning` (see Pitch) |
+| `Pitch`, `Interval` | Abstract musical values | Turned into `Hz` by a tuning (see Pitch) |
+| `fn(A, B) -> R` | A function value | See Functions as values |
 
 Lifting rules:
 
@@ -106,28 +107,61 @@ Optional channel layouts name positions without changing the type: `type Surroun
 
 ## Pitch and tuning
 
-A note name is an abstract `Pitch`, not a frequency; it becomes `Hz` only when resolved through a `Tuning`. Raw `Hz` literals bypass tuning entirely.
+A note name is an abstract `Pitch`, not a frequency; it becomes `Hz` only when it goes through a tuning. A tuning is an ordinary function from `Pitch` to `Hz`. Raw `Hz` literals bypass tuning entirely.
 
 ```
-let tuning = equal(12, a4: 440Hz)       // 12-TET at A440
-let tuning = equal(24, a4: 432Hz)       // quarter tones
-let tuning = just(C, a4: 440Hz)         // just intonation on C, with A4 at 440Hz
-let tuning = pythagorean(D)
+E4 |> equal(24, a4: 432Hz) |> sine      // quarter tones, A4 at 432Hz
+E4 |> just(C) |> sine                   // just intonation on C
+(E4 + 4st) |> equal |> sine             // Pitch + Interval -> Pitch
+sum([E4, F#4, B4] |> equal |> sine)     // a chord: three voices, mixed
 
-E4 |> tuning |> sine                    // Pitch -> Hz -> sound
-sine(440Hz)                             // already concrete
-(E4 + 4st) |> tuning |> sine            // Pitch + Interval -> Pitch
-sum([E4, F#4, B4] |> tuning |> sine)    // a chord: three voices, mixed
+let tuning = fn(p: Pitch) -> Hz { pythagorean(p, D) }   // pick one, pass it around
+```
+
+The built-in tunings take the pitch first, so pipes read naturally:
+
+```
+equal(pitch: Pitch, steps: i32 = 12, a4: Hz = 440Hz) -> Hz
+just(pitch: Pitch, root: Pitch, a4: Hz = 440Hz) -> Hz
+pythagorean(pitch: Pitch, root: Pitch, a4: Hz = 440Hz) -> Hz
+meantone(pitch: Pitch, root: Pitch, a4: Hz = 440Hz) -> Hz
 ```
 
 Rules:
 
 - A `Pitch` is a position, not an amount: `Pitch ± Interval` gives a `Pitch` and `Pitch - Pitch` gives the `Interval` between them. Pitches can be compared, but not scaled or added together.
-- A tuning is a value applied with `|>` (or called like a function). It is fixed when the program is built: tunings cannot be `state`, and choosing one needs constant arguments and conditions.
-- `equal(n)` places note names on the nearest of `n` equal divisions of the octave. Scale tunings (`just`, `pythagorean`, `meantone`) build twelve notes from ratios above their root and put A4 exactly on `a4`. In every tuning, fractions of a semitone (cents, bends) stay continuous.
-- Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Hz` and mixing on streams. Tuning a chord tunes each pitch, and passing it to a rill that takes `Hz` lifts it to one voice per pitch.
-- When the tuning and every operand are known at build time, the whole expression constant-folds to a number. Otherwise it is evaluated per tick.
+- `equal` places note names on the nearest of `steps` equal divisions of the octave. The scale tunings build twelve notes from ratios above their root and put A4 exactly on `a4`. In every tuning, fractions of a semitone (cents, bends) stay continuous.
+- A tuning's settings are ordinary arguments, so they can change while playing (`a4` from a live control, say). Your own tuning is any `fn(Pitch) -> Hz`.
+- Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Hz` and mixing on streams. The built-in tunings accept a chord and tune each pitch; passing the result to a rill that takes `Hz` lifts it to one voice per pitch.
+- When every input is known at build time, tuning constant-folds to a number. Otherwise it is evaluated per tick.
 - Note events carry `pitch` as a `Pitch` and `velocity` in 0–1. Velocity is linear; a curve such as `velocity * velocity` sounds more even, since a straight line is too loud at soft velocities.
+
+## Functions as values
+
+Fns are values: they can be bound with `let`, passed to fns and rills, returned from fns, and chosen while playing. Anonymous fns use the named syntax without the name.
+
+```
+fn a432(p: Pitch) -> Hz { 432Hz * pow(2, (p - A4) / 12st) }
+
+rill voice(pitch: Pitch, tune: fn(Pitch) -> Hz) -> sample {
+    return pitch |> tune |> sine
+}
+
+voice(E4, a432)                         // a named fn
+voice(E4, fn(p) { equal(p, 24) })       // anonymous; types come from `tune`
+voice(E4, equal)                        // extra parameters with defaults are fine
+voice(E4, if minor { just_c } else { equal })   // chosen while playing
+```
+
+Rules:
+
+- Function types are written `fn(A, B) -> R`. They cannot be `state`, frame channels, event fields or the entry rill's parameters.
+- An anonymous fn's parameter and return types can be left out when the surroundings say what they are (a parameter of function type, an annotated `let`, a `return`, or a fn's declared return type). Otherwise they are required.
+- Anonymous fns capture what they use, by value, at the point they are made. They are fns, so they are pure: they read what they capture but cannot change it, and cannot call rills.
+- A named fn can be used where a function type with fewer parameters is expected, if its remaining parameters have defaults. A built-in that works on several types (`sin`) needs an expected type to pick one.
+- Rills are not values: they carry state, and whether an unchosen rill keeps running is not decided yet.
+- Recursion is still not allowed, including through function values.
+- At build time every call of a function value is replaced by the function's body, so function values cost nothing while playing. A function chosen while playing becomes a branch between the candidates; only the chosen one runs.
 
 ## Execution model
 

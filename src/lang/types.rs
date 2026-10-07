@@ -16,7 +16,6 @@ pub enum Type {
     Bool,
     Hz,
     Pitch,
-    Tuning,
     Time,
     Interval,
     /// Dynamically shaped payload passed to an `on event(...)` handler.
@@ -26,6 +25,8 @@ pub enum Type {
     Num,
     /// `[elem; size]`. `elem` is always a scalar.
     Frame(Box<Type>, Size),
+    /// A function value: `fn(params) -> ret`.
+    Fn(Vec<Type>, Box<Type>),
     /// No value, e.g. `out(x)` or an `if` without `else`.
     Unit,
     /// The expression always `return`s, so it never produces a value.
@@ -62,12 +63,21 @@ impl fmt::Display for Type {
             Type::Bool => f.write_str("bool"),
             Type::Hz => f.write_str("Hz"),
             Type::Pitch => f.write_str("Pitch"),
-            Type::Tuning => f.write_str("Tuning"),
             Type::Time => f.write_str("Time"),
             Type::Interval => f.write_str("Interval"),
             Type::Event => f.write_str("event"),
             Type::Num => f.write_str("number"),
             Type::Frame(elem, size) => write!(f, "[{elem}; {size}]"),
+            Type::Fn(params, ret) => {
+                f.write_str("fn(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{p}")?;
+                }
+                write!(f, ") -> {ret}")
+            }
             Type::Unit => f.write_str("()"),
             Type::Never => f.write_str("!"),
             Type::Param(p) => f.write_str(p),
@@ -134,6 +144,11 @@ pub fn coerces(from: &Type, to: &Type) -> bool {
         (Type::Num, Type::Sample | Type::F32 | Type::I32) => true,
         (Type::F32, Type::Sample) | (Type::Sample, Type::F32) => true,
         (Type::Frame(a, n), Type::Frame(b, m)) => n == m && coerces(a, b),
+        // A function fits where it can be called the same way: it accepts
+        // what the expected type passes, and returns what it promises.
+        (Type::Fn(pa, ra), Type::Fn(pb, rb)) => {
+            pa.len() == pb.len() && pa.iter().zip(pb).all(|(a, b)| coerces(b, a)) && coerces(ra, rb)
+        }
         _ => false,
     }
 }

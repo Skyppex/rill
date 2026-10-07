@@ -356,6 +356,32 @@ impl Printer<'_> {
                 typed(prop("field").plain(" .").ident(&field.name)),
                 vec![self.expr(base)],
             ),
+            ExprKind::Fn { params, body, .. } => {
+                // Parameter types are shown as checked, including ones the
+                // source leaves out.
+                let param_types = match &self.checked.types[e.id as usize] {
+                    super::types::Type::Fn(ps, _) => ps.clone(),
+                    _ => Vec::new(),
+                };
+                let mut children: Vec<Node> = params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let ty = param_types
+                            .get(i)
+                            .map_or_else(|| "?".to_owned(), |t| t.to_string());
+                        Node::leaf(
+                            prop("param")
+                                .plain(" ")
+                                .ident(&p.name.name)
+                                .plain(": ")
+                                .ty(ty),
+                        )
+                    })
+                    .collect();
+                children.push(self.block(prop("body"), body));
+                Node::new(typed(kw("fn")), children)
+            }
         }
     }
 }

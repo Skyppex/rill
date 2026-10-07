@@ -70,15 +70,29 @@ pub enum TypeExpr {
         size: SizeExpr,
         span: Span,
     },
+    /// `fn(params) -> ret`
+    Fn {
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+        span: Span,
+    },
 }
 
 impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
             TypeExpr::Named(id) => id.span,
-            TypeExpr::Frame { span, .. } => *span,
+            TypeExpr::Frame { span, .. } | TypeExpr::Fn { span, .. } => *span,
         }
     }
+}
+
+/// A parameter of an anonymous fn. The type may be left out when the
+/// surroundings say what it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FnParam {
+    pub name: Ident,
+    pub ty: Option<TypeExpr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,6 +190,12 @@ pub enum ExprKind {
     Frame(Vec<Expr>),
     Index(Box<Expr>, Box<Expr>),
     Field(Box<Expr>, Ident),
+    /// An anonymous fn: `fn(p) { ... }` or `fn(p: Pitch) -> Hz { ... }`.
+    Fn {
+        params: Vec<FnParam>,
+        ret: Option<TypeExpr>,
+        body: Block,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

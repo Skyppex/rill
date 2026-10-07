@@ -601,7 +601,7 @@ fn names_and_suggestions() {
 
     assert_eq!(
         error(&with_sine("let x = sine")).0,
-        "`sine` is a rill and must be called"
+        "rill `sine` cannot be used as a value"
     );
     assert_eq!(
         error(&body("let a = 1\nlet x = a(2)")).0,
@@ -724,26 +724,111 @@ fn pitches_are_positions_not_amounts() {
 }
 
 #[test]
-fn tunings_are_fixed_when_the_program_is_built() {
-    assert_ok(&body(
-        "let t = if true { just(C) } else { equal(12) }\nlet f = A4 |> t",
+fn tunings_are_functions() {
+    assert_eq!(type_of(&body("let f = E4 |> equal(24)"), "f"), Type::Hz);
+    assert_eq!(
+        type_of(&body("let chord = [C4, E4, G4] |> just(C)"), "chord"),
+        frame(Type::Hz, 3)
+    );
+    // Settings may vary while playing.
+    assert_ok("rill main(a4: Hz = 440Hz) -> sample {\n return (A4 |> equal(a4: a4)) / 1kHz\n}");
+
+    let (msg, help) = error(&body("let t = equal(12)"));
+    assert_eq!(
+        msg,
+        "argument `pitch` of `equal` expects `Pitch`, found `number`"
+    );
+    assert_eq!(
+        help.as_deref(),
+        Some("write a pitch as a note name, like `A4` or `F#3`")
+    );
+}
+
+#[test]
+fn functions_are_values() {
+    let defs = "
+        fn a432(p: Pitch) -> Hz { 432Hz * pow(2, (p - A4) / 12st) }
+        rill voice(pitch: Pitch, tune: fn(Pitch) -> Hz) -> sample {
+            return (pitch |> tune) / 1kHz
+        }
+        fn tuned(steps: i32) -> fn(Pitch) -> Hz { fn(p) { equal(p, steps) } }
+    ";
+    let with = |stmts: &str| format!("{SINE}\n{defs}\n{}", body(stmts));
+
+    assert_eq!(
+        type_of(&with("let t = fn(p: Pitch) -> Hz { equal(p) }"), "t"),
+        Type::Fn(vec![Type::Pitch], Box::new(Type::Hz))
+    );
+    assert_eq!(
+        type_of(&with("let t = tuned(24)"), "t"),
+        Type::Fn(vec![Type::Pitch], Box::new(Type::Hz))
+    );
+    assert_ok(&with(
+        "let a = voice(E4, a432)
+         let b = voice(E4, fn(p) { equal(p, 24) })
+         let c = voice(E4, equal)
+         let t: fn(Pitch) -> Hz = equal
+         let d = E4 |> t
+         let f: fn(sample) -> sample = sin
+         let e = f(0.5)",
     ));
-    assert_eq!(
-        error("rill main() -> sample {\n state t = equal(12)\n return 0\n}").0,
-        "a tuning cannot be `state`"
+
+    for (stmts, msg) in [
+        ("let f = fn(p) { p }", "cannot tell the type of `p`"),
+        (
+            "let a = voice(E4, sine)",
+            "rill `sine` cannot be used as a value",
+        ),
+        ("let f = sin", "cannot tell which `sin` is meant here"),
+        (
+            "let a = voice(E4, fn(p) { p })",
+            "this fn should return `Hz`, but its body produces `Pitch`",
+        ),
+        (
+            "let f = fn(x: sample) -> sample { sine(1Hz) }",
+            "an anonymous fn cannot call rill `sine`",
+        ),
+        ("state f = a432", "a function cannot be `state`"),
+        (
+            "let t = fn(p: Pitch) -> Hz { equal(p) }\nlet x = t(A4, B4)",
+            "`t` takes 1 argument(s), but 2 were given",
+        ),
+        (
+            "let a = voice(E4, decay)",
+            "`decay` does not fit `fn(Pitch) -> Hz`",
+        ),
+    ] {
+        assert_eq!(error(&with(stmts)).0, msg, "{stmts}");
+    }
+
+    let src = format!(
+        "{SINE}\n{}",
+        "rill main() -> sample {
+            state s: sample = 0
+            let f = fn(x: sample) -> sample {
+                s = x
+                x
+            }
+            return f(1)
+        }"
     );
+    assert_eq!(error(&src).0, "an anonymous fn cannot change `s`");
+
     assert_eq!(
-        error("rill main(steps: i32 = 12) -> sample {\n let t = equal(steps)\n return 0\n}").0,
-        "`equal` needs constant arguments"
-    );
-    assert_eq!(
-        error(
-            "rill main(flip: bool = true) -> sample {
-                let t = if flip { equal(12) } else { just(C) }
-                return 0
-            }"
-        )
+        entry_errors(
+            "rill main(t: fn(Pitch) -> Hz = equal) -> sample { return 0 }",
+            "main"
+        )[0]
         .0,
-        "a tuning cannot be chosen by a condition that changes while playing"
+        "`t` cannot be a function"
     );
+}
+
+#[test]
+fn recursion_through_function_values_is_rejected() {
+    let errs = errors(
+        "fn apply(f: fn(sample) -> sample, x: sample) -> sample { f(x) }
+         fn spin(x: sample) -> sample { apply(spin, x) }",
+    );
+    assert_eq!(errs, ["recursion is not allowed: `spin` -> `spin`"]);
 }

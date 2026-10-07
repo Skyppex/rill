@@ -10,7 +10,10 @@
 //! - `state` lives only at the top of a rill body; only `state` can be
 //!   assigned to.
 //! - Every path through a rill ends in exactly one `return`.
-//! - A `fn` is pure: it cannot call a rill.
+//! - A `fn` is pure: it cannot call a rill. Anonymous fns are fns too: they
+//!   read what they capture but cannot change it.
+//! - Fns are values. A named fn fits a function type with fewer parameters
+//!   when the rest have defaults. Rills are not values.
 //! - No recursion: the run stage has no unbounded loops and every rill
 //!   instance needs a fixed amount of state.
 //! - Defaults and `state` initial values are known before audio starts.
@@ -46,6 +49,8 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
         current: None,
         ret: Type::Unit,
         in_event: false,
+        lambda_floor: None,
+        tail_expect: None,
         calls: HashMap::new(),
         def_order: Vec::new(),
     };
@@ -117,7 +122,15 @@ struct Checker {
     current: Option<String>,
     ret: Type,
     in_event: bool,
+    /// Inside an anonymous fn: the first scope that belongs to it. Variables
+    /// in scopes below are captured and cannot be assigned.
+    lambda_floor: Option<usize>,
+    /// The type a fn body's final expression should have, handed to the
+    /// next block checked (the body itself) so an anonymous fn there can
+    /// take its types from it.
+    tail_expect: Option<Type>,
     /// Caller -> (callee, call site), user definitions only.
+    /// Mentioning a fn as a value counts as a call.
     calls: HashMap<String, Vec<(String, Span)>>,
     def_order: Vec<String>,
 }
@@ -223,7 +236,7 @@ impl Checker {
             return;
         }
         let saved = std::mem::replace(&mut self.place, Place::Fn);
-        let t = self.expr(default);
+        let t = self.expr_expect(default, Some(ty));
         self.place = saved;
         if !coerces(&t, ty) {
             let e = mismatch(default.span, &format!("default for `{param}`"), ty, &t);
@@ -240,12 +253,11 @@ impl Checker {
                 "bool" => Type::Bool,
                 "Hz" => Type::Hz,
                 "Pitch" => Type::Pitch,
-                "Tuning" => Type::Tuning,
                 "Time" => Type::Time,
                 "Interval" => Type::Interval,
                 other => {
-                    const KNOWN: [&str; 9] = [
-                        "sample", "f32", "i32", "bool", "Hz", "Pitch", "Tuning", "Time", "Interval",
+                    const KNOWN: [&str; 8] = [
+                        "sample", "f32", "i32", "bool", "Hz", "Pitch", "Time", "Interval",
                     ];
                     let mut e = self.error(id.span, format!("unknown type `{other}`"));
                     if let Some(s) = suggest(other, KNOWN) {
@@ -279,6 +291,14 @@ impl Checker {
                     }
                 };
                 Type::Frame(Box::new(elem_ty), size)
+            }
+            TypeExpr::Fn { params, ret, .. } => {
+                let params = params
+                    .iter()
+                    .map(|p| self.resolve_type(p, generics))
+                    .collect();
+                let ret = self.resolve_type(ret, generics);
+                Type::Fn(params, Box::new(ret))
             }
         }
     }
@@ -316,6 +336,9 @@ impl Checker {
         }
         self.scopes = vec![scope];
 
+        if sig.kind == DefKind::Fn {
+            self.tail_expect = Some(sig.ret.clone());
+        }
         let (ty, diverges) = self.block(&d.body, sig.kind == DefKind::Rill);
         let name = &d.name.name;
         if sig.kind == DefKind::Rill && !diverges {
@@ -344,6 +367,7 @@ impl Checker {
     /// Check a block. Returns its value type and whether every path through
     /// it returns.
     fn block(&mut self, b: &Block, allow_state: bool) -> (Type, bool) {
+        let tail = self.tail_expect.take();
         self.scopes.push(HashMap::new());
         let mut value = Type::Unit;
         let mut diverged = false;
@@ -356,7 +380,15 @@ impl Checker {
                 break;
             }
             let last = i + 1 == b.stmts.len();
-            let (t, div) = self.stmt(s, allow_state, last);
+            let (t, div) = match (s, &tail) {
+                (Stmt::Expr(e), Some(expected)) if last => {
+                    let expected = expected.clone();
+                    let t = self.expr_expect(e, Some(&expected));
+                    let never = t == Type::Never;
+                    (t, never)
+                }
+                _ => self.stmt(s, allow_state, last),
+            };
             diverged |= div;
             if last && matches!(s, Stmt::Expr(_)) {
                 value = t;
@@ -381,15 +413,22 @@ impl Checker {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
+    /// Index of the scope that binds `name`.
+    fn lookup_depth(&self, name: &str) -> Option<usize> {
+        self.scopes.iter().rposition(|s| s.contains_key(name))
+    }
+
     fn stmt(&mut self, s: &Stmt, allow_state: bool, last: bool) -> (Type, bool) {
         match s {
             Stmt::Let {
                 name, ty, value, ..
             } => {
-                let t = self.expr(value);
-                let bound = match ty {
-                    Some(te) => {
-                        let declared = self.resolve_type(te, &self.generics());
+                let declared = ty
+                    .as_ref()
+                    .map(|te| self.resolve_type(te, &self.generics()));
+                let t = self.expr_expect(value, declared.as_ref());
+                let bound = match declared {
+                    Some(declared) => {
                         if !coerces(&t, &declared) {
                             let e =
                                 mismatch(value.span, &format!("`{}`", name.name), &declared, &t);
@@ -443,10 +482,10 @@ impl Checker {
                     }
                     None => t.settle(),
                 };
-                if bound == Type::Tuning {
-                    let e = self
-                        .error(*span, "a tuning cannot be `state`")
-                        .with_help(TUNING_FIXED_HELP);
+                if matches!(bound, Type::Fn(..)) {
+                    let e = self.error(*span, "a function cannot be `state`").with_help(
+                        "state holds numbers that change between ticks; bind functions with `let`",
+                    );
                     self.report(e);
                 }
                 self.bind(&name.name, bound, VarKind::State);
@@ -454,7 +493,17 @@ impl Checker {
             }
             Stmt::Assign { target, value, .. } => {
                 let t = self.expr(value);
+                let captured = matches!(
+                    (self.lambda_floor, self.lookup_depth(&target.name)),
+                    (Some(floor), Some(depth)) if depth < floor
+                );
                 match self.lookup(&target.name).cloned() {
+                    Some(_) if captured => {
+                        let e = self
+                            .error(target.span, format!("an anonymous fn cannot change `{}`", target.name))
+                            .with_help("fns are pure, including anonymous ones: they can read what they capture, but not change it");
+                        self.report(e);
+                    }
                     Some(var)
                         if var.kind == VarKind::State
                             || (self.in_event && var.kind == VarKind::Param) =>
@@ -479,7 +528,8 @@ impl Checker {
                 (Type::Unit, t == Type::Never)
             }
             Stmt::Return { value, .. } => {
-                let t = self.expr(value);
+                let expected = self.ret.clone();
+                let t = self.expr_expect(value, Some(&expected));
                 if !coerces(&t, &self.ret) {
                     let what = format!("`{}`", self.current.as_deref().unwrap_or("?"));
                     let ret = self.ret.clone();
@@ -561,22 +611,10 @@ impl Checker {
                 if let Some(t) = builtins::constant(name) {
                     return t.clone();
                 }
-                let kind = match self.defs.get(name) {
-                    Some(&i) => Some(self.signatures[i].kind),
-                    None if !builtins::lookup(name).is_empty() => Some(DefKind::Builtin),
-                    None => None,
-                };
-                let d = match kind {
-                    Some(k) => self
-                        .error(
-                            e.span,
-                            format!("`{name}` is a {} and must be called", k.word()),
-                        )
-                        .with_help(format!(
-                            "call it, as in `{name}(x)`, or pipe into it with `x |> {name}`"
-                        )),
-                    None => self.unknown_name(name, e.span),
-                };
+                if self.defs.contains_key(name) || !builtins::lookup(name).is_empty() {
+                    return self.fn_value(name, e.span, None);
+                }
+                let d = self.unknown_name(name, e.span);
                 self.report(d);
                 Type::Error
             }
@@ -644,13 +682,6 @@ impl Checker {
                 };
                 let t2 = self.expr(els);
                 match join(&t1, &t2) {
-                    Some(Type::Tuning) if !self.is_const(cond) => {
-                        let d = self
-                            .error(cond.span, "a tuning cannot be chosen by a condition that changes while playing")
-                            .with_help(TUNING_FIXED_HELP);
-                        self.report(d);
-                        Type::Tuning
-                    }
                     Some(t) => t,
                     None => {
                         let d = self.error(
@@ -748,6 +779,7 @@ impl Checker {
                     }
                 }
             }
+            ExprKind::Fn { params, ret, body } => self.lambda(e, params, ret.as_ref(), body, None),
             ExprKind::Field(base, field) => {
                 let base_ty = self.expr(base);
                 if base_ty == Type::Event {
@@ -783,16 +815,14 @@ impl Checker {
     }
 
     fn call(&mut self, span: Span, callee: &Ident, args: &[Arg]) -> Type {
-        let arg_types: Vec<Type> = args.iter().map(|a| self.expr(&a.value)).collect();
         let name = callee.name.as_str();
 
-        if let Some(var) = self.lookup(name)
-            && var.ty == Type::Tuning
-        {
-            return self.tuning_call(span, callee, args, arg_types);
-        }
-
-        if let Some(var) = self.lookup(name) {
+        // A variable holding a function.
+        if let Some(var) = self.lookup(name).cloned() {
+            if let Type::Fn(params, ret) = &var.ty {
+                return self.call_value(span, callee, args, params, ret);
+            }
+            self.exprs(args);
             let d = self.error(
                 callee.span,
                 format!(
@@ -810,6 +840,7 @@ impl Checker {
             None => builtins::lookup(name),
         };
         if sigs.is_empty() {
+            self.exprs(args);
             let mut d = self.error(callee.span, format!("unknown fn or rill `{name}`"));
             let candidates = self
                 .def_order
@@ -825,57 +856,42 @@ impl Checker {
 
         let kind = sigs[0].kind;
         if kind == DefKind::Rill && self.place == Place::Fn {
-            let me = self.current.clone().unwrap_or_default();
-            let d = self
-                .error(callee.span, format!("fn `{me}` cannot call rill `{name}`"))
-                .with_help(format!(
-                    "rills keep state between ticks, so fns must stay pure; make `{me}` a rill"
-                ));
+            let d = if self.lambda_floor.is_some() {
+                self.error(callee.span, format!("an anonymous fn cannot call rill `{name}`"))
+                    .with_help("fns stay pure, including anonymous ones; call the rill outside and pass its value in")
+            } else {
+                let me = self.current.clone().unwrap_or_default();
+                self.error(callee.span, format!("fn `{me}` cannot call rill `{name}`"))
+                    .with_help(format!(
+                        "rills keep state between ticks, so fns must stay pure; make `{me}` a rill"
+                    ))
+            };
             self.report(d);
         }
-        if kind != DefKind::Builtin
-            && let Some(me) = &self.current
-        {
-            self.calls
-                .entry(me.clone())
-                .or_default()
-                .push((name.to_owned(), callee.span));
+        if kind != DefKind::Builtin {
+            self.note_use(name, callee.span);
         }
 
-        let sig = match sigs.iter().find(|s| s.params.len() == args.len()) {
-            Some(s) if kind == DefKind::Builtin => s.clone(),
-            _ if kind == DefKind::Builtin => {
-                let counts: Vec<String> = sigs.iter().map(|s| s.params.len().to_string()).collect();
-                let d = self.error(
-                    span,
-                    format!(
-                        "`{name}` takes {} argument(s), but {} were given",
-                        counts.join(" or "),
-                        args.len()
-                    ),
-                );
-                self.report(d);
-                return Type::Error;
-            }
-            _ => sigs[0].clone(),
+        // Built-ins overloaded by arity (like `min`) are picked by argument
+        // count; everything else has one signature, with defaults.
+        let sig = if sigs.len() == 1 {
+            sigs[0].clone()
+        } else if let Some(s) = sigs.iter().find(|s| s.params.len() == args.len()) {
+            s.clone()
+        } else {
+            self.exprs(args);
+            let counts: Vec<String> = sigs.iter().map(|s| s.params.len().to_string()).collect();
+            let d = self.error(
+                span,
+                format!(
+                    "`{name}` takes {} argument(s), but {} were given",
+                    counts.join(" or "),
+                    args.len()
+                ),
+            );
+            self.report(d);
+            return Type::Error;
         };
-
-        if kind == DefKind::Builtin && sig.ret == Type::Tuning {
-            let varying: Vec<Span> = args
-                .iter()
-                .filter(|a| !self.is_const(&a.value))
-                .map(|a| a.value.span)
-                .collect();
-            for at in &varying {
-                let d = self
-                    .error(*at, format!("`{name}` needs constant arguments"))
-                    .with_help(TUNING_FIXED_HELP);
-                self.report(d);
-            }
-            if !varying.is_empty() {
-                return Type::Error;
-            }
-        }
 
         // Match arguments to parameters.
         let mut slots: Vec<Option<usize>> = vec![None; sig.params.len()];
@@ -940,6 +956,19 @@ impl Checker {
             }
             slots[pi] = Some(ai);
         }
+
+        // Check every argument once, with its parameter's type as the
+        // expectation when that is a function type.
+        let mut arg_types = vec![Type::Error; args.len()];
+        for (ai, arg) in args.iter().enumerate() {
+            let expected = slots
+                .iter()
+                .position(|s| *s == Some(ai))
+                .map(|pi| &sig.params[pi].ty)
+                .filter(|t| matches!(t, Type::Fn(..)));
+            arg_types[ai] = self.expr_expect(&arg.value, expected);
+        }
+
         for (p, slot) in sig.params.iter().zip(&slots) {
             if slot.is_none() && !p.has_default && ok {
                 let d = self
@@ -955,10 +984,11 @@ impl Checker {
 
         // Unify argument types with parameter types. A rill whose scalar
         // parameter receives a frame runs once per channel (lifting); fns and
-        // built-ins never lift.
+        // built-ins never lift, except the built-ins documented to take a
+        // frame in their first parameter.
         let mut subst = Subst::default();
         let mut lift: Option<(Size, Span)> = None;
-        for (p, slot) in sig.params.iter().zip(&slots) {
+        for (pi, (p, slot)) in sig.params.iter().zip(&slots).enumerate() {
             let Some(ai) = *slot else { continue };
             let at = &arg_types[ai];
             let arg_span = args[ai].value.span;
@@ -976,7 +1006,9 @@ impl Checker {
             {
                 let mut trial = subst.clone();
                 if unify(&p.ty, elem, &mut trial, &sig.generics) {
-                    if kind != DefKind::Rill {
+                    let lifts = kind == DefKind::Rill
+                        || (kind == DefKind::Builtin && pi == 0 && builtins::takes_frames(name));
+                    if !lifts {
                         let help = if kind == DefKind::Fn {
                             format!(
                                 "fns take exactly what they declare; give `{name}` a size parameter, \
@@ -1046,42 +1078,264 @@ impl Checker {
         }
     }
 
-    fn tuning_call(
+    /// Check each argument with no expectation, so that errors inside them
+    /// are still reported when the call itself is broken.
+    fn exprs(&mut self, args: &[Arg]) {
+        for a in args {
+            self.expr(&a.value);
+        }
+    }
+
+    /// Record that the current definition uses `name`, for the recursion
+    /// check.
+    fn note_use(&mut self, name: &str, at: Span) {
+        if let Some(me) = &self.current {
+            self.calls
+                .entry(me.clone())
+                .or_default()
+                .push((name.to_owned(), at));
+        }
+    }
+
+    /// A call through a variable holding a function.
+    fn call_value(
         &mut self,
         span: Span,
         callee: &Ident,
         args: &[Arg],
-        arg_types: Vec<Type>,
+        params: &[Type],
+        ret: &Type,
     ) -> Type {
         let name = &callee.name;
-        if args.len() != 1 {
+        let mut ok = true;
+        for (i, a) in args.iter().enumerate() {
+            let expected = params.get(i).filter(|t| matches!(t, Type::Fn(..)));
+            let t = self.expr_expect(&a.value, expected);
+            if let Some(id) = &a.name {
+                let d = self
+                    .error(
+                        id.span,
+                        format!("`{name}` is a function value, so its arguments have no names"),
+                    )
+                    .with_help("pass the arguments in order");
+                self.report(d);
+                ok = false;
+                continue;
+            }
+            let Some(p) = params.get(i) else { continue };
+            if t.is_wild() || coerces(&t, p) {
+                continue;
+            }
+            let d = if let (Type::Frame(elem, _), false) = (&t, matches!(p, Type::Frame(..)))
+                && coerces(elem, p)
+            {
+                self.error(a.value.span, format!("`{name}` takes one value, not a frame (`{t}`)"))
+                    .with_help("function values never run per channel; call it once per channel, or from a rill")
+            } else {
+                mismatch(
+                    a.value.span,
+                    &format!("argument {} of `{name}`", i + 1),
+                    p,
+                    &t,
+                )
+            };
+            self.report(d);
+            ok = false;
+        }
+        if args.len() != params.len() {
             let d = self.error(
                 span,
                 format!(
-                    "tuning `{name}` takes one pitch argument, but {} were given",
+                    "`{name}` takes {} argument(s), but {} were given",
+                    params.len(),
                     args.len()
                 ),
             );
             self.report(d);
+            ok = false;
+        }
+        if ok { ret.clone() } else { Type::Error }
+    }
+
+    /// Check `e`, letting an anonymous fn or the name of a fn take its types
+    /// from `expected` when that is a function type.
+    fn expr_expect(&mut self, e: &Expr, expected: Option<&Type>) -> Type {
+        let expected = expected.filter(|t| matches!(t, Type::Fn(..)));
+        let t = match (&e.kind, expected) {
+            (ExprKind::Fn { params, ret, body }, _) => {
+                self.lambda(e, params, ret.as_ref(), body, expected)
+            }
+            (ExprKind::Name(name), Some(exp))
+                if self.lookup(name).is_none()
+                    && (self.defs.contains_key(name) || !builtins::lookup(name).is_empty()) =>
+            {
+                self.fn_value(name, e.span, Some(exp))
+            }
+            _ => return self.expr(e),
+        };
+        self.types[e.id as usize] = t.clone();
+        t
+    }
+
+    /// The type of `name` (a fn or built-in, not a variable) used as a
+    /// value, fitted to `expected` if given.
+    fn fn_value(&mut self, name: &str, span: Span, expected: Option<&Type>) -> Type {
+        let sigs = match self.defs.get(name) {
+            Some(&i) => vec![self.signatures[i].clone()],
+            None => builtins::lookup(name),
+        };
+        let kind = sigs[0].kind;
+        if kind == DefKind::Rill {
+            let d = self
+                .error(span, format!("rill `{name}` cannot be used as a value"))
+                .with_help(format!(
+                    "only fns can be passed around; call it, as in `{name}(x)` or `x |> {name}`"
+                ));
+            self.report(d);
             return Type::Error;
         }
-        match &arg_types[0] {
-            Type::Pitch => Type::Hz,
-            Type::Frame(elem, n) if **elem == Type::Pitch => {
-                Type::Frame(Box::new(Type::Hz), n.clone())
+        if kind == DefKind::Fn {
+            self.note_use(name, span);
+        }
+
+        if let Some(Type::Fn(eps, eret)) = expected {
+            if sigs.iter().any(|s| fits(s, eps, eret)) {
+                return expected.cloned().unwrap();
             }
-            Type::Error | Type::Never => Type::Error,
-            other => {
-                let d = mismatch(
-                    args[0].value.span,
-                    &format!("argument of tuning `{name}`"),
-                    &Type::Pitch,
-                    other,
-                );
+            let shown = sigs
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            let d = self
+                .error(
+                    span,
+                    format!("`{name}` does not fit `{}`", expected.unwrap()),
+                )
+                .with_help(format!("`{name}` is {shown}"));
+            self.report(d);
+            return Type::Error;
+        }
+
+        let sig = &sigs[0];
+        let generic = sigs.len() > 1
+            || !sig.generics.is_empty()
+            || sig.params.iter().any(|p| contains_param(&p.ty))
+            || contains_param(&sig.ret);
+        if generic {
+            let help = if kind == DefKind::Fn {
+                format!("`{name}` has size parameters, so it cannot be used as a value yet")
+            } else {
+                format!(
+                    "`{name}` works on several types; say which one where it goes, as in `let f: fn(sample) -> sample = {name}`"
+                )
+            };
+            let d = self
+                .error(span, format!("cannot tell which `{name}` is meant here"))
+                .with_help(help);
+            self.report(d);
+            return Type::Error;
+        }
+        Type::Fn(
+            sig.params.iter().map(|p| p.ty.clone()).collect(),
+            Box::new(sig.ret.clone()),
+        )
+    }
+
+    /// An anonymous fn. Parameter types come from annotations or, failing
+    /// that, from `expected`; the return type from an annotation, `expected`
+    /// or the body.
+    fn lambda(
+        &mut self,
+        e: &Expr,
+        params: &[FnParam],
+        ret: Option<&TypeExpr>,
+        body: &Block,
+        expected: Option<&Type>,
+    ) -> Type {
+        let (eps, eret) = match expected {
+            Some(Type::Fn(ps, r)) => (Some(ps.clone()), Some((**r).clone())),
+            _ => (None, None),
+        };
+        if let Some(eps) = &eps
+            && eps.len() != params.len()
+        {
+            let d = self.error(
+                e.span,
+                format!(
+                    "this fn takes {} parameter(s), but `{}` is expected here",
+                    params.len(),
+                    expected.unwrap()
+                ),
+            );
+            self.report(d);
+        }
+
+        let generics = self.generics();
+        let mut scope = HashMap::new();
+        let mut param_types = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let ty = match (&p.ty, eps.as_ref().and_then(|ps| ps.get(i))) {
+                (Some(te), _) => self.resolve_type(te, &generics),
+                (None, Some(t)) => t.clone(),
+                (None, None) => {
+                    let d = self
+                        .error(
+                            p.name.span,
+                            format!("cannot tell the type of `{}`", p.name.name),
+                        )
+                        .with_help(format!("annotate it, as in `{}: Pitch`", p.name.name));
+                    self.report(d);
+                    Type::Error
+                }
+            };
+            scope.insert(
+                p.name.name.clone(),
+                Var {
+                    ty: ty.clone(),
+                    kind: VarKind::Param,
+                },
+            );
+            param_types.push(ty);
+        }
+        let declared = ret.map(|te| self.resolve_type(te, &generics)).or(eret);
+
+        // The body is a fn body: pure, with its own return type.
+        let saved_place = std::mem::replace(&mut self.place, Place::Fn);
+        let saved_ret = std::mem::replace(&mut self.ret, declared.clone().unwrap_or(Type::Error));
+        let saved_event = std::mem::replace(&mut self.in_event, false);
+        let saved_floor = self.lambda_floor.replace(self.scopes.len());
+        self.scopes.push(scope);
+        self.tail_expect = declared.clone();
+        let (t, diverges) = self.block(body, false);
+        self.scopes.pop();
+        self.place = saved_place;
+        self.ret = saved_ret;
+        self.in_event = saved_event;
+        self.lambda_floor = saved_floor;
+
+        let ret = match declared {
+            Some(r) => {
+                if !diverges && !coerces(&t, &r) {
+                    let at = body.stmts.last().map_or(body.span, Stmt::span);
+                    let d = self.error(
+                        at,
+                        format!("this fn should return `{r}`, but its body produces `{t}`"),
+                    );
+                    self.report(d);
+                }
+                r
+            }
+            None if diverges => {
+                let d = self
+                    .error(e.span, "cannot tell what this fn returns")
+                    .with_help("annotate it, as in `fn(p: Pitch) -> Hz { ... }`");
                 self.report(d);
                 Type::Error
             }
-        }
+            None => t.settle(),
+        };
+        Type::Fn(param_types, Box::new(ret))
     }
 
     /// Known before audio starts: literals, built-in constants, size
@@ -1094,7 +1348,13 @@ impl Checker {
             ExprKind::Frame(xs) => xs.iter().all(|x| self.is_const(x)),
             ExprKind::Name(n) => match self.lookup(n) {
                 Some(v) => v.kind == VarKind::Size,
-                None => builtins::constant(n).is_some() || pitch_literal(n).is_some(),
+                None => {
+                    builtins::constant(n).is_some()
+                        || pitch_literal(n).is_some()
+                        // A named fn is a fixed value.
+                        || self.defs.get(n).is_some_and(|&i| self.signatures[i].kind == DefKind::Fn)
+                        || !builtins::lookup(n).is_empty()
+                }
             },
             ExprKind::Call { callee, args, .. } => {
                 let name = callee.name.as_str();
@@ -1106,7 +1366,8 @@ impl Checker {
             ExprKind::If { .. }
             | ExprKind::Block(_)
             | ExprKind::Index(..)
-            | ExprKind::Field(..) => false,
+            | ExprKind::Field(..)
+            | ExprKind::Fn { .. } => false,
         }
     }
 
@@ -1169,9 +1430,6 @@ fn describe_param(c: &str) -> &'static str {
     }
 }
 
-const TUNING_FIXED_HELP: &str =
-    "tunings are fixed when the program is built; pick one with constants only";
-
 const NOTE_NAME_HELP: &str = "write a pitch as a note name, like `A4` or `F#3`";
 
 const PITCH_ARITH_HELP: &str = "a pitch is a position, not an amount: add or subtract an interval \
@@ -1212,6 +1470,33 @@ fn mismatch(span: Span, what: &str, expected: &Type, found: &Type) -> Diagnostic
             .with_help("reduce the channels first, e.g. with `sum(...)`, or pick one with `x[0]`");
     }
     d
+}
+
+/// Can a fn with signature `sig` be used as a value of type
+/// `fn(params) -> ret`? Its extra parameters must have defaults.
+fn fits(sig: &Signature, params: &[Type], ret: &Type) -> bool {
+    if params.len() > sig.params.len() || sig.params[params.len()..].iter().any(|p| !p.has_default)
+    {
+        return false;
+    }
+    let mut subst = Subst::default();
+    for (p, given) in sig.params.iter().zip(params) {
+        if !unify(&p.ty, given, &mut subst, &sig.generics) {
+            return false;
+        }
+    }
+    let actual = substitute(&sig.ret, &subst);
+    !matches!(actual, Type::Error) && coerces(&actual, ret)
+}
+
+/// Does `t` mention a built-in type parameter?
+fn contains_param(t: &Type) -> bool {
+    match t {
+        Type::Param(_) => true,
+        Type::Frame(e, _) => contains_param(e),
+        Type::Fn(ps, r) => ps.iter().any(contains_param) || contains_param(r),
+        _ => false,
+    }
 }
 
 fn mentions_size(t: &Type, name: &str) -> bool {
@@ -1523,6 +1808,17 @@ pub fn check_entry(
                 ),
             ),
         );
+    }
+    for (p, ps) in def.params.iter().zip(&sig.params) {
+        if matches!(ps.ty, Type::Fn(..)) {
+            errors.push(
+                Diagnostic::error(
+                    p.name.span,
+                    format!("`{}` cannot be a function", p.name.name),
+                )
+                .with_help("the entry rill's parameters are live controls, so they hold numbers"),
+            );
+        }
     }
     for p in def.params.iter().filter(|p| p.default.is_none()) {
         errors.push(

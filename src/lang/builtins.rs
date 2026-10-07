@@ -46,7 +46,7 @@ pub fn lookup(name: &str) -> Vec<Signature> {
             .map(|(n, ty)| ParamSig {
                 name: (*n).to_owned(),
                 ty: ty.clone(),
-                has_default: false,
+                has_default: default_value(name, n).is_some(),
             })
             .collect(),
         ret,
@@ -65,19 +65,43 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         "clamp" => vec![sig(&[("x", s()), ("lo", s()), ("hi", s())], s())],
         // Per-tick multiplier that decays by 60 dB over `time`.
         "decay" => vec![sig(&[("time", Type::Time)], Type::Sample)],
-        "equal" => vec![
-            sig(&[("steps", Type::I32)], Type::Tuning),
-            sig(&[("steps", Type::I32), ("a4", Type::Hz)], Type::Tuning),
-        ],
-        "just" | "pythagorean" | "meantone" => vec![
-            sig(&[("root", Type::Pitch)], Type::Tuning),
-            sig(&[("root", Type::Pitch), ("a4", Type::Hz)], Type::Tuning),
-        ],
+        // Tunings: a pitch (or a chord of them) in, a frequency out.
+        "equal" => vec![sig(
+            &[
+                ("pitch", Type::Pitch),
+                ("steps", Type::I32),
+                ("a4", Type::Hz),
+            ],
+            Type::Hz,
+        )],
+        "just" | "pythagorean" | "meantone" => vec![sig(
+            &[
+                ("pitch", Type::Pitch),
+                ("root", Type::Pitch),
+                ("a4", Type::Hz),
+            ],
+            Type::Hz,
+        )],
         "f32" => vec![sig(&[("x", t())], Type::F32)],
         "i32" => vec![sig(&[("x", t())], Type::I32)],
         "sample" => vec![sig(&[("x", t())], Type::Sample)],
         _ => Vec::new(),
     }
+}
+
+/// The default of built-in parameter `param` of `name`, if it has one.
+pub fn default_value(name: &str, param: &str) -> Option<f32> {
+    match (name, param) {
+        ("equal", "steps") => Some(12.0),
+        ("equal" | "just" | "pythagorean" | "meantone", "a4") => Some(440.0),
+        _ => None,
+    }
+}
+
+/// Built-ins that accept a frame in their first parameter and return one
+/// result per channel. Tunings do, so a chord can be tuned in one go.
+pub fn takes_frames(name: &str) -> bool {
+    matches!(name, "equal" | "just" | "pythagorean" | "meantone")
 }
 
 /// Every built-in function name, for suggestions.

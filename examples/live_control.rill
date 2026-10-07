@@ -37,8 +37,7 @@ rill live_control(depth: Hz = 0.5Hz, gain: sample = 0.25) -> sample {
 
     // A slow LFO modulates a band-limited tone.
     let tremolo = sine(depth) * 0.3
-    let tuning = equal(12, a4: 440Hz)
-    let tuned = (pitch |> tuning) + tremolo * 120Hz
+    let tuned = (pitch |> equal(12, a4: 440Hz)) + tremolo * 120Hz
     let voice = sine(tuned) * (gain + cc_gain + release * 0.5)
     return voice
 }

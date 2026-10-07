@@ -4,6 +4,10 @@
 //! every call site gets its own `state` registers (each call is its own
 //! instance) and the result is one flat program. Arguments known at build
 //! time are folded into the code instead of becoming inputs.
+//!
+//! Function values are resolved here too: a fn passed as an argument is
+//! inlined where it is called, and one chosen while playing becomes a branch
+//! between the candidates. Nothing is called at run time.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,7 +15,7 @@ use super::ast::*;
 use super::check::Checked;
 use super::diag::{Diagnostic, Span};
 use super::types::{Signature, Size, Type};
-use super::vm::{Code, EventBinding, EventCode, Instr, Operand, TuningSpec};
+use super::vm::{Code, EventBinding, EventCode, Instr, Operand, Tuning};
 use crate::ops::{Op1, Op2};
 
 /// A compile-time value: one operand per channel.
@@ -20,7 +24,25 @@ pub enum CVal {
     Scalar(Operand),
     Frame(Vec<Operand>),
     Event(Vec<(String, Operand)>),
-    Tuning(TuningSpec),
+    Fn(FnVal),
+}
+
+/// A function value, known at build time.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FnVal {
+    /// A user fn or built-in, by name.
+    Named(String),
+    /// An anonymous fn (by expression id) and the scopes it captured.
+    Lambda {
+        id: u32,
+        captured: Vec<HashMap<String, Binding>>,
+    },
+    /// One of two functions, picked by `cond` while playing.
+    Choice {
+        cond: Operand,
+        then: Box<FnVal>,
+        els: Box<FnVal>,
+    },
 }
 
 impl CVal {
@@ -33,8 +55,7 @@ impl CVal {
         match self {
             CVal::Scalar(o) => std::slice::from_ref(o),
             CVal::Frame(os) => os,
-            CVal::Event(_) => &[],
-            CVal::Tuning(_) => &[],
+            CVal::Event(_) | CVal::Fn(_) => &[],
         }
     }
 
@@ -42,8 +63,7 @@ impl CVal {
         match self {
             CVal::Scalar(o) => *o,
             CVal::Frame(os) => os[0],
-            CVal::Event(_) => Operand::Const(0.0),
-            CVal::Tuning(_) => Operand::Const(0.0),
+            CVal::Event(_) | CVal::Fn(_) => Operand::Const(0.0),
         }
     }
 
@@ -59,29 +79,90 @@ impl CVal {
                     .map(|((name, _), op)| (name.clone(), op))
                     .collect(),
             ),
-            CVal::Tuning(t) => CVal::Tuning(*t),
+            CVal::Fn(f) => CVal::Fn(f.clone()),
         }
     }
 }
 
-/// Every fn and rill, by name.
+/// Every fn and rill by name, and every anonymous fn by expression id.
 pub struct Defs<'a> {
     map: HashMap<&'a str, (&'a Def, &'a Signature)>,
+    lambdas: HashMap<u32, &'a Expr>,
 }
 
 impl<'a> Defs<'a> {
     pub fn new(program: &'a Program, checked: &'a Checked) -> Defs<'a> {
         let defs = program.items.iter().map(Item::def);
+        let mut lambdas = HashMap::new();
+        for d in program.items.iter().map(Item::def) {
+            for p in &d.params {
+                if let Some(e) = &p.default {
+                    collect_lambdas(e, &mut lambdas);
+                }
+            }
+            collect_lambdas_in_block(&d.body, &mut lambdas);
+        }
         Defs {
             map: defs
                 .zip(&checked.signatures)
                 .map(|(d, s)| (d.name.name.as_str(), (d, s)))
                 .collect(),
+            lambdas,
         }
     }
 
     pub fn get(&self, name: &str) -> Option<(&'a Def, &'a Signature)> {
         self.map.get(name).copied()
+    }
+
+    fn lambda(&self, id: u32) -> Option<&'a Expr> {
+        self.lambdas.get(&id).copied()
+    }
+}
+
+fn collect_lambdas<'a>(e: &'a Expr, out: &mut HashMap<u32, &'a Expr>) {
+    match &e.kind {
+        ExprKind::Fn { body, .. } => {
+            out.insert(e.id, e);
+            collect_lambdas_in_block(body, out);
+        }
+        ExprKind::Unary(_, x) | ExprKind::Field(x, _) => collect_lambdas(x, out),
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
+            collect_lambdas(a, out);
+            collect_lambdas(b, out);
+        }
+        ExprKind::Call { args, .. } => {
+            for a in args {
+                collect_lambdas(&a.value, out);
+            }
+        }
+        ExprKind::If { cond, then, els } => {
+            collect_lambdas(cond, out);
+            collect_lambdas_in_block(then, out);
+            if let Some(els) = els {
+                collect_lambdas(els, out);
+            }
+        }
+        ExprKind::Block(b) => collect_lambdas_in_block(b, out),
+        ExprKind::Frame(xs) => {
+            for x in xs {
+                collect_lambdas(x, out);
+            }
+        }
+        ExprKind::Number { .. } | ExprKind::Bool(_) | ExprKind::Name(_) => {}
+    }
+}
+
+fn collect_lambdas_in_block<'a>(b: &'a Block, out: &mut HashMap<u32, &'a Expr>) {
+    for s in &b.stmts {
+        match s {
+            Stmt::Let { value: e, .. }
+            | Stmt::State { init: e, .. }
+            | Stmt::Assign { value: e, .. }
+            | Stmt::Return { value: e, .. }
+            | Stmt::Expr(e) => collect_lambdas(e, out),
+            Stmt::EventHandler { body, .. } => collect_lambdas_in_block(body, out),
+        }
     }
 }
 
@@ -112,7 +193,7 @@ pub fn compile_instance(
         sample_rate,
         code: Vec::new(),
         events: Vec::new(),
-        tunings: Vec::new(),
+        inlining: Vec::new(),
         regs: 0,
         state_init: Vec::new(),
         state_regs: HashSet::new(),
@@ -159,7 +240,6 @@ pub fn compile_instance(
         output: out.operands().to_vec(),
         state_init: c.state_init,
         events: c.events,
-        tunings: c.tunings,
     })
 }
 
@@ -183,7 +263,7 @@ pub fn default_value(
         sample_rate,
         code: Vec::new(),
         events: Vec::new(),
-        tunings: Vec::new(),
+        inlining: Vec::new(),
         regs: 0,
         state_init: Vec::new(),
         state_regs: HashSet::new(),
@@ -195,8 +275,8 @@ pub fn default_value(
     c.expr(default)
 }
 
-#[derive(Clone)]
-struct Binding {
+#[derive(Clone, Debug, PartialEq)]
+pub struct Binding {
     val: CVal,
     /// `state`, which can be assigned to.
     mutable: bool,
@@ -222,7 +302,9 @@ struct Compiler<'a> {
     sample_rate: f32,
     code: Vec<Instr>,
     events: Vec<EventCode>,
-    tunings: Vec<TuningSpec>,
+    /// Definitions and anonymous fns currently being inlined, innermost
+    /// last. Meeting one again means recursion through a function value.
+    inlining: Vec<String>,
     regs: u16,
     state_init: Vec<(u16, f32)>,
     state_regs: HashSet<u16>,
@@ -273,22 +355,23 @@ impl Compiler<'_> {
         Ok(Operand::Reg(dst))
     }
 
-    fn tune(&mut self, tuning: &TuningSpec, pitch: Operand) -> CResult<Operand> {
-        if let Operand::Const(pitch) = pitch {
-            return Ok(Operand::Const(tuning.frequency(pitch)));
+    fn tune(
+        &mut self,
+        tuning: Tuning,
+        pitch: Operand,
+        setting: Operand,
+        a4: Operand,
+    ) -> CResult<Operand> {
+        if let (Operand::Const(p), Operand::Const(s), Operand::Const(a)) = (pitch, setting, a4) {
+            return Ok(Operand::Const(tuning.frequency(p, s, a)));
         }
-        let index = match self.tunings.iter().position(|t| t == tuning) {
-            Some(i) => i,
-            None => {
-                self.tunings.push(*tuning);
-                self.tunings.len() - 1
-            }
-        };
         let dst = self.reg()?;
         self.emit(Instr::Tune {
-            tuning: index as u16,
+            tuning,
             dst,
             pitch,
+            setting,
+            a4,
         });
         Ok(Operand::Reg(dst))
     }
@@ -363,21 +446,21 @@ impl Compiler<'_> {
     /// Copy `v` into `slot`, allocating registers of the same shape the
     /// first time.
     fn copy_into(&mut self, slot: &mut Option<CVal>, v: &CVal) -> CResult<()> {
-        // A tuning has no registers to copy into. Several paths may produce
-        // it only if they all agree, since nothing can pick one while playing.
-        if let CVal::Tuning(t) = v {
+        // A function has no registers to copy into. `if` builds a choice
+        // between functions itself; several `return`s must agree.
+        if let CVal::Fn(f) = v {
             return match slot {
                 None => {
                     *slot = Some(v.clone());
                     Ok(())
                 }
-                Some(CVal::Tuning(prev)) if prev == t => Ok(()),
+                Some(CVal::Fn(prev)) if prev == f => Ok(()),
                 Some(_) => Err(Diagnostic::error(
                     self.span,
-                    "a tuning cannot be chosen while playing",
+                    "returning different functions from different branches is not supported yet",
                 )
                 .with_help(
-                    "tunings are fixed when the program is built; pick one with constants only",
+                    "choose with an expression instead, as in `return if c { f } else { g }`",
                 )),
             };
         }
@@ -414,6 +497,13 @@ impl Compiler<'_> {
     /// Compile `def`'s body in place with `args` bound to its parameters,
     /// and return its result.
     fn inline(&mut self, def: &Def, sig: &Signature, args: Vec<CVal>) -> CResult<CVal> {
+        self.enter(&def.name.name, def.name.span)?;
+        let result = self.inline_body(def, sig, args);
+        self.inlining.pop();
+        result
+    }
+
+    fn inline_body(&mut self, def: &Def, sig: &Signature, args: Vec<CVal>) -> CResult<CVal> {
         let saved_scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
         let saved_span = std::mem::replace(&mut self.span, def.name.span);
 
@@ -569,9 +659,26 @@ impl Compiler<'_> {
                 if let Some(p) = super::check::pitch_literal(name) {
                     return Ok(CVal::Scalar(Operand::Const(p)));
                 }
-                constant(name, self.sample_rate)
-                    .map(|c| CVal::Scalar(Operand::Const(c)))
-                    .ok_or_else(|| internal(e.span, &format!("unknown name `{name}`")))
+                if let Some(c) = constant(name, self.sample_rate) {
+                    return Ok(CVal::Scalar(Operand::Const(c)));
+                }
+                if self.defs.get(name).is_some() || !super::builtins::lookup(name).is_empty() {
+                    return Ok(CVal::Fn(FnVal::Named(name.clone())));
+                }
+                Err(internal(e.span, &format!("unknown name `{name}`")))
+            }
+            ExprKind::Fn { .. } => {
+                // Capture by value: `state` read now keeps this tick's value.
+                let mut captured = self.scopes.clone();
+                for scope in &mut captured {
+                    for binding in scope.values_mut() {
+                        if binding.mutable {
+                            binding.val = self.detach(binding.val.clone())?;
+                            binding.mutable = false;
+                        }
+                    }
+                }
+                Ok(CVal::Fn(FnVal::Lambda { id: e.id, captured }))
             }
             ExprKind::Unary(op, x) => {
                 let v = self.expr(x)?;
@@ -702,6 +809,10 @@ impl Compiler<'_> {
             };
         }
 
+        if matches!(self.types[e.id as usize], Type::Fn(..)) {
+            return self.choose_fn(c, then, els);
+        }
+
         let skip_then = self.emit(Instr::JumpUnless { cond: c, target: 0 });
         let mut result: Option<CVal> = None;
         let (v1, _) = self.branch(|s| s.block(then))?;
@@ -723,6 +834,38 @@ impl Compiler<'_> {
         Ok(result.unwrap_or_else(CVal::unit))
     }
 
+    /// `if c { f } else { g }` where the result is a function and `c` is
+    /// only known while playing. Each side still runs only when taken, for
+    /// any code it has; the result calls one or the other depending on `c`.
+    fn choose_fn(&mut self, c: Operand, then: &Block, els: Option<&Expr>) -> CResult<CVal> {
+        // Keep the condition as it is now, even if it reads `state` that is
+        // assigned before the function is called.
+        let c = self.detach(CVal::Scalar(c))?.scalar();
+        let skip_then = self.emit(Instr::JumpUnless { cond: c, target: 0 });
+        let (v1, _) = self.branch(|s| s.block(then))?;
+        let skip_else = self.emit(Instr::Jump { target: 0 });
+        self.patch(skip_then);
+        let v2 = match els {
+            Some(els) => Some(self.branch(|s| s.expr(els))?),
+            None => None,
+        };
+        self.patch(skip_else);
+        match (v1, v2) {
+            (Some(CVal::Fn(a)), Some(CVal::Fn(b))) if a == b => Ok(CVal::Fn(a)),
+            (Some(CVal::Fn(a)), Some(CVal::Fn(b))) => Ok(CVal::Fn(FnVal::Choice {
+                cond: c,
+                then: Box::new(a),
+                els: Box::new(b),
+            })),
+            // One side always returns, so the other is the only value.
+            (Some(v), None) | (None, Some(v)) => Ok(v),
+            _ => Err(internal(
+                self.span,
+                "function-valued `if` without functions",
+            )),
+        }
+    }
+
     fn branch<T>(&mut self, f: impl FnOnce(&mut Self) -> CResult<T>) -> CResult<T> {
         self.depth += 1;
         let r = f(self);
@@ -733,13 +876,13 @@ impl Compiler<'_> {
     fn call(&mut self, e: &Expr, callee: &Ident, args: &[Arg]) -> CResult<CVal> {
         let name = callee.name.as_str();
         if let Some(binding) = self.lookup(name)
-            && let CVal::Tuning(tuning) = binding.val.clone()
+            && let CVal::Fn(f) = binding.val.clone()
         {
-            let vals = args
-                .iter()
-                .map(|a| self.expr(&a.value))
-                .collect::<CResult<Vec<_>>>()?;
-            return self.apply_tuning(&tuning, &vals[0]);
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(self.expr(&a.value)?);
+            }
+            return self.call_value(&f, vals, e.span);
         }
         // User definitions shadow built-ins.
         if let Some((def, sig)) = self.defs.get(name) {
@@ -754,44 +897,154 @@ impl Compiler<'_> {
                     None => None,
                 });
             }
-            // Defaults are constants; compile them where only the size
-            // parameters are visible.
-            let saved = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
-            for (p, v) in sig.params.iter().zip(&vals) {
-                if let (Type::Frame(_, Size::Var(n)), Some(CVal::Frame(ops))) = (&p.ty, v) {
-                    self.bind(n, CVal::Scalar(Operand::Const(ops.len() as f32)), false);
-                }
-            }
-            let mut filled = Vec::new();
-            for ((v, p), dp) in vals.into_iter().zip(&sig.params).zip(&def.params) {
-                filled.push(match v {
-                    Some(v) => v,
-                    None => {
-                        let d = dp.default.as_ref().ok_or_else(|| {
-                            internal(e.span, &format!("missing argument `{}`", p.name))
-                        })?;
-                        self.expr(d)?
-                    }
-                });
-            }
-            self.scopes = saved;
+            let filled = self.fill_defaults(def, sig, vals, e.span)?;
             return self.call_lifted(def, sig, filled);
         }
-        self.builtin(e, name, args)
+        self.call_builtin(e.span, name, args)
     }
 
-    fn apply_tuning(&mut self, tuning: &TuningSpec, pitch: &CVal) -> CResult<CVal> {
-        match pitch {
-            CVal::Scalar(pitch) => Ok(CVal::Scalar(self.tune(tuning, *pitch)?)),
-            CVal::Frame(pitches) => {
-                let mut out = Vec::with_capacity(pitches.len());
-                for &pitch in pitches {
-                    out.push(self.tune(tuning, pitch)?);
-                }
-                Ok(CVal::Frame(out))
+    /// Complete `vals` (one per parameter) with defaults. Defaults are
+    /// constants, compiled where only the size parameters are visible.
+    fn fill_defaults(
+        &mut self,
+        def: &Def,
+        sig: &Signature,
+        vals: Vec<Option<CVal>>,
+        span: Span,
+    ) -> CResult<Vec<CVal>> {
+        let saved = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
+        for (p, v) in sig.params.iter().zip(&vals) {
+            if let (Type::Frame(_, Size::Var(n)), Some(CVal::Frame(ops))) = (&p.ty, v) {
+                self.bind(n, CVal::Scalar(Operand::Const(ops.len() as f32)), false);
             }
-            _ => Err(internal(self.span, "tuning applied to a non-pitch value")),
         }
+        let mut filled = Vec::new();
+        let mut result = Ok(());
+        for ((v, p), dp) in vals.into_iter().zip(&sig.params).zip(&def.params) {
+            match v {
+                Some(v) => filled.push(v),
+                None => match dp.default.as_ref() {
+                    Some(d) => match self.expr(d) {
+                        Ok(v) => filled.push(v),
+                        Err(err) => {
+                            result = Err(err);
+                            break;
+                        }
+                    },
+                    None => {
+                        result = Err(internal(span, &format!("missing argument `{}`", p.name)));
+                        break;
+                    }
+                },
+            }
+        }
+        self.scopes = saved;
+        result.map(|()| filled)
+    }
+
+    /// Call a function value with positional arguments. Missing trailing
+    /// arguments take the function's defaults.
+    fn call_value(&mut self, f: &FnVal, vals: Vec<CVal>, span: Span) -> CResult<CVal> {
+        match f {
+            FnVal::Named(name) => {
+                if let Some((def, sig)) = self.defs.get(name) {
+                    let mut slots: Vec<Option<CVal>> = vals.into_iter().map(Some).collect();
+                    slots.resize(sig.params.len(), None);
+                    let filled = self.fill_defaults(def, sig, slots, span)?;
+                    return self.inline(def, sig, filled);
+                }
+                let sigs = super::builtins::lookup(name);
+                let mut vals = vals;
+                if let [sig] = sigs.as_slice() {
+                    for p in &sig.params[vals.len().min(sig.params.len())..] {
+                        let d = super::builtins::default_value(name, &p.name).ok_or_else(|| {
+                            internal(span, &format!("missing argument `{}`", p.name))
+                        })?;
+                        vals.push(CVal::Scalar(Operand::Const(d)));
+                    }
+                }
+                self.builtin(span, name, vals)
+            }
+            FnVal::Lambda { id, captured } => {
+                let lambda = self
+                    .defs
+                    .lambda(*id)
+                    .ok_or_else(|| internal(span, "unknown anonymous fn"))?;
+                self.inline_lambda(lambda, captured.clone(), vals)
+            }
+            FnVal::Choice { cond, then, els } => {
+                let skip_then = self.emit(Instr::JumpUnless {
+                    cond: *cond,
+                    target: 0,
+                });
+                let mut result = None;
+                let a = self.branch(|s| s.call_value(then, vals.clone(), span))?;
+                self.copy_into(&mut result, &a)?;
+                let skip_else = self.emit(Instr::Jump { target: 0 });
+                self.patch(skip_then);
+                let b = self.branch(|s| s.call_value(els, vals, span))?;
+                self.copy_into(&mut result, &b)?;
+                self.patch(skip_else);
+                Ok(result.unwrap_or_else(CVal::unit))
+            }
+        }
+    }
+
+    /// Compile an anonymous fn's body in place, in the scopes it captured.
+    fn inline_lambda(
+        &mut self,
+        lambda: &Expr,
+        captured: Vec<HashMap<String, Binding>>,
+        args: Vec<CVal>,
+    ) -> CResult<CVal> {
+        let ExprKind::Fn { params, body, .. } = &lambda.kind else {
+            return Err(internal(lambda.span, "not an anonymous fn"));
+        };
+        let key = format!("fn#{}", lambda.id);
+        self.enter(&key, lambda.span)?;
+        let saved_scopes = std::mem::replace(&mut self.scopes, captured);
+        let saved_span = std::mem::replace(&mut self.span, lambda.span);
+        self.scopes.push(HashMap::new());
+        for (p, a) in params.iter().zip(args) {
+            self.bind(&p.name.name, a, false);
+        }
+
+        self.rets.push(Ret {
+            val: None,
+            patches: Vec::new(),
+            depth: self.depth,
+            direct: None,
+        });
+        let result = self
+            .block_in_current_scope(body)
+            .and_then(|(value, diverged)| {
+                if !diverged && let Some(v) = value {
+                    self.ret(v)?;
+                }
+                Ok(())
+            });
+        let ret = self.rets.pop().expect("pushed above");
+        for at in ret.patches {
+            self.patch(at);
+        }
+        self.scopes = saved_scopes;
+        self.span = saved_span;
+        self.inlining.pop();
+        result?;
+        Ok(ret.direct.or(ret.val).unwrap_or_else(CVal::unit))
+    }
+
+    /// Note that `key` is being inlined, refusing recursion.
+    fn enter(&mut self, key: &str, span: Span) -> CResult<()> {
+        if self.inlining.iter().any(|k| k == key) {
+            return Err(Diagnostic::error(
+                span,
+                "recursion through a function value is not allowed",
+            )
+            .with_help("the run stage has no unbounded loops; a fn cannot end up calling itself"));
+        }
+        self.inlining.push(key.to_owned());
+        Ok(())
     }
 
     /// Inline `def`, once per channel if a scalar parameter got a frame.
@@ -823,47 +1076,45 @@ impl Compiler<'_> {
         Ok(CVal::Frame(out))
     }
 
-    fn builtin(&mut self, e: &Expr, name: &str, args: &[Arg]) -> CResult<CVal> {
+    /// A direct call of a built-in: arguments by position or name, with
+    /// defaults for the rest.
+    fn call_builtin(&mut self, span: Span, name: &str, args: &[Arg]) -> CResult<CVal> {
+        let sigs = super::builtins::lookup(name);
         let mut vals = Vec::new();
-        for a in args {
-            vals.push(self.expr(&a.value)?);
+        if let [sig] = sigs.as_slice() {
+            for (slot, p) in order_args(sig, args).into_iter().zip(&sig.params) {
+                vals.push(match slot {
+                    Some(a) => self.expr(a)?,
+                    None => {
+                        let d = super::builtins::default_value(name, &p.name).ok_or_else(|| {
+                            internal(span, &format!("missing argument `{}`", p.name))
+                        })?;
+                        CVal::Scalar(Operand::Const(d))
+                    }
+                });
+            }
+        } else {
+            for a in args {
+                vals.push(self.expr(&a.value)?);
+            }
         }
+        self.builtin(span, name, vals)
+    }
+
+    /// A built-in applied to its arguments, in parameter order.
+    fn builtin(&mut self, span: Span, name: &str, vals: Vec<CVal>) -> CResult<CVal> {
         if let Some(op) = Op1::builtin(name) {
             return self.map1(op, &vals[0]);
         }
+        if let Some(tuning) = Tuning::builtin(name) {
+            let (setting, a4) = (vals[1].scalar(), vals[2].scalar());
+            let mut out = Vec::new();
+            for &pitch in vals[0].operands() {
+                out.push(self.tune(tuning, pitch, setting, a4)?);
+            }
+            return Ok(vals[0].reshape(out));
+        }
         match (name, vals.as_slice()) {
-            ("equal", [steps]) => Ok(CVal::Tuning(TuningSpec::Equal {
-                steps: const_operand(steps, e.span)?,
-                a4: 440.0,
-            })),
-            ("equal", [steps, a4]) => Ok(CVal::Tuning(TuningSpec::Equal {
-                steps: const_operand(steps, e.span)?,
-                a4: const_operand(a4, e.span)?,
-            })),
-            ("just", [root]) => Ok(CVal::Tuning(TuningSpec::Just {
-                root: const_operand(root, e.span)?,
-                a4: 440.0,
-            })),
-            ("just", [root, a4]) => Ok(CVal::Tuning(TuningSpec::Just {
-                root: const_operand(root, e.span)?,
-                a4: const_operand(a4, e.span)?,
-            })),
-            ("pythagorean", [root]) => Ok(CVal::Tuning(TuningSpec::Pythagorean {
-                root: const_operand(root, e.span)?,
-                a4: 440.0,
-            })),
-            ("pythagorean", [root, a4]) => Ok(CVal::Tuning(TuningSpec::Pythagorean {
-                root: const_operand(root, e.span)?,
-                a4: const_operand(a4, e.span)?,
-            })),
-            ("meantone", [root]) => Ok(CVal::Tuning(TuningSpec::Meantone {
-                root: const_operand(root, e.span)?,
-                a4: 440.0,
-            })),
-            ("meantone", [root, a4]) => Ok(CVal::Tuning(TuningSpec::Meantone {
-                root: const_operand(root, e.span)?,
-                a4: const_operand(a4, e.span)?,
-            })),
             ("f32" | "sample", [x]) => Ok(x.clone()),
             ("pow", [x, y]) => self.zip2(Op2::Pow, x, y),
             ("min", [x, y]) => self.zip2(Op2::Min, x, y),
@@ -876,7 +1127,7 @@ impl Compiler<'_> {
                 self.zip2(Op2::Max, &low, lo)
             }
             _ => Err(Diagnostic::error(
-                e.span,
+                span,
                 format!("`{name}` cannot be used here"),
             )),
         }
@@ -888,16 +1139,6 @@ fn event_fields_for(param: &str) -> &'static [&'static str] {
         "note" => &["pitch", "velocity", "release"],
         "control" => &["channel", "index"],
         _ => &["pitch", "velocity", "release", "channel", "index"],
-    }
-}
-
-fn const_operand(value: &CVal, span: Span) -> CResult<f32> {
-    match value {
-        CVal::Scalar(Operand::Const(v)) => Ok(*v),
-        _ => Err(Diagnostic::error(
-            span,
-            "this tuning parameter must be a constant",
-        )),
     }
 }
 

@@ -199,8 +199,7 @@ fn rill_events_run_handlers_at_sample_offsets() {
         rill main() -> sample {
             state pitch: Hz = 440Hz
             on note_on(note) {
-                let tuning = equal(12)
-                pitch = note.pitch |> tuning
+                pitch = note.pitch |> equal(12)
             }
             return pitch / 1Hz
         }
@@ -232,9 +231,9 @@ fn rill_events_run_handlers_at_sample_offsets() {
 fn pitch_literals_and_callable_tunings_resolve_to_hz() {
     let src = "
         rill main() -> [sample; 4] {
-            let equal12 = equal(12)
-            let just_c = just(C)
-            let pyth_c = pythagorean(C)
+            let equal12 = fn(p: Pitch) -> Hz { equal(p, 12) }
+            let just_c = fn(p: Pitch) -> Hz { just(p, C) }
+            let pyth_c = fn(p: Pitch) -> Hz { pythagorean(p, C) }
             return [
                 (A4 |> equal12) / 1Hz,
                 ((A4 + 12st) |> equal12) / 1Hz,
@@ -253,8 +252,7 @@ fn pitch_literals_and_callable_tunings_resolve_to_hz() {
 
     let src = "
         rill main() -> [sample; 3] {
-            let tuning = equal(12, a4: 432Hz)
-            let tuned = [A4, C5, E5] |> tuning
+            let tuned = [A4, C5, E5] |> equal(12, a4: 432Hz)
             return [tuned[0] / 1Hz, tuned[1] / 1Hz, tuned[2] / 1Hz]
         }
     ";
@@ -508,8 +506,8 @@ fn rate_changing_rills_are_rejected_for_now() {
 fn equal_temperament_keeps_pitches_between_notes() {
     let src = "
         rill main() -> [sample; 4] {
-            let et = equal(12)
-            let quarter = equal(24)
+            let et = fn(p: Pitch) -> Hz { equal(p) }
+            let quarter = fn(p: Pitch) -> Hz { equal(p, 24) }
             return [
                 ((A4 + 50cents) |> et) / 1Hz,
                 ((A4 - 30cents) |> et) / 1Hz,
@@ -537,7 +535,7 @@ fn pitch_bends_glide_at_run_time() {
     let src = "
         rill main() -> sample {
             state bend: Interval = 0st
-            let t = equal(12)
+            let t = fn(p: Pitch) -> Hz { equal(p) }
             let f = (A4 + bend) |> t
             bend = bend + 25cents
             return f / 1Hz
@@ -551,29 +549,83 @@ fn pitch_bends_glide_at_run_time() {
 }
 
 #[test]
-fn a_tuning_picked_while_playing_is_an_error() {
+fn a_function_can_be_chosen_while_playing() {
+    // `s` flips every tick, so the tuning alternates: just C4 is 264Hz,
+    // equal-tempered C4 is 261.63Hz.
     let src = "
-        rill pick(x: sample) -> Tuning {
-            if x > 0 { return equal(12) }
-            return just(C)
-        }
         rill main() -> sample {
             state s: sample = 1
             s = -s
-            let t = pick(s)
-            return (A4 |> t) / 1kHz
+            let et: fn(Pitch) -> Hz = equal
+            let jc = fn(p: Pitch) -> Hz { just(p, C) }
+            let t = if s > 0 { et } else { jc }
+            return (C4 |> t) / 1Hz
         }
     ";
-    assert_eq!(errors(src, 1), ["a tuning cannot be chosen while playing"]);
+    let out = render(src, 4);
+    for (i, got) in out.iter().enumerate() {
+        let want = if i % 2 == 0 { 264.0 } else { 261.6256 };
+        assert!((got - want).abs() < 0.01, "tick {i}: {got} vs {want}");
+    }
+}
+
+#[test]
+fn functions_are_inlined_where_they_are_called() {
+    let src = format!(
+        "{SINE}
+        fn a432(p: Pitch) -> Hz {{
+            432Hz * pow(2, (p - A4) / 12st)
+        }}
+        fn tuned(steps: i32) -> fn(Pitch) -> Hz {{
+            fn(p) {{ equal(p, steps) }}
+        }}
+        rill voice(pitch: Pitch, tune: fn(Pitch) -> Hz) -> sample {{
+            return (pitch |> tune) / 1kHz
+        }}
+        rill main() -> [sample; 4] {{
+            let detune = 3Hz
+            return [
+                voice(A4, a432),
+                voice(A4, fn(p) {{ equal(p) + detune }}),
+                voice(A4 + 50cents, tuned(24)),
+                voice(A4, equal),
+            ]
+        }}"
+    );
+    let out = render_with(&src, 4, 1, Blocks::Fixed(1));
+    let expected = [0.432, 0.443, 0.452_893, 0.44];
+    for (got, want) in out.iter().zip(expected) {
+        assert!((got - want).abs() < 1e-5, "{got} vs {want}");
+    }
+    // Everything above is constant, so it folds away entirely.
+    assert_eq!(graph(&src, 4).len(), 0);
+}
+
+#[test]
+fn captured_values_can_change_over_time() {
+    // `level` is state captured by the fn; each tick the fn sees the value
+    // it had when the fn was made.
+    let src = "
+        rill main() -> sample {
+            state level: sample = 0
+            level = level + 1
+            let scale = fn(x: sample) -> sample { x * level }
+            level = level + 100
+            return scale(2)
+        }
+    ";
+    // Tick 1: level is 1 when captured, so 2. Then level = 101; tick 2
+    // captures 102, and so on.
+    assert_eq!(render(src, 3), [2.0, 204.0, 406.0]);
 }
 
 #[test]
 fn ratio_tunings_put_a4_on_the_reference() {
     let src = "
         rill main() -> [sample; 4] {
-            let just_c = just(C)
-            let pyth_d = pythagorean(D, a4: 432Hz)
-            let mean_c = meantone(C)
+            let just_c = fn(p: Pitch) -> Hz { just(p, C) }
+            let pyth_d = fn(p: Pitch) -> Hz { pythagorean(p, D, a4: 432Hz) }
+            let mean_c = fn(p: Pitch) -> Hz { meantone(p, C) }
             return [
                 (A4 |> just_c) / 1Hz,
                 (A4 |> pyth_d) / 1Hz,

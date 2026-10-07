@@ -8,7 +8,7 @@
 //! def     := NAME ("<" NAME ("," NAME)* ">")? "(" params ")" "->" type
 //!            ("@" "rate" (("*" | "/") INT)?)? block
 //! param   := NAME ":" type ("=" expr)?
-//! type    := NAME | "[" type ";" (INT | NAME) "]"
+//! type    := NAME | "[" type ";" (INT | NAME) "]" | "fn" "(" types ")" "->" type
 //! block   := "{" stmt* "}"
 //! stmt    := "let" NAME (":" type)? "=" expr
 //!          | "state" NAME (":" type)? "=" expr
@@ -24,7 +24,8 @@
 //! unary   := ("-" | "+" | "!") unary | postfix
 //! postfix := primary ("[" expr "]")*
 //! primary := NUMBER UNIT? | "true" | "false" | NAME ("(" args ")")?
-//!          | "(" expr ")" | "[" expr ("," expr)* "]" | if | block
+//!          | "(" expr ")" | "[" expr ("," expr)* "]" | if | block | lambda
+//! lambda  := "fn" "(" (NAME (":" type)?),* ")" ("->" type)? block
 //! if      := "if" expr block ("else" (if | block))?
 //! args    := (NAME ":")? expr ("," (NAME ":")? expr)*
 //! ```
@@ -272,6 +273,29 @@ impl Parser<'_> {
     }
 
     fn ty(&mut self) -> PResult<TypeExpr> {
+        if let Some(start) = self.eat(TokenKind::Fn) {
+            self.expect(TokenKind::LParen, "after `fn` in a function type")?;
+            self.nest += 1;
+            let mut params = Vec::new();
+            while !self.at(TokenKind::RParen) {
+                params.push(self.ty()?);
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RParen, "to close the parameter types")?;
+            self.nest -= 1;
+            self.expect(
+                TokenKind::Arrow,
+                "and a return type, as in `fn(Pitch) -> Hz`",
+            )?;
+            let ret = self.ty()?;
+            return Ok(TypeExpr::Fn {
+                params,
+                ret: Box::new(ret),
+                span: self.span_from(start.span),
+            });
+        }
         if let Some(open) = self.eat(TokenKind::LBracket) {
             self.nest += 1;
             let elem = self.ty()?;
@@ -640,6 +664,7 @@ impl Parser<'_> {
                 Ok(self.expr_node(ExprKind::Frame(elems), span))
             }
             TokenKind::If => self.if_expr(),
+            TokenKind::Fn => self.lambda(),
             TokenKind::LBrace => {
                 let block = self.block()?;
                 let span = block.span;
@@ -647,6 +672,45 @@ impl Parser<'_> {
             }
             _ => Err(self.unexpected("an expression")),
         }
+    }
+
+    /// `fn(p) { ... }`: a fn without a name.
+    fn lambda(&mut self) -> PResult<Expr> {
+        let start = self.bump().span;
+        if self.at(TokenKind::Ident) {
+            let name = self.ident("")?;
+            return Err(Diagnostic::error(
+                name.span,
+                "a fn with a name can only be defined at the top level",
+            )
+            .with_help(format!(
+                "leave the name out for an anonymous fn, as in `let {} = fn(x) {{ ... }}`",
+                name.name
+            )));
+        }
+        self.expect(TokenKind::LParen, "after `fn`")?;
+        self.nest += 1;
+        let mut params = Vec::new();
+        while !self.at(TokenKind::RParen) {
+            let name = self.ident("as a parameter name")?;
+            let ty = match self.eat(TokenKind::Colon) {
+                Some(_) => Some(self.ty()?),
+                None => None,
+            };
+            params.push(FnParam { name, ty });
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "to close the parameter list")?;
+        self.nest -= 1;
+        let ret = match self.eat(TokenKind::Arrow) {
+            Some(_) => Some(self.ty()?),
+            None => None,
+        };
+        let body = self.block()?;
+        let span = self.span_from(start);
+        Ok(self.expr_node(ExprKind::Fn { params, ret, body }, span))
     }
 
     fn if_expr(&mut self) -> PResult<Expr> {

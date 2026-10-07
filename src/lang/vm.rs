@@ -32,11 +32,13 @@ pub enum Instr {
         dst: u16,
         src: Operand,
     },
-    /// `dst = tunings[tuning](pitch)`, indexing [`Code::tunings`].
+    /// `dst = tuning(pitch, setting, a4)`; see [`Tuning::frequency`].
     Tune {
-        tuning: u16,
+        tuning: Tuning,
         dst: u16,
         pitch: Operand,
+        setting: Operand,
+        a4: Operand,
     },
     /// `dst = if cond { a } else { b }`
     Select {
@@ -55,29 +57,43 @@ pub enum Instr {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TuningSpec {
-    Equal { steps: f32, a4: f32 },
-    Just { root: f32, a4: f32 },
-    Pythagorean { root: f32, a4: f32 },
-    Meantone { root: f32, a4: f32 },
+/// The built-in tunings, as run by [`Instr::Tune`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tuning {
+    Equal,
+    Just,
+    Pythagorean,
+    Meantone,
 }
 
-impl TuningSpec {
-    pub fn frequency(&self, pitch: f32) -> f32 {
-        match *self {
-            TuningSpec::Equal { steps, a4 } => {
-                // Note names land on the nearest of `steps` equal divisions;
+impl Tuning {
+    /// The tuning behind a built-in function name.
+    pub fn builtin(name: &str) -> Option<Tuning> {
+        Some(match name {
+            "equal" => Tuning::Equal,
+            "just" => Tuning::Just,
+            "pythagorean" => Tuning::Pythagorean,
+            "meantone" => Tuning::Meantone,
+            _ => return None,
+        })
+    }
+
+    /// Frequency of `pitch`. `setting` is the number of equal steps per
+    /// octave for [`Tuning::Equal`], and the root pitch for the scale
+    /// tunings. A4 sounds at `a4`.
+    pub fn frequency(self, pitch: f32, setting: f32, a4: f32) -> f32 {
+        match self {
+            Tuning::Equal => {
+                // Note names land on the nearest of `setting` equal divisions;
                 // anything between notes (cents, bends) stays continuous.
+                let steps = setting;
                 let note = pitch.floor();
                 let step = ((note - 69.0) * steps / 12.0).round();
                 a4 * 2.0f32.powf(step / steps + (pitch - note) / 12.0)
             }
-            TuningSpec::Just { root, a4 } => ratio_tuning(pitch, root, a4, JUST_RATIOS),
-            TuningSpec::Pythagorean { root, a4 } => {
-                ratio_tuning(pitch, root, a4, PYTHAGOREAN_RATIOS)
-            }
-            TuningSpec::Meantone { root, a4 } => ratio_tuning(pitch, root, a4, MEANTONE_RATIOS),
+            Tuning::Just => ratio_tuning(pitch, setting, a4, JUST_RATIOS),
+            Tuning::Pythagorean => ratio_tuning(pitch, setting, a4, PYTHAGOREAN_RATIOS),
+            Tuning::Meantone => ratio_tuning(pitch, setting, a4, MEANTONE_RATIOS),
         }
     }
 }
@@ -144,9 +160,6 @@ pub struct Code {
     /// Registers that are `state`, with their initial values.
     pub state_init: Vec<(u16, f32)>,
     pub events: Vec<EventCode>,
-    /// Tunings used by `Tune` instructions, here and in event handlers. Kept
-    /// out of the instructions so those stay small.
-    pub tunings: Vec<TuningSpec>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -193,9 +206,18 @@ impl Code {
                 }
                 Instr::Op1 { op: o, dst, x } => format!("r{dst} = {} {}", o.name(), op(x)),
                 Instr::Copy { dst, src } => format!("r{dst} = {}", op(src)),
-                Instr::Tune { tuning, dst, pitch } => {
-                    format!("r{dst} = tune#{tuning} {}", op(pitch))
-                }
+                Instr::Tune {
+                    tuning,
+                    dst,
+                    pitch,
+                    setting,
+                    a4,
+                } => format!(
+                    "r{dst} = tune {tuning:?} {} {} {}",
+                    op(pitch),
+                    op(setting),
+                    op(a4)
+                ),
                 Instr::Select { dst, cond, a, b } => {
                     format!("r{dst} = select {} {} {}", op(cond), op(a), op(b))
                 }
@@ -271,9 +293,15 @@ impl Node for Program {
                         regs[dst as usize] = op.apply(val(regs, x), rate);
                     }
                     Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
-                    Instr::Tune { tuning, dst, pitch } => {
+                    Instr::Tune {
+                        tuning,
+                        dst,
+                        pitch,
+                        setting,
+                        a4,
+                    } => {
                         regs[dst as usize] =
-                            code.tunings[tuning as usize].frequency(val(regs, pitch));
+                            tuning.frequency(val(regs, pitch), val(regs, setting), val(regs, a4));
                     }
                     Instr::Select { dst, cond, a, b } => {
                         regs[dst as usize] = if val(regs, cond) != 0.0 {
@@ -351,9 +379,15 @@ impl Node for Program {
                     regs[dst as usize] = op.apply(val(regs, x), _sample_rate);
                 }
                 Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
-                Instr::Tune { tuning, dst, pitch } => {
+                Instr::Tune {
+                    tuning,
+                    dst,
+                    pitch,
+                    setting,
+                    a4,
+                } => {
                     regs[dst as usize] =
-                        self.code.tunings[tuning as usize].frequency(val(regs, pitch));
+                        tuning.frequency(val(regs, pitch), val(regs, setting), val(regs, a4));
                 }
                 Instr::Select { dst, cond, a, b } => {
                     regs[dst as usize] = if val(regs, cond) != 0.0 {

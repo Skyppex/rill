@@ -245,8 +245,7 @@ impl Checker {
                 "Interval" => Type::Interval,
                 other => {
                     const KNOWN: [&str; 9] = [
-                        "sample", "f32", "i32", "bool", "Hz", "Pitch", "Tuning", "Time",
-                        "Interval",
+                        "sample", "f32", "i32", "bool", "Hz", "Pitch", "Tuning", "Time", "Interval",
                     ];
                     let mut e = self.error(id.span, format!("unknown type `{other}`"));
                     if let Some(s) = suggest(other, KNOWN) {
@@ -444,6 +443,12 @@ impl Checker {
                     }
                     None => t.settle(),
                 };
+                if bound == Type::Tuning {
+                    let e = self
+                        .error(*span, "a tuning cannot be `state`")
+                        .with_help(TUNING_FIXED_HELP);
+                    self.report(e);
+                }
                 self.bind(&name.name, bound, VarKind::State);
                 (Type::Unit, false)
             }
@@ -639,6 +644,13 @@ impl Checker {
                 };
                 let t2 = self.expr(els);
                 match join(&t1, &t2) {
+                    Some(Type::Tuning) if !self.is_const(cond) => {
+                        let d = self
+                            .error(cond.span, "a tuning cannot be chosen by a condition that changes while playing")
+                            .with_help(TUNING_FIXED_HELP);
+                        self.report(d);
+                        Type::Tuning
+                    }
                     Some(t) => t,
                     None => {
                         let d = self.error(
@@ -660,7 +672,7 @@ impl Checker {
                         bad = true;
                         continue;
                     }
-                    if !(t.is_plain() || t.is_dimensioned()) {
+                    if !t.is_quantity() {
                         let d = self.error(
                             el.span,
                             format!("a frame channel must be a number, found `{t}`"),
@@ -848,6 +860,23 @@ impl Checker {
             _ => sigs[0].clone(),
         };
 
+        if kind == DefKind::Builtin && sig.ret == Type::Tuning {
+            let varying: Vec<Span> = args
+                .iter()
+                .filter(|a| !self.is_const(&a.value))
+                .map(|a| a.value.span)
+                .collect();
+            for at in &varying {
+                let d = self
+                    .error(*at, format!("`{name}` needs constant arguments"))
+                    .with_help(TUNING_FIXED_HELP);
+                self.report(d);
+            }
+            if !varying.is_empty() {
+                return Type::Error;
+            }
+        }
+
         // Match arguments to parameters.
         let mut slots: Vec<Option<usize>> = vec![None; sig.params.len()];
         let mut ok = true;
@@ -1028,14 +1057,19 @@ impl Checker {
         if args.len() != 1 {
             let d = self.error(
                 span,
-                format!("tuning `{name}` takes one pitch argument, but {} were given", args.len()),
+                format!(
+                    "tuning `{name}` takes one pitch argument, but {} were given",
+                    args.len()
+                ),
             );
             self.report(d);
             return Type::Error;
         }
         match &arg_types[0] {
             Type::Pitch => Type::Hz,
-            Type::Frame(elem, n) if **elem == Type::Pitch => Type::Frame(Box::new(Type::Hz), n.clone()),
+            Type::Frame(elem, n) if **elem == Type::Pitch => {
+                Type::Frame(Box::new(Type::Hz), n.clone())
+            }
             Type::Error | Type::Never => Type::Error,
             other => {
                 let d = mismatch(
@@ -1135,6 +1169,14 @@ fn describe_param(c: &str) -> &'static str {
     }
 }
 
+const TUNING_FIXED_HELP: &str =
+    "tunings are fixed when the program is built; pick one with constants only";
+
+const NOTE_NAME_HELP: &str = "write a pitch as a note name, like `A4` or `F#3`";
+
+const PITCH_ARITH_HELP: &str = "a pitch is a position, not an amount: add or subtract an interval \
+     (`A4 + 7st`), or subtract two pitches to get the interval between them";
+
 fn unit_example(t: &Type) -> &'static str {
     match t {
         Type::Hz => "440Hz",
@@ -1150,6 +1192,9 @@ fn mismatch(span: Span, what: &str, expected: &Type, found: &Type) -> Diagnostic
         span,
         format!("{what} expects `{expected}`, found `{found}`"),
     );
+    if *found == Type::Num && *expected == Type::Pitch {
+        return d.with_help(NOTE_NAME_HELP);
+    }
     if *found == Type::Num && expected.is_dimensioned() {
         return d.with_help(format!(
             "give the number a unit, as in `{}`",
@@ -1254,13 +1299,14 @@ fn compare(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
     let ok = match (a, b) {
         (Type::Bool, Type::Bool) => equality,
         (a, b) if a.is_plain() && b.is_plain() => join(a, b).is_some(),
-        (a, b) => a == b && a.is_dimensioned(),
+        (a, b) => a == b && (a.is_dimensioned() || *a == Type::Pitch),
     };
     if ok {
         return Ok(Type::Bool);
     }
-    let help = if (*a == Type::Num && b.is_dimensioned()) || (*b == Type::Num && a.is_dimensioned())
-    {
+    let help = if (*a == Type::Num && *b == Type::Pitch) || (*b == Type::Num && *a == Type::Pitch) {
+        Some(NOTE_NAME_HELP.to_owned())
+    } else if (*a == Type::Num && b.is_dimensioned()) || (*b == Type::Num && a.is_dimensioned()) {
         let dim = if a.is_dimensioned() { a } else { b };
         Some(format!(
             "give the number a unit, as in `{}`",
@@ -1304,8 +1350,9 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
         _ => "take the remainder of",
     };
     let fail = || {
-        let help = if (*a == Type::Num && b.is_dimensioned())
-            || (*b == Type::Num && a.is_dimensioned())
+        let help = if *a == Type::Pitch || *b == Type::Pitch {
+            Some(PITCH_ARITH_HELP.to_owned())
+        } else if (*a == Type::Num && b.is_dimensioned()) || (*b == Type::Num && a.is_dimensioned())
         {
             let dim = if a.is_dimensioned() { a } else { b };
             Some(format!(

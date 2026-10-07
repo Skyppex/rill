@@ -199,7 +199,8 @@ fn parse_rill_event(input: &str) -> Result<ScheduledRillEvent, String> {
 
 fn parse_event_value(input: &str) -> Result<f32, String> {
     input.parse::<f32>().or_else(|_| {
-        rill::lang::check::pitch_literal(input).ok_or_else(|| format!("`{input}` is not a number or pitch"))
+        rill::lang::check::pitch_literal(input)
+            .ok_or_else(|| format!("`{input}` is not a number or pitch"))
     })
 }
 

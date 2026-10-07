@@ -32,8 +32,9 @@ pub enum Instr {
         dst: u16,
         src: Operand,
     },
+    /// `dst = tunings[tuning](pitch)`, indexing [`Code::tunings`].
     Tune {
-        tuning: TuningSpec,
+        tuning: u16,
         dst: u16,
         pitch: Operand,
     },
@@ -66,8 +67,11 @@ impl TuningSpec {
     pub fn frequency(&self, pitch: f32) -> f32 {
         match *self {
             TuningSpec::Equal { steps, a4 } => {
-                let step = ((pitch - 69.0) * steps / 12.0).round();
-                a4 * 2.0f32.powf(step / steps)
+                // Note names land on the nearest of `steps` equal divisions;
+                // anything between notes (cents, bends) stays continuous.
+                let note = pitch.floor();
+                let step = ((note - 69.0) * steps / 12.0).round();
+                a4 * 2.0f32.powf(step / steps + (pitch - note) / 12.0)
             }
             TuningSpec::Just { root, a4 } => ratio_tuning(pitch, root, a4, JUST_RATIOS),
             TuningSpec::Pythagorean { root, a4 } => {
@@ -109,17 +113,23 @@ const PYTHAGOREAN_RATIOS: [f32; 12] = [
 ];
 
 const MEANTONE_RATIOS: [f32; 12] = [
-    1.0, 1.069984, 1.118034, 1.196279, 1.25, 1.33748, 1.397542, 1.495349, 1.6, 1.67185,
-    1.788854, 1.869186,
+    1.0, 1.069984, 1.118034, 1.196279, 1.25, 1.33748, 1.397542, 1.495349, 1.6, 1.67185, 1.788854,
+    1.869186,
 ];
 
+/// A twelve-note scale built from `ratios` above `root`, scaled so that A4
+/// sounds at exactly `a4`. Fractions of a semitone are added on top, so
+/// bends and cents stay continuous.
 fn ratio_tuning(pitch: f32, root: f32, a4: f32, ratios: [f32; 12]) -> f32 {
-    let degree = (pitch - root).floor();
-    let frac = pitch - pitch.floor();
-    let octave = (degree / 12.0).floor();
-    let index = degree.rem_euclid(12.0) as usize;
-    let root_hz = a4 / 2.0f32.powf((69.0 - root) / 12.0);
-    root_hz * 2.0f32.powf(octave) * ratios[index] * 2.0f32.powf(frac / 12.0)
+    // Frequency relative to the root, which sits at 1.0.
+    let relative = |pitch: f32| {
+        let degree = (pitch - root).floor();
+        let octave = (degree / 12.0).floor();
+        let index = degree.rem_euclid(12.0) as usize;
+        let frac = pitch - root - degree;
+        2.0f32.powf(octave) * ratios[index] * 2.0f32.powf(frac / 12.0)
+    };
+    a4 * relative(pitch) / relative(69.0)
 }
 
 /// One compiled instance, ready to be turned into a [`Program`] node.
@@ -134,6 +144,9 @@ pub struct Code {
     /// Registers that are `state`, with their initial values.
     pub state_init: Vec<(u16, f32)>,
     pub events: Vec<EventCode>,
+    /// Tunings used by `Tune` instructions, here and in event handlers. Kept
+    /// out of the instructions so those stay small.
+    pub tunings: Vec<TuningSpec>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -180,7 +193,9 @@ impl Code {
                 }
                 Instr::Op1 { op: o, dst, x } => format!("r{dst} = {} {}", o.name(), op(x)),
                 Instr::Copy { dst, src } => format!("r{dst} = {}", op(src)),
-                Instr::Tune { dst, pitch, .. } => format!("r{dst} = tune {}", op(pitch)),
+                Instr::Tune { tuning, dst, pitch } => {
+                    format!("r{dst} = tune#{tuning} {}", op(pitch))
+                }
                 Instr::Select { dst, cond, a, b } => {
                     format!("r{dst} = select {} {} {}", op(cond), op(a), op(b))
                 }
@@ -257,7 +272,8 @@ impl Node for Program {
                     }
                     Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
                     Instr::Tune { tuning, dst, pitch } => {
-                        regs[dst as usize] = tuning.frequency(val(regs, pitch));
+                        regs[dst as usize] =
+                            code.tunings[tuning as usize].frequency(val(regs, pitch));
                     }
                     Instr::Select { dst, cond, a, b } => {
                         regs[dst as usize] = if val(regs, cond) != 0.0 {
@@ -336,7 +352,8 @@ impl Node for Program {
                 }
                 Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
                 Instr::Tune { tuning, dst, pitch } => {
-                    regs[dst as usize] = tuning.frequency(val(regs, pitch));
+                    regs[dst as usize] =
+                        self.code.tunings[tuning as usize].frequency(val(regs, pitch));
                 }
                 Instr::Select { dst, cond, a, b } => {
                     regs[dst as usize] = if val(regs, cond) != 0.0 {

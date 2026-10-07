@@ -90,13 +90,20 @@ impl Type {
         matches!(self, Type::Num | Type::Sample | Type::F32 | Type::I32)
     }
 
-    /// Numbers that carry a unit.
+    /// Numbers that carry a unit. These scale and add like amounts.
+    /// `Pitch` is not one of them: it is a position, so only intervals can be
+    /// added to it.
     pub fn is_dimensioned(&self) -> bool {
-        matches!(self, Type::Hz | Type::Time | Type::Interval | Type::Pitch)
+        matches!(self, Type::Hz | Type::Time | Type::Interval)
+    }
+
+    /// Values that can be compared, ordered and put in a frame.
+    pub fn is_quantity(&self) -> bool {
+        self.is_plain() || self.is_dimensioned() || *self == Type::Pitch
     }
 
     pub fn is_scalar(&self) -> bool {
-        self.is_plain() || self.is_dimensioned() || *self == Type::Bool
+        self.is_quantity() || *self == Type::Bool
     }
 
     /// Error or Never: anything goes, the problem is reported elsewhere or the

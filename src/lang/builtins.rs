@@ -3,7 +3,7 @@
 //! Built-ins use type parameters, which user code cannot declare:
 //!
 //! - `T`: a plain number (`sample`, `f32`, `i32` or a literal)
-//! - `S`: any number, with or without a unit
+//! - `S`: any number, with or without a unit, or a pitch
 
 use super::types::{DefKind, ParamSig, Signature, Size, Type};
 
@@ -22,7 +22,7 @@ pub fn constant(name: &str) -> Option<&'static Type> {
 pub fn satisfies(param: &str, ty: &Type) -> bool {
     match param {
         "T" => ty.is_plain(),
-        "S" => ty.is_plain() || ty.is_dimensioned(),
+        "S" => ty.is_quantity(),
         _ => unreachable!("unknown builtin type parameter {param}"),
     }
 }
@@ -82,9 +82,31 @@ pub fn lookup(name: &str) -> Vec<Signature> {
 
 /// Every built-in function name, for suggestions.
 pub const FUNCTIONS: &[&str] = &[
-    "sin", "cos", "tan", "tanh", "exp", "log", "sqrt", "abs", "floor", "ceil", "round", "wrap",
-    "pow", "min", "max", "sum", "clamp", "decay", "equal", "just", "pythagorean", "meantone",
-    "f32", "i32", "sample",
+    "sin",
+    "cos",
+    "tan",
+    "tanh",
+    "exp",
+    "log",
+    "sqrt",
+    "abs",
+    "floor",
+    "ceil",
+    "round",
+    "wrap",
+    "pow",
+    "min",
+    "max",
+    "sum",
+    "clamp",
+    "decay",
+    "equal",
+    "just",
+    "pythagorean",
+    "meantone",
+    "f32",
+    "i32",
+    "sample",
 ];
 
 #[cfg(test)]

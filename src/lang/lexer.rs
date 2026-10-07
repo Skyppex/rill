@@ -212,9 +212,11 @@ impl Lexer<'_> {
                 continue;
             }
             if c.is_ascii_alphabetic() || c == b'_' {
+                // `#` is a sharp, so it is only part of a name right after a
+                // note letter, as in `F#4`.
                 while self.peek(0).is_ascii_alphanumeric()
                     || self.peek(0) == b'_'
-                    || self.peek(0) == b'#'
+                    || (self.peek(0) == b'#' && self.pos == start + 1 && matches!(c, b'A'..=b'G'))
                 {
                     self.pos += 1;
                 }
@@ -274,6 +276,8 @@ impl Lexer<'_> {
                             err.with_help("use `|>` to pipe or `||` for logical or")
                         } else if ch == '&' {
                             err.with_help("use `&&` for logical and")
+                        } else if ch == '#' {
+                            err.with_help("`#` only appears in note names, like `F#4`")
                         } else {
                             err
                         });
@@ -476,5 +480,21 @@ mod tests {
             "unterminated block comment"
         );
         assert_eq!(lex("é").unwrap_err().span, Span::new(0, 2));
+    }
+
+    #[test]
+    fn sharps_only_in_note_names() {
+        assert_eq!(
+            kinds("F#4 C#"),
+            vec![TokenKind::Ident, TokenKind::Ident, TokenKind::Eof]
+        );
+        let e = lex("let level#2 = 1").unwrap_err();
+        assert_eq!(e.message, "unexpected character `#`");
+        assert_eq!(
+            e.help.as_deref(),
+            Some("`#` only appears in note names, like `F#4`")
+        );
+        assert!(lex("a#").is_err());
+        assert!(lex("H#4").is_err());
     }
 }

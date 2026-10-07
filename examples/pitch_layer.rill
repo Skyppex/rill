@@ -14,7 +14,9 @@ rill main() -> sample {
 
     on note_on(note) {
         pitch = note.pitch // note.pitch becomes this type of pitch instead of a frequency
-        gain = note.velocity // i'm sure there is some sort of conversion needed here. i just don't know what that would me :)
+        // Velocity arrives as 0–1. Squaring it is a simple loudness curve:
+        // a straight line sounds too loud at soft velocities.
+        gain = note.velocity * note.velocity
     }
 
     on note_off(note) {

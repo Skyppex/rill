@@ -59,7 +59,7 @@ impl CVal {
                     .map(|((name, _), op)| (name.clone(), op))
                     .collect(),
             ),
-            CVal::Tuning(t) => CVal::Tuning(t.clone()),
+            CVal::Tuning(t) => CVal::Tuning(*t),
         }
     }
 }
@@ -112,6 +112,7 @@ pub fn compile_instance(
         sample_rate,
         code: Vec::new(),
         events: Vec::new(),
+        tunings: Vec::new(),
         regs: 0,
         state_init: Vec::new(),
         state_regs: HashSet::new(),
@@ -158,6 +159,7 @@ pub fn compile_instance(
         output: out.operands().to_vec(),
         state_init: c.state_init,
         events: c.events,
+        tunings: c.tunings,
     })
 }
 
@@ -181,6 +183,7 @@ pub fn default_value(
         sample_rate,
         code: Vec::new(),
         events: Vec::new(),
+        tunings: Vec::new(),
         regs: 0,
         state_init: Vec::new(),
         state_regs: HashSet::new(),
@@ -219,6 +222,7 @@ struct Compiler<'a> {
     sample_rate: f32,
     code: Vec<Instr>,
     events: Vec<EventCode>,
+    tunings: Vec<TuningSpec>,
     regs: u16,
     state_init: Vec<(u16, f32)>,
     state_regs: HashSet<u16>,
@@ -273,9 +277,16 @@ impl Compiler<'_> {
         if let Operand::Const(pitch) = pitch {
             return Ok(Operand::Const(tuning.frequency(pitch)));
         }
+        let index = match self.tunings.iter().position(|t| t == tuning) {
+            Some(i) => i,
+            None => {
+                self.tunings.push(*tuning);
+                self.tunings.len() - 1
+            }
+        };
         let dst = self.reg()?;
         self.emit(Instr::Tune {
-            tuning: tuning.clone(),
+            tuning: index as u16,
             dst,
             pitch,
         });
@@ -352,6 +363,24 @@ impl Compiler<'_> {
     /// Copy `v` into `slot`, allocating registers of the same shape the
     /// first time.
     fn copy_into(&mut self, slot: &mut Option<CVal>, v: &CVal) -> CResult<()> {
+        // A tuning has no registers to copy into. Several paths may produce
+        // it only if they all agree, since nothing can pick one while playing.
+        if let CVal::Tuning(t) = v {
+            return match slot {
+                None => {
+                    *slot = Some(v.clone());
+                    Ok(())
+                }
+                Some(CVal::Tuning(prev)) if prev == t => Ok(()),
+                Some(_) => Err(Diagnostic::error(
+                    self.span,
+                    "a tuning cannot be chosen while playing",
+                )
+                .with_help(
+                    "tunings are fixed when the program is built; pick one with constants only",
+                )),
+            };
+        }
         if slot.is_none() {
             let mut regs = Vec::new();
             for _ in v.operands() {
@@ -706,7 +735,10 @@ impl Compiler<'_> {
         if let Some(binding) = self.lookup(name)
             && let CVal::Tuning(tuning) = binding.val.clone()
         {
-            let vals = args.iter().map(|a| self.expr(&a.value)).collect::<CResult<Vec<_>>>()?;
+            let vals = args
+                .iter()
+                .map(|a| self.expr(&a.value))
+                .collect::<CResult<Vec<_>>>()?;
             return self.apply_tuning(&tuning, &vals[0]);
         }
         // User definitions shadow built-ins.

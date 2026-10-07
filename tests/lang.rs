@@ -687,3 +687,63 @@ fn garbage_never_panics() {
         }
     }
 }
+
+// ---- pitch --------------------------------------------------------------
+
+#[test]
+fn pitches_are_positions_not_amounts() {
+    assert_eq!(type_of(&body("let i = E4 - C4"), "i"), Type::Interval);
+    assert_eq!(type_of(&body("let p = C4 + 4st"), "p"), Type::Pitch);
+    assert_eq!(type_of(&body("let p = 7st + C4"), "p"), Type::Pitch);
+    assert_eq!(type_of(&body("let p = C4 - 50cents"), "p"), Type::Pitch);
+    assert_eq!(
+        type_of(&body("let chord = [C4, E4, G4]"), "chord"),
+        frame(Type::Pitch, 3)
+    );
+    assert_eq!(type_of(&body("let low = min(C4, G3)"), "low"), Type::Pitch);
+    assert_eq!(type_of(&body("let up = C4 < E4"), "up"), Type::Bool);
+
+    for (src, msg) in [
+        ("let x = A4 * 2", "cannot multiply `Pitch` and `number`"),
+        ("let x = A4 + A4", "cannot add `Pitch` and `Pitch`"),
+        ("let x = A4 / C4", "cannot divide `Pitch` and `Pitch`"),
+        ("let x = 4st - C4", "cannot subtract `Interval` and `Pitch`"),
+    ] {
+        let (m, help) = error(&body(src));
+        assert_eq!(m, msg, "{src}");
+        assert!(help.unwrap().starts_with("a pitch is a position"), "{src}");
+    }
+    assert_eq!(error(&body("let x = -A4")).0, "cannot negate `Pitch`");
+
+    let (m, help) = error(&body("let x = A4 == 69"));
+    assert_eq!(m, "cannot compare `Pitch` and `number` with `==`");
+    assert_eq!(
+        help.as_deref(),
+        Some("write a pitch as a note name, like `A4` or `F#3`")
+    );
+}
+
+#[test]
+fn tunings_are_fixed_when_the_program_is_built() {
+    assert_ok(&body(
+        "let t = if true { just(C) } else { equal(12) }\nlet f = A4 |> t",
+    ));
+    assert_eq!(
+        error("rill main() -> sample {\n state t = equal(12)\n return 0\n}").0,
+        "a tuning cannot be `state`"
+    );
+    assert_eq!(
+        error("rill main(steps: i32 = 12) -> sample {\n let t = equal(steps)\n return 0\n}").0,
+        "`equal` needs constant arguments"
+    );
+    assert_eq!(
+        error(
+            "rill main(flip: bool = true) -> sample {
+                let t = if flip { equal(12) } else { just(C) }
+                return 0
+            }"
+        )
+        .0,
+        "a tuning cannot be chosen by a condition that changes while playing"
+    );
+}

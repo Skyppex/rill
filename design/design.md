@@ -109,22 +109,25 @@ Optional channel layouts name positions without changing the type: `type Surroun
 A note name is an abstract `Pitch`, not a frequency; it becomes `Hz` only when resolved through a `Tuning`. Raw `Hz` literals bypass tuning entirely.
 
 ```
-tuning = equal(12, a4: 440Hz)        // default
-tuning = equal(24, a4: 432Hz)
-tuning = just(root: C, a4: 440Hz)    // just intonation depends on the root
-tuning = pythagorean(root: D)
+let tuning = equal(12, a4: 440Hz)       // 12-TET at A440
+let tuning = equal(24, a4: 432Hz)       // quarter tones
+let tuning = just(C, a4: 440Hz)         // just intonation on C, with A4 at 440Hz
+let tuning = pythagorean(D)
 
-sine(E4)                 // resolved through the current tuning
-sine(440Hz)              // already concrete
-sine(E4 + major_third)   // Pitch + Interval -> Pitch
-sine([E4 F#4 B4])        // Chord -> 3 voices, summed
+E4 |> tuning |> sine                    // Pitch -> Hz -> sound
+sine(440Hz)                             // already concrete
+(E4 + 4st) |> tuning |> sine            // Pitch + Interval -> Pitch
+sum([E4, F#4, B4] |> tuning |> sine)    // a chord: three voices, mixed
 ```
 
 Rules:
 
-- Chords use `[ ]`, not `+`, because `+` already means addition on `Hz` and mixing on streams.
-- Passing a `Chord` to a rill that takes `Hz` lifts it to one voice per pitch.
-- When the tuning and every operand are known at build time, the whole expression constant-folds to a number. Otherwise it is evaluated at control rate.
+- A `Pitch` is a position, not an amount: `Pitch ± Interval` gives a `Pitch` and `Pitch - Pitch` gives the `Interval` between them. Pitches can be compared, but not scaled or added together.
+- A tuning is a value applied with `|>` (or called like a function). It is fixed when the program is built: tunings cannot be `state`, and choosing one needs constant arguments and conditions.
+- `equal(n)` places note names on the nearest of `n` equal divisions of the octave. Scale tunings (`just`, `pythagorean`, `meantone`) build twelve notes from ratios above their root and put A4 exactly on `a4`. In every tuning, fractions of a semitone (cents, bends) stay continuous.
+- Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Hz` and mixing on streams. Tuning a chord tunes each pitch, and passing it to a rill that takes `Hz` lifts it to one voice per pitch.
+- When the tuning and every operand are known at build time, the whole expression constant-folds to a number. Otherwise it is evaluated per tick.
+- Note events carry `pitch` as a `Pitch` and `velocity` in 0–1. Velocity is linear; a curve such as `velocity * velocity` sounds more even, since a straight line is too loud at soft velocities.
 
 ## Execution model
 

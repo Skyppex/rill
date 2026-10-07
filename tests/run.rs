@@ -238,16 +238,18 @@ fn pitch_literals_and_callable_tunings_resolve_to_hz() {
             return [
                 (A4 |> equal12) / 1Hz,
                 ((A4 + 12st) |> equal12) / 1Hz,
-                (E4 |> just_c) / 1Hz,
-                (E4 |> pyth_c) / 1Hz,
+                (C4 |> just_c) / 1Hz,
+                (C4 |> pyth_c) / 1Hz,
             ]
         }
     ";
     let out = render_with(src, 4, 1, Blocks::Fixed(1));
     assert!((out[0] - 440.0).abs() < 1e-4);
     assert!((out[1] - 880.0).abs() < 1e-4);
-    assert!((out[2] - 327.03195).abs() < 0.01);
-    assert!((out[3] - 331.119).abs() < 0.01);
+    // A4 sits on 440Hz and the root follows from the scale's ratio for A:
+    // 5/3 in just intonation, 27/16 in Pythagorean tuning.
+    assert!((out[2] - 264.0).abs() < 0.01);
+    assert!((out[3] - 260.7407).abs() < 0.01);
 
     let src = "
         rill main() -> [sample; 3] {
@@ -499,5 +501,95 @@ fn rate_changing_rills_are_rejected_for_now() {
     assert_eq!(
         errors(&src, 1),
         ["`decimate` changes the sample rate, which is not supported yet"]
+    );
+}
+
+#[test]
+fn equal_temperament_keeps_pitches_between_notes() {
+    let src = "
+        rill main() -> [sample; 4] {
+            let et = equal(12)
+            let quarter = equal(24)
+            return [
+                ((A4 + 50cents) |> et) / 1Hz,
+                ((A4 - 30cents) |> et) / 1Hz,
+                ((A4 + 50cents) |> quarter) / 1Hz,
+                (C5 |> quarter) / 1Hz,
+            ]
+        }
+    ";
+    let out = render_with(src, 4, 1, Blocks::Fixed(1));
+    let expected = [
+        440.0 * 2f32.powf(0.5 / 12.0),
+        440.0 * 2f32.powf(-0.3 / 12.0),
+        440.0 * 2f32.powf(0.5 / 12.0),
+        523.2511,
+    ];
+    for (got, want) in out.iter().zip(expected) {
+        assert!((got - want).abs() < 0.01, "{got} vs {want}");
+    }
+}
+
+#[test]
+fn pitch_bends_glide_at_run_time() {
+    // The interval changes every tick, so tuning happens in the VM rather
+    // than at build time, and must not snap to semitones.
+    let src = "
+        rill main() -> sample {
+            state bend: Interval = 0st
+            let t = equal(12)
+            let f = (A4 + bend) |> t
+            bend = bend + 25cents
+            return f / 1Hz
+        }
+    ";
+    let out = render(src, 4);
+    for (i, got) in out.iter().enumerate() {
+        let want = 440.0 * 2f32.powf(0.25 * i as f32 / 12.0);
+        assert!((got - want).abs() < 0.01, "tick {i}: {got} vs {want}");
+    }
+}
+
+#[test]
+fn a_tuning_picked_while_playing_is_an_error() {
+    let src = "
+        rill pick(x: sample) -> Tuning {
+            if x > 0 { return equal(12) }
+            return just(C)
+        }
+        rill main() -> sample {
+            state s: sample = 1
+            s = -s
+            let t = pick(s)
+            return (A4 |> t) / 1kHz
+        }
+    ";
+    assert_eq!(errors(src, 1), ["a tuning cannot be chosen while playing"]);
+}
+
+#[test]
+fn ratio_tunings_put_a4_on_the_reference() {
+    let src = "
+        rill main() -> [sample; 4] {
+            let just_c = just(C)
+            let pyth_d = pythagorean(D, a4: 432Hz)
+            let mean_c = meantone(C)
+            return [
+                (A4 |> just_c) / 1Hz,
+                (A4 |> pyth_d) / 1Hz,
+                (A4 |> mean_c) / 1Hz,
+                ((A4 + 50cents) |> just_c) / 1Hz,
+            ]
+        }
+    ";
+    let out = render_with(src, 4, 1, Blocks::Fixed(1));
+    assert!((out[0] - 440.0).abs() < 1e-3, "{}", out[0]);
+    assert!((out[1] - 432.0).abs() < 1e-3, "{}", out[1]);
+    assert!((out[2] - 440.0).abs() < 1e-3, "{}", out[2]);
+    // Cents on top of a scale note stay continuous.
+    assert!(
+        (out[3] - 440.0 * 2f32.powf(0.5 / 12.0)).abs() < 0.01,
+        "{}",
+        out[3]
     );
 }

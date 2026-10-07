@@ -1166,7 +1166,7 @@ impl Compiler<'_> {
                 let size = self.map1(Op1::Abs, x)?;
                 self.zip2(Op2::Max, &size, &CVal::Scalar(Operand::Const(1e-6)))
             }
-            ("amp" | "f32" | "sample", [x]) => Ok(x.clone()),
+            ("amp" | "Float" | "Sample", [x]) => Ok(x.clone()),
             ("pow", [x, y]) => self.zip2(Op2::Pow, x, y),
             ("min", [x, y]) => self.zip2(Op2::Min, x, y),
             ("max", [x, y]) => self.zip2(Op2::Max, x, y),
@@ -1218,7 +1218,7 @@ pub fn op2_for(op: BinOp, result: &Type) -> Op2 {
         BinOp::Add => Op2::Add,
         BinOp::Sub => Op2::Sub,
         BinOp::Mul => Op2::Mul,
-        BinOp::Div if *result == Type::I32 => Op2::IDiv,
+        BinOp::Div if *result == Type::Int => Op2::IDiv,
         BinOp::Div => Op2::Div,
         BinOp::Rem => Op2::Rem,
         BinOp::Lt => Op2::Lt,

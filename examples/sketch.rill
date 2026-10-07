@@ -1,63 +1,63 @@
 // The syntax sketch from design/design.md, filled in where it said `...`.
 
 // Pure function on one value. Auto-lifted over streams and channels.
-fn abs(x: sample) -> sample {
+fn abs(x: Sample) -> Sample {
     if x < 0 { -x } else { x }
 }
 
 // Stateful 1:1 rill. Body runs once per tick.
-rill peak(x: sample, release: Time = 300ms) -> sample {
-    state level: sample = 0
+rill peak(x: Sample, release: Time = 300ms) -> Sample {
+    state level: Sample = 0
     let a = abs(x)
     level = if a > level { a } else { level * decay(release) }
     return level
 }
 
 // Composition with pipes.
-rill meter(x: sample) -> sample {
+rill meter(x: Sample) -> Sample {
     return x |> abs |> peak
 }
 
 // Generic over channel count. Only needed when a rill works ACROSS channels.
-rill mix_down<N>(x: [sample; N]) -> [sample; 1] {
+rill mix_down<N>(x: [Sample; N]) -> [Sample; 1] {
     return [sum(x) / N]
 }
 
 // Rate-changing rill: the ratio is part of the signature.
-rill decimate(x: sample) -> sample @ rate / 2 {
+rill decimate(x: Sample) -> Sample @ rate / 2 {
     return x
 }
 
 // Generator: no audio input.
-rill sine(freq: Hz) -> sample {
-    state phase: f32 = 0
+rill sine(freq: Freq) -> Sample {
+    state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return sin(phase * TAU)
 }
 
 // Generator: no audio input.
-rill saw(freq: Hz) -> sample {
-    state phase: f32 = 0
+rill saw(freq: Freq) -> Sample {
+    state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return phase * 2 - 1
 }
 
 // Generator: no audio input.
-rill square(freq: Hz) -> sample {
-    state phase: f32 = 0
+rill square(freq: Freq) -> Sample {
+    state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return if phase < 0.5 { 1 } else { -1 }
 }
 
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
+fn lerp(a: Float, b: Float, t: Float) -> Float {
     return a + (b - a) * t
 }
 
-rill wavetable(left: sample, right: sample, t: f32) -> sample {
+rill wavetable(left: Sample, right: Sample, t: Float) -> Sample {
     return lerp(left, right, t)
 }
 
-rill ramp(from: f32, to: f32, time: Time) -> f32 {
+rill ramp(from: Float, to: Float, time: Time) -> Float {
     state elapsed = 0s
 
     let t = min(elapsed / time, 1)
@@ -67,8 +67,8 @@ rill ramp(from: f32, to: f32, time: Time) -> f32 {
     return from + (to - from) * t
 }
 
-rill crush(x: sample, bits: f32 = 8, hold: Time = 0.5ms) -> sample {
-    state held: sample = 0
+rill crush(x: Sample, bits: Float = 8, hold: Time = 0.5ms) -> Sample {
+    state held: Sample = 0
     state left: Time = 0s
   
     // Lower the sample rate: grab a new value every `hold`, repeat it in between.
@@ -84,7 +84,7 @@ rill crush(x: sample, bits: f32 = 8, hold: Time = 0.5ms) -> sample {
 }
 
 // Entry point: the program runs `main` and plays what it returns.
-rill main() -> sample {
+rill main() -> Sample {
     let lfo   = sine(0.5Hz) * 0.5 + 0.5
     let voice1 = sine(440Hz)
     let voice2 = square(440Hz)

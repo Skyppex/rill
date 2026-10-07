@@ -1,18 +1,18 @@
 event note_on(note)
 event note_off(note)
 
-rill sine(freq: Hz) -> sample {
-    state phase: f32 = 0
+rill sine(freq: Freq) -> Sample {
+    state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return sin(phase * TAU)
 }
 
-rill main() -> sample {
+rill main() -> Sample {
     state pitch = A4
     state gain = 0.0
     // A tuning is just a fn from Pitch to Hz. `equal` takes the pitch first,
     // so this fills in the rest; named arguments are optional.
-    let tuning = fn(p: Pitch) -> Hz { equal(p, 12, a4: 440Hz) }
+    let tuning = fn(p: Pitch) -> Freq { equal(p, 12, a4: 440Hz) }
 
     on note_on(note) {
         pitch = note.pitch // note.pitch becomes this type of pitch instead of a frequency

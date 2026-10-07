@@ -190,7 +190,7 @@ pub enum ExprKind {
     Frame(Vec<Expr>),
     Index(Box<Expr>, Box<Expr>),
     Field(Box<Expr>, Ident),
-    /// An anonymous fn: `fn(p) { ... }` or `fn(p: Pitch) -> Hz { ... }`.
+    /// An anonymous fn: `fn(p) { ... }` or `fn(p: Pitch) -> Freq { ... }`.
     Fn {
         params: Vec<FnParam>,
         ret: Option<TypeExpr>,

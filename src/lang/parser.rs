@@ -217,7 +217,7 @@ impl Parser<'_> {
         self.expect(TokenKind::Arrow, "and a return type")
             .map_err(|e| {
                 e.with_help(format!(
-                    "{keyword}s declare what they return, e.g. `-> sample`"
+                    "{keyword}s declare what they return, e.g. `-> Sample`"
                 ))
             })?;
         let ret = self.ty()?;
@@ -287,7 +287,7 @@ impl Parser<'_> {
             self.nest -= 1;
             self.expect(
                 TokenKind::Arrow,
-                "and a return type, as in `fn(Pitch) -> Hz`",
+                "and a return type, as in `fn(Pitch) -> Freq`",
             )?;
             let ret = self.ty()?;
             return Ok(TypeExpr::Fn {
@@ -299,7 +299,7 @@ impl Parser<'_> {
         if let Some(open) = self.eat(TokenKind::LBracket) {
             self.nest += 1;
             let elem = self.ty()?;
-            self.expect(TokenKind::Semi, "and a channel count, as in `[sample; 2]`")?;
+            self.expect(TokenKind::Semi, "and a channel count, as in `[Sample; 2]`")?;
             let size = if self.at(TokenKind::Ident) {
                 SizeExpr::Var(self.ident("")?)
             } else {

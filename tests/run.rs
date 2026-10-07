@@ -7,8 +7,8 @@ use rill::{Config, Engine, EventValue, Graph, ParamEvent, RillEvent};
 const RATE: u32 = 48_000;
 
 const SINE: &str = "
-rill sine(freq: Hz) -> sample {
-    state phase: f32 = 0
+rill sine(freq: Freq) -> Sample {
+    state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return sin(phase * TAU)
 }
@@ -24,7 +24,7 @@ fn config(channels: usize) -> Config {
 
 /// `rill main() -> sample { return <expr> }`
 fn main_returning(expr: &str) -> String {
-    format!("rill main() -> sample {{\n    return {expr}\n}}")
+    format!("rill main() -> Sample {{\n    return {expr}\n}}")
 }
 
 fn graph(src: &str, channels: usize) -> Graph {
@@ -81,7 +81,7 @@ fn rill_sine_matches_the_native_oscillator() {
 fn design_doc_example_has_the_right_vibrato() {
     let src = format!(
         "{SINE}
-        rill main() -> sample {{
+        rill main() -> Sample {{
             let lfo   = sine(0.5Hz) * 20Hz + 440Hz
             let voice = sine(lfo) * 0.3
             return voice
@@ -147,8 +147,8 @@ fn a_program_is_one_node() {
 #[test]
 fn constant_programs_fold_to_nothing() {
     let src = format!(
-        "fn double(x: sample) -> sample {{ x * 2 }}
-        fn abs2(x: sample) -> sample {{ if x < 0 {{ -x }} else {{ x }} }}
+        "fn double(x: Sample) -> Sample {{ x * 2 }}
+        fn abs2(x: Sample) -> Sample {{ if x < 0 {{ -x }} else {{ x }} }}
         {}",
         main_returning("double(abs2(-0.125)) + sum([0.1, 0.15])")
     );
@@ -158,7 +158,7 @@ fn constant_programs_fold_to_nothing() {
 
 #[test]
 fn entry_parameters_are_live_controls() {
-    let src = "rill main(gain: sample = 0.25) -> sample { return gain }";
+    let src = "rill main(gain: Sample = 0.25) -> Sample { return gain }";
     let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
     assert_eq!(engine.params().collect::<Vec<_>>(), vec!["gain"]);
 
@@ -177,7 +177,7 @@ fn entry_parameters_are_live_controls() {
 
 #[test]
 fn parameter_events_split_blocks_at_sample_offsets() {
-    let src = "rill main(gain: sample = 0) -> sample { return gain }";
+    let src = "rill main(gain: Sample = 0) -> Sample { return gain }";
     let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
     let mut out = [0.0f32; 12];
     engine.render_planar_with_events(
@@ -196,8 +196,8 @@ fn parameter_events_split_blocks_at_sample_offsets() {
 #[test]
 fn rill_events_run_handlers_at_sample_offsets() {
     let src = "
-        rill main() -> sample {
-            state pitch: Hz = 440Hz
+        rill main() -> Sample {
+            state pitch: Freq = 440Hz
             on note_on(note) {
                 pitch = note.pitch |> equal(12)
             }
@@ -230,10 +230,10 @@ fn rill_events_run_handlers_at_sample_offsets() {
 #[test]
 fn pitch_literals_and_callable_tunings_resolve_to_hz() {
     let src = "
-        rill main() -> [sample; 4] {
-            let equal12 = fn(p: Pitch) -> Hz { equal(p, 12) }
-            let just_c = fn(p: Pitch) -> Hz { just(p, C) }
-            let pyth_c = fn(p: Pitch) -> Hz { pythagorean(p, C) }
+        rill main() -> [Sample; 4] {
+            let equal12 = fn(p: Pitch) -> Freq { equal(p, 12) }
+            let just_c = fn(p: Pitch) -> Freq { just(p, C) }
+            let pyth_c = fn(p: Pitch) -> Freq { pythagorean(p, C) }
             return [
                 (A4 |> equal12) / 1Hz,
                 ((A4 + 12st) |> equal12) / 1Hz,
@@ -251,7 +251,7 @@ fn pitch_literals_and_callable_tunings_resolve_to_hz() {
     assert!((out[3] - 260.7407).abs() < 0.01);
 
     let src = "
-        rill main() -> [sample; 3] {
+        rill main() -> [Sample; 3] {
             let tuned = [A4, C5, E5] |> equal(12, a4: 432Hz)
             return [tuned[0] / 1Hz, tuned[1] / 1Hz, tuned[2] / 1Hz]
         }
@@ -267,13 +267,13 @@ fn pitch_literals_and_callable_tunings_resolve_to_hz() {
 #[test]
 fn state_persists_and_branches_work() {
     let src = "
-        rill counter(x: sample) -> sample {
-            state n: f32 = 0
+        rill counter(x: Sample) -> Sample {
+            state n: Float = 0
             n = n + 1
             if n > 3 { n = 0 }
             return n + x
         }
-        rill main() -> sample { return counter(0) }
+        rill main() -> Sample { return counter(0) }
     ";
     let expected: Vec<f32> = (0..20).map(|i| ((i + 1) % 4) as f32).collect();
     for blocks in [Blocks::Fixed(1), Blocks::Fixed(7), Blocks::Fixed(64)] {
@@ -285,7 +285,7 @@ fn state_persists_and_branches_work() {
 fn early_returns() {
     let src = format!(
         "{SINE}
-        rill sign(x: sample) -> sample {{
+        rill sign(x: Sample) -> Sample {{
             if x > 0 {{ return 1 }}
             if x < 0 {{ return -1 }}
             return 0
@@ -304,13 +304,13 @@ fn reading_state_before_assigning_it_gives_the_old_value() {
     // A one-sample delay: `let old = s` must not see the new value.
     let src = format!(
         "{SINE}
-        rill delay1(x: sample) -> sample {{
-            state s: sample = 0
+        rill delay1(x: Sample) -> Sample {{
+            state s: Sample = 0
             let old = s
             s = x
             return old
         }}
-        rill main() -> [sample; 2] {{
+        rill main() -> [Sample; 2] {{
             let x = sine(1000Hz)
             return [x, delay1(x)]
         }}"
@@ -325,12 +325,12 @@ fn reading_state_before_assigning_it_gives_the_old_value() {
 #[test]
 fn frame_state_swaps_atomically() {
     let src = "
-        rill flip(x: sample) -> sample {
-            state s: [f32; 2] = [1, 2]
+        rill flip(x: Sample) -> Sample {
+            state s: [Float; 2] = [1, 2]
             s = [s[1], s[0]]
             return s[0] + x
         }
-        rill main() -> sample { return flip(0) }
+        rill main() -> Sample { return flip(0) }
     ";
     assert_eq!(render(src, 6), [2.0, 1.0, 2.0, 1.0, 2.0, 1.0]);
 }
@@ -338,15 +338,15 @@ fn frame_state_swaps_atomically() {
 #[test]
 fn each_call_site_has_its_own_state() {
     let src = "
-        rill counter(x: sample) -> sample {
-            state n: f32 = 0
+        rill counter(x: Sample) -> Sample {
+            state n: Float = 0
             n = n + x
             return n
         }
-        rill two(x: sample) -> sample {
+        rill two(x: Sample) -> Sample {
             return counter(x) + counter(x * 10)
         }
-        rill main() -> sample { return two(1) }
+        rill main() -> Sample { return two(1) }
     ";
     assert_eq!(render(src, 3), [11.0, 22.0, 33.0]);
 }
@@ -354,12 +354,12 @@ fn each_call_site_has_its_own_state() {
 #[test]
 fn rills_lift_over_channels_with_independent_state() {
     let src = "
-        rill acc(x: sample) -> sample {
-            state total: sample = 0
+        rill acc(x: Sample) -> Sample {
+            state total: Sample = 0
             total = total + x
             return total
         }
-        rill main() -> [sample; 2] { return acc([1, 2]) }
+        rill main() -> [Sample; 2] { return acc([1, 2]) }
     ";
     let out = render_with(src, 2, 3, Blocks::Fixed(2));
     assert_eq!(out, [1.0, 2.0, 2.0, 4.0, 3.0, 6.0]);
@@ -368,13 +368,13 @@ fn rills_lift_over_channels_with_independent_state() {
 #[test]
 fn generic_rills_and_reductions() {
     let src = "
-        rill mix_down<N>(x: [sample; N]) -> [sample; 1] {
+        rill mix_down<N>(x: [Sample; N]) -> [Sample; 1] {
             return [sum(x) / N]
         }
-        rill widest<N>(x: [sample; N]) -> sample {
+        rill widest<N>(x: [Sample; N]) -> Sample {
             return max(x) - min(x)
         }
-        rill main() -> sample { return mix_down([0.1, 0.2, 0.6])[0] + widest([0.5, -0.25]) }
+        rill main() -> Sample { return mix_down([0.1, 0.2, 0.6])[0] + widest([0.5, -0.25]) }
     ";
     close(&render(src, 2), &[0.3 + 0.75; 2], 1e-6);
 }
@@ -382,18 +382,18 @@ fn generic_rills_and_reductions() {
 #[test]
 fn peak_decays_by_60_db_over_its_release() {
     let src = "
-        rill impulse(x: sample) -> sample {
-            state first: bool = true
+        rill impulse(x: Sample) -> Sample {
+            state first: Bool = true
             let y = if first { 1 } else { 0 }
             first = false
             return y + x
         }
-        rill peak(x: sample, release: Time = 300ms) -> sample {
-            state level: sample = 0
+        rill peak(x: Sample, release: Time = 300ms) -> Sample {
+            state level: Sample = 0
             level = if abs(x) > level { abs(x) } else { level * decay(release) }
             return level
         }
-        rill main() -> sample { return impulse(0) |> peak(release: 100ms) }
+        rill main() -> Sample { return impulse(0) |> peak(release: 100ms) }
     ";
     let out = render(src, 4801);
     assert_eq!(out[0], 1.0);
@@ -404,17 +404,17 @@ fn peak_decays_by_60_db_over_its_release() {
 #[test]
 fn dynamic_channel_index() {
     let src = "
-        rill step(x: sample) -> i32 {
-            state n: i32 = 0
+        rill step(x: Sample) -> Int {
+            state n: Int = 0
             let out = n
             n = (n + 1) % 3
             return out
         }
-        rill pick(i: i32) -> sample {
+        rill pick(i: Int) -> Sample {
             let options = [10, 20, 30]
             return options[i]
         }
-        rill main() -> sample { return pick(step(0)) }
+        rill main() -> Sample { return pick(step(0)) }
     ";
     assert_eq!(render(src, 5), [10.0, 20.0, 30.0, 10.0, 20.0]);
 }
@@ -423,7 +423,7 @@ fn dynamic_channel_index() {
 fn conditions_on_streams() {
     let src = format!(
         "{SINE}
-        rill main() -> sample {{
+        rill main() -> Sample {{
             let s = sine(1000Hz)
             return if s > 0 {{ 1 }} else {{ -1 }}
         }}"
@@ -436,13 +436,13 @@ fn conditions_on_streams() {
 #[test]
 fn rills_in_a_branch_only_advance_when_it_runs() {
     let src = "
-        rill counter() -> sample {
-            state n: f32 = 0
+        rill counter() -> Sample {
+            state n: Float = 0
             n = n + 1
             return n
         }
-        rill main() -> sample {
-            state t: f32 = 0
+        rill main() -> Sample {
+            state t: Float = 0
             t = t + 1
             if t > 2 { return counter() }
             return 0
@@ -458,29 +458,29 @@ fn entry_output_routing() {
     // A scalar plays on every channel; a frame goes channel by channel.
     let out = render_with(&main_returning("0.25"), 2, 2, Blocks::Fixed(2));
     assert_eq!(out, [0.25; 4]);
-    let src = "rill main() -> [sample; 2] { return [0.1, 0.2] }";
+    let src = "rill main() -> [Sample; 2] { return [0.1, 0.2] }";
     close(&render_with(src, 2, 1, Blocks::Fixed(1)), &[0.1, 0.2], 1e-6);
     // One channel in a frame counts as mono.
-    let src = "rill main() -> [sample; 1] { return [0.5] }";
+    let src = "rill main() -> [Sample; 1] { return [0.5] }";
     assert_eq!(render_with(src, 2, 1, Blocks::Fixed(1)), [0.5, 0.5]);
 
     assert_eq!(
-        errors("rill main() -> [sample; 3] { return [0.1, 0.2, 0.3] }", 2),
+        errors("rill main() -> [Sample; 3] { return [0.1, 0.2, 0.3] }", 2),
         ["`main` returns 3 channels, but the output has 2"]
     );
 }
 
 #[test]
 fn entry_parameters_run_at_their_defaults() {
-    let src = "rill main(level: sample = 0.25, gain: f32 = 2) -> sample { return level * gain }";
+    let src = "rill main(level: Sample = 0.25, gain: Float = 2) -> Sample { return level * gain }";
     assert_eq!(render(src, 2), [0.5, 0.5]);
 }
 
 #[test]
 fn another_rill_can_be_the_entry() {
     let src = "
-        rill main() -> sample { return 0.1 }
-        rill other() -> sample { return 0.2 }
+        rill main() -> Sample { return 0.1 }
+        rill other() -> Sample { return 0.2 }
     ";
     let mut engine = Engine::new(graph_from(src, 1, "other"), config(1)).unwrap();
     close(
@@ -493,7 +493,7 @@ fn another_rill_can_be_the_entry() {
 #[test]
 fn rate_changing_rills_are_rejected_for_now() {
     let src = format!(
-        "rill decimate(x: sample) -> sample @ rate / 2 {{ return x }}\n{}",
+        "rill decimate(x: Sample) -> Sample @ rate / 2 {{ return x }}\n{}",
         main_returning("decimate(0.5)")
     );
     assert_eq!(
@@ -505,9 +505,9 @@ fn rate_changing_rills_are_rejected_for_now() {
 #[test]
 fn equal_temperament_keeps_pitches_between_notes() {
     let src = "
-        rill main() -> [sample; 4] {
-            let et = fn(p: Pitch) -> Hz { equal(p) }
-            let quarter = fn(p: Pitch) -> Hz { equal(p, 24) }
+        rill main() -> [Sample; 4] {
+            let et = fn(p: Pitch) -> Freq { equal(p) }
+            let quarter = fn(p: Pitch) -> Freq { equal(p, 24) }
             return [
                 ((A4 + 50cents) |> et) / 1Hz,
                 ((A4 - 30cents) |> et) / 1Hz,
@@ -533,9 +533,9 @@ fn pitch_bends_glide_at_run_time() {
     // The interval changes every tick, so tuning happens in the VM rather
     // than at build time, and must not snap to semitones.
     let src = "
-        rill main() -> sample {
+        rill main() -> Sample {
             state bend: Interval = 0st
-            let t = fn(p: Pitch) -> Hz { equal(p) }
+            let t = fn(p: Pitch) -> Freq { equal(p) }
             let f = (A4 + bend) |> t
             bend = bend + 25cents
             return f / 1Hz
@@ -553,11 +553,11 @@ fn a_function_can_be_chosen_while_playing() {
     // `s` flips every tick, so the tuning alternates: just C4 is 264Hz,
     // equal-tempered C4 is 261.63Hz.
     let src = "
-        rill main() -> sample {
-            state s: sample = 1
+        rill main() -> Sample {
+            state s: Sample = 1
             s = -s
-            let et: fn(Pitch) -> Hz = equal
-            let jc = fn(p: Pitch) -> Hz { just(p, C) }
+            let et: fn(Pitch) -> Freq = equal
+            let jc = fn(p: Pitch) -> Freq { just(p, C) }
             let t = if s > 0 { et } else { jc }
             return (C4 |> t) / 1Hz
         }
@@ -573,16 +573,16 @@ fn a_function_can_be_chosen_while_playing() {
 fn functions_are_inlined_where_they_are_called() {
     let src = format!(
         "{SINE}
-        fn a432(p: Pitch) -> Hz {{
+        fn a432(p: Pitch) -> Freq {{
             432Hz * pow(2, (p - A4) / 12st)
         }}
-        fn tuned(steps: i32) -> fn(Pitch) -> Hz {{
+        fn tuned(steps: Int) -> fn(Pitch) -> Freq {{
             fn(p) {{ equal(p, steps) }}
         }}
-        rill voice(pitch: Pitch, tune: fn(Pitch) -> Hz) -> sample {{
+        rill voice(pitch: Pitch, tune: fn(Pitch) -> Freq) -> Sample {{
             return (pitch |> tune) / 1kHz
         }}
-        rill main() -> [sample; 4] {{
+        rill main() -> [Sample; 4] {{
             let detune = 3Hz
             return [
                 voice(A4, a432),
@@ -606,10 +606,10 @@ fn captured_values_can_change_over_time() {
     // `level` is state captured by the fn; each tick the fn sees the value
     // it had when the fn was made.
     let src = "
-        rill main() -> sample {
-            state level: sample = 0
+        rill main() -> Sample {
+            state level: Sample = 0
             level = level + 1
-            let scale = fn(x: sample) -> sample { x * level }
+            let scale = fn(x: Sample) -> Sample { x * level }
             level = level + 100
             return scale(2)
         }
@@ -622,10 +622,10 @@ fn captured_values_can_change_over_time() {
 #[test]
 fn ratio_tunings_put_a4_on_the_reference() {
     let src = "
-        rill main() -> [sample; 4] {
-            let just_c = fn(p: Pitch) -> Hz { just(p, C) }
-            let pyth_d = fn(p: Pitch) -> Hz { pythagorean(p, D, a4: 432Hz) }
-            let mean_c = fn(p: Pitch) -> Hz { meantone(p, C) }
+        rill main() -> [Sample; 4] {
+            let just_c = fn(p: Pitch) -> Freq { just(p, C) }
+            let pyth_d = fn(p: Pitch) -> Freq { pythagorean(p, D, a4: 432Hz) }
+            let mean_c = fn(p: Pitch) -> Freq { meantone(p, C) }
             return [
                 (A4 |> just_c) / 1Hz,
                 (A4 |> pyth_d) / 1Hz,
@@ -650,7 +650,7 @@ fn ratio_tunings_put_a4_on_the_reference() {
 fn levels_scale_amplitude() {
     let db = |x: f32| 10f32.powf(x / 20.0);
     let src = "
-        rill main() -> [sample; 8] {
+        rill main() -> [Sample; 8] {
             let x = 0.5
             return [
                 x - 6dB,
@@ -686,7 +686,7 @@ fn levels_scale_amplitude() {
 fn levels_can_change_while_playing() {
     // A fade moving 20dB down per tick, applied to a frame.
     let src = "
-        rill main() -> [sample; 2] {
+        rill main() -> [Sample; 2] {
             state fade: Gain = 0dB
             let out = [1, 0.5] + fade
             fade = fade - 20dB
@@ -703,7 +703,7 @@ fn levels_can_change_while_playing() {
 
 #[test]
 fn a_gain_parameter_is_a_live_control() {
-    let src = "rill main(volume: Gain = -6dB) -> sample { return 1 + volume }";
+    let src = "rill main(volume: Gain = -6dB) -> Sample { return 1 + volume }";
     let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
     let mut out = [0.0f32; 4];
     engine.render_interleaved(&mut out[..1]);
@@ -717,4 +717,52 @@ fn a_gain_parameter_is_a_live_control() {
     let mut later = [0.0f32; 4800];
     engine.render_interleaved(&mut later);
     assert!((later[4799] - 0.25).abs() < 1e-6, "{}", later[4799]);
+}
+
+#[test]
+fn different_functions_from_different_returns_is_an_error() {
+    let src = "
+        fn pick(x: Sample) -> fn(Sample) -> Sample {
+            if x > 0 { return fn(v) { v * 2 } }
+            return fn(v) { v }
+        }
+        rill main() -> Sample {
+            state s: Sample = 1
+            s = -s
+            let f = pick(s)
+            return f(0.5)
+        }
+    ";
+    assert_eq!(
+        errors(src, 1),
+        ["returning different functions from different branches is not supported yet"]
+    );
+}
+
+#[test]
+fn levels_per_channel_and_negated_while_playing() {
+    // `fade` drops 20dB per tick. The right channel sits 6dB lower than the
+    // left, and `-fade` turns the fade into a boost.
+    let db = |x: f32| 10f32.powf(x / 20.0);
+    let src = "
+        rill main() -> [Sample; 3] {
+            state fade: Gain = 0dB
+            let out = [1, 1] - [fade, fade + 6dB]
+            let boost = 1 + (-fade)
+            fade = fade - 20dB
+            return [out[0], out[1], boost]
+        }
+    ";
+    let out = render_with(src, 3, 2, Blocks::Fixed(1));
+    let expected = [
+        1.0,
+        db(-6.0),
+        1.0, // tick 0: fade is 0dB
+        10.0,
+        10.0 * db(-6.0),
+        10.0, // tick 1: fade is -20dB
+    ];
+    for (i, (got, want)) in out.iter().zip(expected).enumerate() {
+        assert!((got - want).abs() < 1e-4, "{i}: {got} vs {want}");
+    }
 }

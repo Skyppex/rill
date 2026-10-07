@@ -2,16 +2,16 @@
 //!
 //! Built-ins use type parameters, which user code cannot declare:
 //!
-//! - `T`: a plain number (`sample`, `f32`, `i32` or a literal)
+//! - `T`: a plain number (`Sample`, `Float`, `Int` or a literal)
 //! - `S`: any number, with or without a unit, or a pitch
 
 use super::types::{DefKind, ParamSig, Signature, Size, Type};
 
 pub const CONSTANTS: &[(&str, Type)] = &[
-    ("PI", Type::F32),
-    ("TAU", Type::F32),
+    ("PI", Type::Float),
+    ("TAU", Type::Float),
     // The host sample rate.
-    ("RATE", Type::Hz),
+    ("RATE", Type::Freq),
 ];
 
 pub fn constant(name: &str) -> Option<&'static Type> {
@@ -69,25 +69,26 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         "equal" => vec![sig(
             &[
                 ("pitch", Type::Pitch),
-                ("steps", Type::I32),
-                ("a4", Type::Hz),
+                ("steps", Type::Int),
+                ("a4", Type::Freq),
             ],
-            Type::Hz,
+            Type::Freq,
         )],
         "just" | "pythagorean" | "meantone" => vec![sig(
             &[
                 ("pitch", Type::Pitch),
                 ("root", Type::Pitch),
-                ("a4", Type::Hz),
+                ("a4", Type::Freq),
             ],
-            Type::Hz,
+            Type::Freq,
         )],
         // The level of an amplitude, and the amplitude factor of a level.
         "level" => vec![sig(&[("x", t())], Type::Gain)],
-        "amp" => vec![sig(&[("gain", Type::Gain)], Type::F32)],
-        "f32" => vec![sig(&[("x", t())], Type::F32)],
-        "i32" => vec![sig(&[("x", t())], Type::I32)],
-        "sample" => vec![sig(&[("x", t())], Type::Sample)],
+        "amp" => vec![sig(&[("gain", Type::Gain)], Type::Float)],
+        // Conversions, named after the type they produce.
+        "Float" => vec![sig(&[("x", t())], Type::Float)],
+        "Int" => vec![sig(&[("x", t())], Type::Int)],
+        "Sample" => vec![sig(&[("x", t())], Type::Sample)],
         _ => Vec::new(),
     }
 }
@@ -133,9 +134,9 @@ pub const FUNCTIONS: &[&str] = &[
     "just",
     "pythagorean",
     "meantone",
-    "f32",
-    "i32",
-    "sample",
+    "Float",
+    "Int",
+    "Sample",
 ];
 
 #[cfg(test)]

@@ -1,14 +1,14 @@
 // Levels: a signal moves up or down with `+` or `-` and a level in dB.
 // The level always comes after the signal.
 
-rill sine(freq: Hz) -> sample {
-    state phase: f32 = 0
+rill sine(freq: Freq) -> Sample {
+    state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return sin(phase * TAU)
 }
 
 // From `from` to `to` over `length`, then holds.
-rill ramp(from: f32, to: f32, length: Time) -> f32 {
+rill ramp(from: Float, to: Float, length: Time) -> Float {
     state elapsed = 0s
     let t = min(elapsed / length, 1)
     if elapsed < length {
@@ -18,7 +18,7 @@ rill ramp(from: f32, to: f32, length: Time) -> f32 {
 }
 
 // `volume` is a live control. Hosts send it as a plain amplitude factor.
-rill main(volume: Gain = -12dB) -> [sample; 2] {
+rill main(volume: Gain = -12dB) -> [Sample; 2] {
     let voice = sine(220Hz)
 
     // Fade in evenly in level, from -60dB to 0dB over four seconds.

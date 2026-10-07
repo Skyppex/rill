@@ -14,7 +14,7 @@ pub enum Op2 {
     Div,
     /// Truncating remainder, like Rust's `%`.
     Rem,
-    /// Division rounded toward zero, for `i32 / i32`.
+    /// Division rounded toward zero, for `Int / Int`.
     IDiv,
     Pow,
     Min,
@@ -47,7 +47,7 @@ pub enum Op1 {
     Round,
     /// Fractional part, in [0, 1).
     Wrap,
-    /// Toward zero, for conversion to `i32`.
+    /// Toward zero, for conversion to `Int`.
     Trunc,
     /// Per-tick multiplier that decays by 60 dB over the given seconds.
     Decay,
@@ -171,7 +171,7 @@ impl Op1 {
             "ceil" => Op1::Ceil,
             "round" => Op1::Round,
             "wrap" => Op1::Wrap,
-            "i32" => Op1::Trunc,
+            "Int" => Op1::Trunc,
             "decay" => Op1::Decay,
             _ => return None,
         })

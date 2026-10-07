@@ -3,7 +3,7 @@
 //! Rules enforced here, beyond plain type agreement:
 //!
 //! - Units never appear or vanish implicitly: `440 + 1Hz` is an error, and
-//!   `Hz / Hz` is a plain number.
+//!   `Freq / Freq` is a plain number.
 //! - A rill taking a scalar can be applied to `[T; N]`; it runs once per
 //!   channel and returns a frame (lifting). A fn or built-in takes exactly
 //!   what it declares and never lifts.
@@ -247,21 +247,24 @@ impl Checker {
     fn resolve_type(&mut self, te: &TypeExpr, generics: &[String]) -> Type {
         match te {
             TypeExpr::Named(id) => match id.name.as_str() {
-                "sample" => Type::Sample,
-                "f32" => Type::F32,
-                "i32" => Type::I32,
-                "bool" => Type::Bool,
-                "Hz" => Type::Hz,
+                "Sample" => Type::Sample,
+                "Float" => Type::Float,
+                "Int" => Type::Int,
+                "Bool" => Type::Bool,
+                "Freq" => Type::Freq,
                 "Pitch" => Type::Pitch,
                 "Time" => Type::Time,
                 "Interval" => Type::Interval,
                 "Gain" => Type::Gain,
                 other => {
                     const KNOWN: [&str; 9] = [
-                        "sample", "f32", "i32", "bool", "Hz", "Pitch", "Time", "Interval", "Gain",
+                        "Sample", "Float", "Int", "Bool", "Freq", "Pitch", "Time", "Interval",
+                        "Gain",
                     ];
                     let mut e = self.error(id.span, format!("unknown type `{other}`"));
-                    if let Some(s) = suggest(other, KNOWN) {
+                    if let Some(help) = renamed_type(other) {
+                        e = e.with_help(help);
+                    } else if let Some(s) = suggest(other, KNOWN) {
                         e = e.with_help(format!("did you mean `{s}`?"));
                     }
                     self.report(e);
@@ -673,7 +676,7 @@ impl Checker {
                 let tc = self.expr(cond);
                 if !coerces(&tc, &Type::Bool) {
                     let mut d =
-                        self.error(cond.span, format!("condition must be `bool`, found `{tc}`"));
+                        self.error(cond.span, format!("condition must be `Bool`, found `{tc}`"));
                     if tc.is_plain() || tc.is_dimensioned() {
                         d = d.with_help("compare it, as in `x > 0`");
                     }
@@ -741,7 +744,7 @@ impl Checker {
             ExprKind::Index(base, index) => {
                 let tb = self.expr(base);
                 let ti = self.expr(index);
-                if !ti.is_wild() && !matches!(ti, Type::I32 | Type::Num) {
+                if !ti.is_wild() && !matches!(ti, Type::Int | Type::Num) {
                     let d = self.error(
                         index.span,
                         format!("channel index must be a whole number, found `{ti}`"),
@@ -845,6 +848,10 @@ impl Checker {
         if sigs.is_empty() {
             self.exprs(args);
             let mut d = self.error(callee.span, format!("unknown fn or rill `{name}`"));
+            if let Some(help) = renamed_conversion(name) {
+                self.report(d.with_help(help));
+                return Type::Error;
+            }
             let candidates = self
                 .def_order
                 .iter()
@@ -1015,7 +1022,7 @@ impl Checker {
                         let help = if kind == DefKind::Fn {
                             format!(
                                 "fns take exactly what they declare; give `{name}` a size parameter, \
-                                 as in `fn {name}<N>(x: [sample; N])`, or make it a rill to run it per channel"
+                                 as in `fn {name}<N>(x: [Sample; N])`, or make it a rill to run it per channel"
                             )
                         } else {
                             "built-in functions take one value; to run one per channel, call it from a \
@@ -1230,7 +1237,7 @@ impl Checker {
                 format!("`{name}` has size parameters, so it cannot be used as a value yet")
             } else {
                 format!(
-                    "`{name}` works on several types; say which one where it goes, as in `let f: fn(sample) -> sample = {name}`"
+                    "`{name}` works on several types; say which one where it goes, as in `let f: fn(Sample) -> Sample = {name}`"
                 )
             };
             let d = self
@@ -1332,7 +1339,7 @@ impl Checker {
             None if diverges => {
                 let d = self
                     .error(e.span, "cannot tell what this fn returns")
-                    .with_help("annotate it, as in `fn(p: Pitch) -> Hz { ... }`");
+                    .with_help("annotate it, as in `fn(p: Pitch) -> Freq { ... }`");
                 self.report(d);
                 Type::Error
             }
@@ -1416,6 +1423,33 @@ impl Checker {
     }
 }
 
+/// Help for a type written with its old name.
+fn renamed_type(name: &str) -> Option<String> {
+    Some(match name {
+        "Hz" => "`Hz` is the unit for literals like `440Hz`; the type is `Freq`".to_owned(),
+        "sample" | "f32" | "i32" | "bool" => {
+            let new = match name {
+                "sample" => "Sample",
+                "f32" => "Float",
+                "i32" => "Int",
+                _ => "Bool",
+            };
+            format!("`{name}` is now called `{new}`")
+        }
+        _ => return None,
+    })
+}
+
+/// Help for a conversion called by its old name.
+fn renamed_conversion(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "sample" => "conversions are named after the types: `Sample(...)`",
+        "f32" => "conversions are named after the types: `Float(...)`",
+        "i32" => "conversions are named after the types: `Int(...)`",
+        _ => return None,
+    })
+}
+
 fn var_word(kind: VarKind) -> &'static str {
     match kind {
         VarKind::Param => "parameter",
@@ -1427,7 +1461,7 @@ fn var_word(kind: VarKind) -> &'static str {
 
 fn describe_param(c: &str) -> &'static str {
     match c {
-        "T" => "a plain number (`sample`, `f32` or `i32`)",
+        "T" => "a plain number (`Sample`, `Float` or `Int`)",
         "S" => "a number",
         _ => "something else",
     }
@@ -1440,7 +1474,7 @@ const PITCH_ARITH_HELP: &str = "a pitch is a position, not an amount: add or sub
 
 fn unit_example(t: &Type) -> &'static str {
     match t {
-        Type::Hz => "440Hz",
+        Type::Freq => "440Hz",
         Type::Time => "300ms",
         _ => "7st",
     }
@@ -1462,10 +1496,10 @@ fn mismatch(span: Span, what: &str, expected: &Type, found: &Type) -> Diagnostic
             unit_example(expected)
         ));
     }
-    if found.is_plain() && *expected == Type::I32 {
-        return d.with_help("convert it with `i32(...)`");
+    if found.is_plain() && *expected == Type::Int {
+        return d.with_help("convert it with `Int(...)`");
     }
-    if *found == Type::I32 && expected.is_plain() {
+    if *found == Type::Int && expected.is_plain() {
         return d.with_help(format!("convert it with `{expected}(...)`"));
     }
     if let (Type::Frame(..), false) = (found, matches!(expected, Type::Frame(..))) {
@@ -1565,7 +1599,7 @@ fn logic(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
     } else {
         Err((
             format!(
-                "`{}` needs `bool` on both sides, found `{a}` and `{b}`",
+                "`{}` needs `Bool` on both sides, found `{a}` and `{b}`",
                 op.symbol()
             ),
             None,
@@ -1603,7 +1637,7 @@ fn compare(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
             unit_example(dim)
         ))
     } else if *a == Type::Bool && *b == Type::Bool {
-        Some("only `==` and `!=` work on `bool`".into())
+        Some("only `==` and `!=` work on `Bool`".into())
     } else {
         None
     };
@@ -1653,8 +1687,8 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
                 "give the number a unit, as in `{}`",
                 unit_example(dim)
             ))
-        } else if (*a == Type::I32 && b.is_plain()) || (*b == Type::I32 && a.is_plain()) {
-            Some("convert the `i32` with `f32(...)` or `sample(...)`".into())
+        } else if (*a == Type::Int && b.is_plain()) || (*b == Type::Int && a.is_plain()) {
+            Some("convert the `Int` with `Float(...)` or `Sample(...)`".into())
         } else if (a.is_plain() && b.is_dimensioned()) || (b.is_plain() && a.is_dimensioned()) {
             let (plain, dim) = if a.is_plain() { (a, b) } else { (b, a) };
             Some(format!(
@@ -1715,14 +1749,14 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
         }
         BinOp::Mul => match (a, b) {
             (d, p) | (p, d) if d.is_dimensioned() && p.is_plain() => Ok(d.clone()),
-            (Type::Hz, Type::Time) | (Type::Time, Type::Hz) => Ok(Type::F32),
+            (Type::Freq, Type::Time) | (Type::Time, Type::Freq) => Ok(Type::Float),
             _ => fail(),
         },
         BinOp::Div => match (a, b) {
             (d, p) if d.is_dimensioned() && p.is_plain() => Ok(d.clone()),
-            (x, y) if x == y => Ok(Type::F32),
-            (p, Type::Hz) if p.is_plain() => Ok(Type::Time),
-            (p, Type::Time) if p.is_plain() => Ok(Type::Hz),
+            (x, y) if x == y => Ok(Type::Float),
+            (p, Type::Freq) if p.is_plain() => Ok(Type::Time),
+            (p, Type::Time) if p.is_plain() => Ok(Type::Freq),
             _ => fail(),
         },
         _ => unreachable!("not an arithmetic operator"),
@@ -1733,7 +1767,7 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
 /// `+` and `-`, the level always on the right; levels combine with `+`/`-`
 /// and scale with `*`/`/` by plain numbers.
 fn gain_arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
-    use Type::{F32, Gain, I32, Num, Sample};
+    use Type::{Float, Gain, Int, Num, Sample};
     let verb = match op {
         BinOp::Add => "add",
         BinOp::Sub => "subtract",
@@ -1748,10 +1782,10 @@ fn gain_arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
         ))
     };
     match (op, a, b) {
-        (BinOp::Add | BinOp::Sub, Num | Sample | F32, Gain) => Ok(a.clone()),
+        (BinOp::Add | BinOp::Sub, Num | Sample | Float, Gain) => Ok(a.clone()),
         (BinOp::Add | BinOp::Sub, Gain, Gain) => Ok(Gain),
-        (BinOp::Add | BinOp::Sub, I32, Gain) => err(Some(
-            "integers have no level; convert with `f32(...)` first",
+        (BinOp::Add | BinOp::Sub, Int, Gain) => err(Some(
+            "integers have no level; convert with `Float(...)` first",
         )),
         (BinOp::Add | BinOp::Sub, Gain, _) => err(Some(
             "the level comes after the signal, as in `voice - 6dB`",
@@ -1759,9 +1793,9 @@ fn gain_arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
         (BinOp::Mul | BinOp::Div, Sample, Gain) | (BinOp::Mul, Gain, Sample) => err(Some(
             "to change a signal's level, add or subtract it, as in `voice - 6dB`",
         )),
-        (BinOp::Mul, Gain, Num | F32 | I32) | (BinOp::Mul, Num | F32 | I32, Gain) => Ok(Gain),
-        (BinOp::Div, Gain, Num | F32 | I32) => Ok(Gain),
-        (BinOp::Div, Gain, Gain) => Ok(F32),
+        (BinOp::Mul, Gain, Num | Float | Int) | (BinOp::Mul, Num | Float | Int, Gain) => Ok(Gain),
+        (BinOp::Div, Gain, Num | Float | Int) => Ok(Gain),
+        (BinOp::Div, Gain, Gain) => Ok(Float),
         _ => err(None),
     }
 }
@@ -1770,7 +1804,7 @@ fn event_field_type(name: &str) -> Option<Type> {
     match name {
         "pitch" => Some(Type::Pitch),
         "velocity" | "release" => Some(Type::Sample),
-        "channel" | "index" => Some(Type::I32),
+        "channel" | "index" => Some(Type::Int),
         _ => None,
     }
 }
@@ -1835,7 +1869,7 @@ pub fn check_entry(
         let help = match suggest(entry, rills.iter().copied()) {
             Some(s) => format!("did you mean `{s}`?"),
             None if rills.is_empty() => {
-                format!("add one, as in `rill {entry}() -> sample {{ return 0 }}`")
+                format!("add one, as in `rill {entry}() -> Sample {{ return 0 }}`")
             }
             None => format!("pick one with `--entry`: {}", rills.join(", ")),
         };
@@ -1875,7 +1909,7 @@ pub fn check_entry(
         errors.push(
             Diagnostic::error(p.name.span, format!("`{}` needs a default value", p.name.name)).with_help(
                 "the entry rill's parameters are the program's controls, so each needs a starting value, \
-                 as in `freq: Hz = 440Hz`",
+                 as in `freq: Freq = 440Hz`",
             ),
         );
     }
@@ -1885,7 +1919,7 @@ pub fn check_entry(
             "the entry rill cannot change the sample rate",
         ));
     }
-    let audio = |t: &Type| matches!(t, Type::Sample | Type::F32 | Type::Num);
+    let audio = |t: &Type| matches!(t, Type::Sample | Type::Float | Type::Num);
     let ok_ret = match &sig.ret {
         Type::Frame(elem, Size::Const(_)) => audio(elem),
         t => audio(t),
@@ -1894,7 +1928,7 @@ pub fn check_entry(
         errors.push(Diagnostic::error(
             def.ret.span(),
             format!(
-                "the entry rill must return audio (`sample` or `[sample; N]`), found `{}`",
+                "the entry rill must return audio (`Sample` or `[Sample; N]`), found `{}`",
                 sig.ret
             ),
         ));

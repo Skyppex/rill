@@ -11,7 +11,7 @@ Design principles:
 - **Streams are first-class.** Every value inside a rill is the current value of a stream; time is implicit.
 - **Block size is invisible.** User code never sees callback boundaries, so output is identical at 32 or 1024 frames per callback.
 - **Expressive at build time, boring at run time.** High-level features resolve before audio starts; the callback runs flat loops with no allocation, locks or syscalls.
-- **Hardware-agnostic numbers.** Programmers think in `sample`; the compiler picks the storage format per target.
+- **Hardware-agnostic numbers.** Programmers think in `Sample`; the compiler picks the storage format per target.
 - **Embeddable like Lua.** A small C/Rust API; the host owns the clock and the audio device.
 
 ## Core concepts
@@ -20,9 +20,9 @@ Design principles:
 
 **Rill.** A stream processor. Its body describes what happens on *one* tick; the compiler runs it across each block. By default a rill is 1:1: exactly one output frame per input frame, checked at compile time.
 
-**`sample`.** A native numeric type the programmer treats as a real number nominally in \[-1.0, 1.0\]. Its storage (f32, i16, i24, i32 fixed-point, u8 on tiny targets) is chosen per target, and conversions happen at I/O. Arithmetic on `sample` behaves the same everywhere, within the precision of the target.
+**`Sample`.** A native numeric type the programmer treats as a real number nominally in \[-1.0, 1.0\]. Its storage (f32, i16, i24, i32 fixed-point, u8 on tiny targets) is chosen per target, and conversions happen at I/O. Arithmetic on `Sample` behaves the same everywhere, within the precision of the target.
 
-**Frame.** One `sample` per channel, written `[sample; N]`. Mono is `[sample; 1]`, 7.1 is `[sample; 8]`. N is part of the type and known at build time.
+**Frame.** One `Sample` per channel, written `[Sample; N]`. Mono is `[Sample; 1]`, 7.1 is `[Sample; 8]`. N is part of the type and known at build time.
 
 **State.** Variables declared with `state` inside a rill persist across ticks and callbacks. Only rills have state, so all memory is visible and preallocated.
 
@@ -34,41 +34,41 @@ Two kinds of definitions: `fn` for pure functions on values, and `rill` for stre
 
 ```
 // Pure function on one value. Takes exactly what it declares.
-fn abs(x: sample) -> sample {
+fn abs(x: Sample) -> Sample {
     if x < 0 { -x } else { x }
 }
 
 // Stateful 1:1 rill. Body runs once per tick.
-rill peak(x: sample, release: Time = 300ms) -> sample {
-    state level: sample = 0
+rill peak(x: Sample, release: Time = 300ms) -> Sample {
+    state level: Sample = 0
     let a = abs(x)
     level = if a > level { a } else { level * decay(release) }
     return level
 }
 
 // Composition with pipes.
-rill meter(x: sample) -> sample {
+rill meter(x: Sample) -> Sample {
     return x |> abs |> peak
 }
 
 // Generic over channel count. Only needed when a rill works ACROSS channels.
-rill mix_down<N>(x: [sample; N]) -> [sample; 1] {
+rill mix_down<N>(x: [Sample; N]) -> [Sample; 1] {
     return [sum(x) / N]
 }
 
 // Rate-changing rill: the ratio is part of the signature.
-rill decimate(x: sample) -> sample @ rate / 2 { ... }
+rill decimate(x: Sample) -> Sample @ rate / 2 { ... }
 
 // Generator: no audio input.
-rill sine(freq: Hz) -> sample {
-    state phase: f32 = 0
+rill sine(freq: Freq) -> Sample {
+    state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return sin(phase * TAU)
 }
 
 // Entry point: its return value goes to the device. Parameters need defaults;
 // they are the program's controls.
-rill main(depth: Hz = 20Hz) -> sample {
+rill main(depth: Freq = 20Hz) -> Sample {
     let lfo   = sine(0.5Hz) * depth + 440Hz
     let voice = sine(lfo) * 0.3
     return voice
@@ -83,18 +83,18 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 
 | Type | Meaning | Notes |
 | --- | --- | --- |
-| `sample` | One audio value, nominally \[-1.0, 1.0\] | Storage chosen per target |
-| `[sample; N]` | A frame of N channels | N is a compile-time constant |
-| `f32`, `i32`, `bool` | Plain values for control logic | Not converted at I/O |
-| `Hz`, `Time` | Unit-carrying numbers | Convert to samples via the host rate |
-| `Pitch`, `Interval` | Abstract musical values | Turned into `Hz` by a tuning (see Pitch) |
+| `Sample` | One audio value, nominally \[-1.0, 1.0\] | Storage chosen per target |
+| `[Sample; N]` | A frame of N channels | N is a compile-time constant |
+| `Float`, `Int`, `Bool` | Plain values for control logic | Not converted at I/O |
+| `Freq`, `Time` | Unit-carrying numbers | Convert to samples via the host rate |
+| `Pitch`, `Interval` | Abstract musical values | Turned into `Freq` by a tuning (see Pitch) |
 | `Gain` | A level change, written in `dB` | Any plain number is an amplitude factor (see Levels) |
 | `fn(A, B) -> R` | A function value | See Functions as values |
 
 Lifting rules:
 
-1. A `fn` takes exactly what it declares and never lifts. It is called from bodies, where values are already per tick; to accept channels it says so with a size parameter (`fn f<N>(x: [sample; N])`). Built-in functions follow the same rule.
-2. A rill taking `sample` can be applied to `[sample; N]`; it runs N independent copies, each with its own state. Every rill call is its own instance; `let` binds a value, so a bound result used twice is one instance.
+1. A `fn` takes exactly what it declares and never lifts. It is called from bodies, where values are already per tick; to accept channels it says so with a size parameter (`fn f<N>(x: [Sample; N])`). Built-in functions follow the same rule.
+2. A rill taking `Sample` can be applied to `[Sample; N]`; it runs N independent copies, each with its own state. Every rill call is its own instance; `let` binds a value, so a bound result used twice is one instance.
 3. A constant can be passed wherever a stream of the same type is expected.
 4. Operators on frames are element-wise; `sum`, `max` and similar reduce across channels.
 
@@ -104,11 +104,11 @@ Rate rules:
 2. Every path through a 1:1 rill must `return` exactly once per tick; the compiler rejects anything else.
 3. Any cycle in the graph must pass through a delay of at least one sample.
 
-Optional channel layouts name positions without changing the type: `type Surround71 = [sample; 8] layout(L, R, C, LFE, Ls, Rs, Lb, Rb)` lets code write `x.lfe`.
+Optional channel layouts name positions without changing the type: `type Surround71 = [Sample; 8] layout(L, R, C, LFE, Ls, Rs, Lb, Rb)` lets code write `x.lfe`.
 
 ## Pitch and tuning
 
-A note name is an abstract `Pitch`, not a frequency; it becomes `Hz` only when it goes through a tuning. A tuning is an ordinary function from `Pitch` to `Hz`. Raw `Hz` literals bypass tuning entirely.
+A note name is an abstract `Pitch`, not a frequency; it becomes `Freq` only when it goes through a tuning. A tuning is an ordinary function from `Pitch` to `Freq`. Raw `Hz` literals bypass tuning entirely.
 
 ```
 E4 |> equal(24, a4: 432Hz) |> sine      // quarter tones, A4 at 432Hz
@@ -116,24 +116,24 @@ E4 |> just(C) |> sine                   // just intonation on C
 (E4 + 4st) |> equal |> sine             // Pitch + Interval -> Pitch
 sum([E4, F#4, B4] |> equal |> sine)     // a chord: three voices, mixed
 
-let tuning = fn(p: Pitch) -> Hz { pythagorean(p, D) }   // pick one, pass it around
+let tuning = fn(p: Pitch) -> Freq { pythagorean(p, D) }   // pick one, pass it around
 ```
 
 The built-in tunings take the pitch first, so pipes read naturally:
 
 ```
-equal(pitch: Pitch, steps: i32 = 12, a4: Hz = 440Hz) -> Hz
-just(pitch: Pitch, root: Pitch, a4: Hz = 440Hz) -> Hz
-pythagorean(pitch: Pitch, root: Pitch, a4: Hz = 440Hz) -> Hz
-meantone(pitch: Pitch, root: Pitch, a4: Hz = 440Hz) -> Hz
+equal(pitch: Pitch, steps: Int = 12, a4: Freq = 440Hz) -> Freq
+just(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) -> Freq
+pythagorean(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) -> Freq
+meantone(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) -> Freq
 ```
 
 Rules:
 
 - A `Pitch` is a position, not an amount: `Pitch ± Interval` gives a `Pitch` (the interval always comes after) and `Pitch - Pitch` gives the `Interval` between them. Pitches can be compared, but not scaled or added together.
 - `equal` places note names on the nearest of `steps` equal divisions of the octave. The scale tunings build twelve notes from ratios above their root and put A4 exactly on `a4`. In every tuning, fractions of a semitone (cents, bends) stay continuous.
-- A tuning's settings are ordinary arguments, so they can change while playing (`a4` from a live control, say). Your own tuning is any `fn(Pitch) -> Hz`.
-- Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Hz` and mixing on streams. The built-in tunings accept a chord and tune each pitch; passing the result to a rill that takes `Hz` lifts it to one voice per pitch.
+- A tuning's settings are ordinary arguments, so they can change while playing (`a4` from a live control, say). Your own tuning is any `fn(Pitch) -> Freq`.
+- Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Freq` and mixing on streams. The built-in tunings accept a chord and tune each pitch; passing the result to a rill that takes `Freq` lifts it to one voice per pitch.
 - When every input is known at build time, tuning constant-folds to a number. Otherwise it is evaluated per tick.
 - Note events carry `pitch` as a `Pitch` and `velocity` in 0–1. Velocity is linear; a curve such as `velocity * velocity` sounds more even, since a straight line is too loud at soft velocities.
 
@@ -151,7 +151,7 @@ level(peak(voice)) < -20dB      // level of an amplitude, for meters and dynamic
 
 Rules:
 
-- `x ± Gain` scales `x` by `10^(±dB/20)`, per channel on frames. `Gain ± x` is an error (the level comes after), and so is multiplying or dividing a signal (`sample`) by a `Gain`: levels are added or subtracted.
+- `x ± Gain` scales `x` by `10^(±dB/20)`, per channel on frames. `Gain ± x` is an error (the level comes after), and so is multiplying or dividing a signal (`Sample`) by a `Gain`: levels are added or subtracted.
 - Levels combine with `+`/`-`, scale with `*`/`/` by plain numbers (half of `-6dB` is `-3dB`), and compare with each other. `Gain / Gain` is a plain ratio.
 - A `Gain` is stored as an amplitude factor (`-6dB` is about 0.5), so any plain number can be passed where a `Gain` is expected: `0.5` means about -6dB. Hosts send `Gain` controls the same way. Inside an expression nothing converts: `voice - 0.5` is ordinary subtraction.
 - `level(x)` is the level of an amplitude (`level(1)` is 0dB; silence is held at -120dB instead of -inf). `amp(g)` is the amplitude factor of a level.
@@ -161,9 +161,9 @@ Rules:
 Fns are values: they can be bound with `let`, passed to fns and rills, returned from fns, and chosen while playing. Anonymous fns use the named syntax without the name.
 
 ```
-fn a432(p: Pitch) -> Hz { 432Hz * pow(2, (p - A4) / 12st) }
+fn a432(p: Pitch) -> Freq { 432Hz * pow(2, (p - A4) / 12st) }
 
-rill voice(pitch: Pitch, tune: fn(Pitch) -> Hz) -> sample {
+rill voice(pitch: Pitch, tune: fn(Pitch) -> Freq) -> Sample {
     return pitch |> tune |> sine
 }
 

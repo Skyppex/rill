@@ -456,7 +456,7 @@ mod tests {
     fn operators_keywords_and_comments() {
         use TokenKind::*;
         assert_eq!(
-            kinds("rill f(x) -> sample { x |> g /* c /* nested */ */ } // end\n a != b || !c"),
+            kinds("rill f(x) -> Sample { x |> g /* c /* nested */ */ } // end\n a != b || !c"),
             vec![
                 Rill, Ident, LParen, Ident, RParen, Arrow, Ident, LBrace, Ident, Pipe, Ident,
                 RBrace, Ident, Ne, Ident, OrOr, Bang, Ident, Eof
@@ -487,6 +487,13 @@ mod tests {
             "unterminated block comment"
         );
         assert_eq!(lex("é").unwrap_err().span, Span::new(0, 2));
+    }
+
+    #[test]
+    fn decibel_typo_suggests_the_unit() {
+        let e = lex("let g = 6db").unwrap_err();
+        assert_eq!(e.message, "unknown unit `db`");
+        assert_eq!(e.help.as_deref(), Some("did you mean `dB`?"));
     }
 
     #[test]

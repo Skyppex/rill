@@ -11,10 +11,10 @@ use super::lexer::Dimension;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
     Sample,
-    F32,
-    I32,
+    Float,
+    Int,
     Bool,
-    Hz,
+    Freq,
     Pitch,
     Time,
     Interval,
@@ -23,8 +23,8 @@ pub enum Type {
     Gain,
     /// Dynamically shaped payload passed to an `on event(...)` handler.
     Event,
-    /// An unsuffixed number literal not yet pinned to `sample`, `f32` or
-    /// `i32`. It becomes whichever plain numeric type it meets.
+    /// An unsuffixed number literal not yet pinned to `Sample`, `Float` or
+    /// `Int`. It becomes whichever plain numeric type it meets.
     Num,
     /// `[elem; size]`. `elem` is always a scalar.
     Frame(Box<Type>, Size),
@@ -60,11 +60,11 @@ impl fmt::Display for Size {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Type::Sample => f.write_str("sample"),
-            Type::F32 => f.write_str("f32"),
-            Type::I32 => f.write_str("i32"),
-            Type::Bool => f.write_str("bool"),
-            Type::Hz => f.write_str("Hz"),
+            Type::Sample => f.write_str("Sample"),
+            Type::Float => f.write_str("Float"),
+            Type::Int => f.write_str("Int"),
+            Type::Bool => f.write_str("Bool"),
+            Type::Freq => f.write_str("Freq"),
             Type::Pitch => f.write_str("Pitch"),
             Type::Time => f.write_str("Time"),
             Type::Interval => f.write_str("Interval"),
@@ -93,7 +93,7 @@ impl fmt::Display for Type {
 impl Type {
     pub fn from_dimension(d: Dimension) -> Type {
         match d {
-            Dimension::Frequency => Type::Hz,
+            Dimension::Frequency => Type::Freq,
             Dimension::Time => Type::Time,
             Dimension::Interval => Type::Interval,
             Dimension::Level => Type::Gain,
@@ -102,14 +102,14 @@ impl Type {
 
     /// Dimensionless numbers that mix freely with each other.
     pub fn is_plain(&self) -> bool {
-        matches!(self, Type::Num | Type::Sample | Type::F32 | Type::I32)
+        matches!(self, Type::Num | Type::Sample | Type::Float | Type::Int)
     }
 
     /// Numbers that carry a unit. These scale and add like amounts.
     /// `Pitch` is not one of them: it is a position, so only intervals can be
     /// added to it.
     pub fn is_dimensioned(&self) -> bool {
-        matches!(self, Type::Hz | Type::Time | Type::Interval)
+        matches!(self, Type::Freq | Type::Time | Type::Interval)
     }
 
     /// Values that can be compared, ordered and put in a frame.
@@ -127,7 +127,7 @@ impl Type {
         matches!(self, Type::Error | Type::Never)
     }
 
-    /// What an unconstrained binding settles on: literals become `sample`.
+    /// What an unconstrained binding settles on: literals become `Sample`.
     pub fn settle(self) -> Type {
         match self {
             Type::Num => Type::Sample,
@@ -139,17 +139,17 @@ impl Type {
 
 /// Can a value of type `from` be used where `to` is expected?
 ///
-/// `sample` and `f32` convert both ways, and an unsuffixed literal becomes
+/// `Sample` and `Float` convert both ways, and an unsuffixed literal becomes
 /// any plain number. Units never appear or disappear implicitly.
 pub fn coerces(from: &Type, to: &Type) -> bool {
     if from == to || from.is_wild() || to.is_wild() {
         return true;
     }
     match (from, to) {
-        (Type::Num, Type::Sample | Type::F32 | Type::I32) => true,
-        (Type::F32, Type::Sample) | (Type::Sample, Type::F32) => true,
+        (Type::Num, Type::Sample | Type::Float | Type::Int) => true,
+        (Type::Float, Type::Sample) | (Type::Sample, Type::Float) => true,
         // A plain number is an amplitude factor, which is what a gain is.
-        (Type::Num | Type::Sample | Type::F32, Type::Gain) => true,
+        (Type::Num | Type::Sample | Type::Float, Type::Gain) => true,
         (Type::Frame(a, n), Type::Frame(b, m)) => n == m && coerces(a, b),
         // A function fits where it can be called the same way: it accepts
         // what the expected type passes, and returns what it promises.
@@ -171,7 +171,7 @@ pub fn join(a: &Type, b: &Type) -> Option<Type> {
         (Type::Never, t) | (t, Type::Never) => Some(t.clone()),
         (Type::Num, t) | (t, Type::Num) if t.is_plain() => Some(t.clone()),
         (Type::Num, Type::Gain) | (Type::Gain, Type::Num) => Some(Type::Gain),
-        (Type::Sample, Type::F32) | (Type::F32, Type::Sample) => Some(Type::Sample),
+        (Type::Sample, Type::Float) | (Type::Float, Type::Sample) => Some(Type::Sample),
         (Type::Frame(x, n), Type::Frame(y, m)) if n == m => {
             Some(Type::Frame(Box::new(join(x, y)?), n.clone()))
         }
@@ -251,12 +251,12 @@ mod tests {
     #[test]
     fn coercion() {
         assert!(coerces(&Type::Num, &Type::Sample));
-        assert!(coerces(&Type::F32, &Type::Sample));
-        assert!(coerces(&Type::Sample, &Type::F32));
-        assert!(!coerces(&Type::Num, &Type::Hz));
-        assert!(!coerces(&Type::Sample, &Type::Hz));
-        assert!(!coerces(&Type::Hz, &Type::Time));
-        assert!(!coerces(&Type::Sample, &Type::I32));
+        assert!(coerces(&Type::Float, &Type::Sample));
+        assert!(coerces(&Type::Sample, &Type::Float));
+        assert!(!coerces(&Type::Num, &Type::Freq));
+        assert!(!coerces(&Type::Sample, &Type::Freq));
+        assert!(!coerces(&Type::Freq, &Type::Time));
+        assert!(!coerces(&Type::Sample, &Type::Int));
         assert!(coerces(&frame(Type::Num, 2), &frame(Type::Sample, 2)));
         assert!(!coerces(&frame(Type::Sample, 2), &frame(Type::Sample, 3)));
         assert!(!coerces(&Type::Sample, &frame(Type::Sample, 1)));
@@ -264,19 +264,19 @@ mod tests {
 
     #[test]
     fn joining() {
-        assert_eq!(join(&Type::Num, &Type::F32), Some(Type::F32));
-        assert_eq!(join(&Type::F32, &Type::Sample), Some(Type::Sample));
-        assert_eq!(join(&Type::I32, &Type::Sample), None);
-        assert_eq!(join(&Type::Never, &Type::Hz), Some(Type::Hz));
-        assert_eq!(join(&Type::Hz, &Type::Sample), None);
+        assert_eq!(join(&Type::Num, &Type::Float), Some(Type::Float));
+        assert_eq!(join(&Type::Float, &Type::Sample), Some(Type::Sample));
+        assert_eq!(join(&Type::Int, &Type::Sample), None);
+        assert_eq!(join(&Type::Never, &Type::Freq), Some(Type::Freq));
+        assert_eq!(join(&Type::Freq, &Type::Sample), None);
     }
 
     #[test]
     fn display() {
-        assert_eq!(frame(Type::Sample, 8).to_string(), "[sample; 8]");
+        assert_eq!(frame(Type::Sample, 8).to_string(), "[Sample; 8]");
         assert_eq!(
             Type::Frame(Box::new(Type::Sample), Size::Var("N".into())).to_string(),
-            "[sample; N]"
+            "[Sample; N]"
         );
     }
 }

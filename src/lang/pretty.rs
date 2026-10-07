@@ -1,12 +1,12 @@
 //! Tree view of a checked program, for `rill check ast`.
 //!
 //! ```text
-//! rill peak -> sample
-//! ├─ param x: sample
+//! rill peak -> Sample
+//! ├─ param x: Sample
 //! ├─ param release: Time
 //! │  └─ 300ms : Time
 //! └─ body
-//!    ├─ state level: sample
+//!    ├─ state level: Sample
 //!    │  └─ 0 : number
 //!    ...
 //! ```
@@ -391,12 +391,12 @@ mod tests {
     use super::*;
 
     const SRC: &str = "\
-rill peak(x: sample, release: Time = 300ms) -> sample {
-    state level: sample = 0
+rill peak(x: Sample, release: Time = 300ms) -> Sample {
+    state level: Sample = 0
     level = if abs(x) > level { abs(x) } else { level * decay(release) }
     return level
 }
-rill main() -> sample {
+rill main() -> Sample {
     let y = [0.5, 1] |> peak(release: 10ms)
     return y[0]
 }
@@ -406,44 +406,66 @@ rill main() -> sample {
     fn renders_a_typed_tree() {
         let (program, checked) = crate::lang::compile(SRC).unwrap();
         let expected = "\
-rill peak -> sample
-├─ param x: sample
+rill peak -> Sample
+├─ param x: Sample
 ├─ param release: Time
 │  └─ 300ms : Time
 └─ body
-   ├─ state level: sample
+   ├─ state level: Sample
    │  └─ 0 : number
    ├─ assign level
-   │  └─ if : sample
+   │  └─ if : Sample
    │     ├─ cond
-   │     │  └─ binary > : bool
-   │     │     ├─ call abs : sample
-   │     │     │  └─ x : sample
-   │     │     └─ level : sample
+   │     │  └─ binary > : Bool
+   │     │     ├─ call abs : Sample
+   │     │     │  └─ x : Sample
+   │     │     └─ level : Sample
    │     ├─ then
-   │     │  └─ call abs : sample
-   │     │     └─ x : sample
+   │     │  └─ call abs : Sample
+   │     │     └─ x : Sample
    │     └─ else
-   │        └─ binary * : sample
-   │           ├─ level : sample
-   │           └─ call decay : sample
+   │        └─ binary * : Sample
+   │           ├─ level : Sample
+   │           └─ call decay : Sample
    │              └─ release : Time
    └─ return
-      └─ level : sample
+      └─ level : Sample
 
-rill main -> sample
+rill main -> Sample
 └─ body
    ├─ let y
-   │  └─ call peak (piped) : [sample; 2]
+   │  └─ call peak (piped) : [Sample; 2]
    │     ├─ frame : [number; 2]
    │     │  ├─ 0.5 : number
    │     │  └─ 1 : number
    │     └─ release: 10ms : Time
    └─ return
-      └─ index : sample
-         ├─ y : [sample; 2]
+      └─ index : Sample
+         ├─ y : [Sample; 2]
          └─ 0 : number
 ";
         assert_eq!(tree(SRC, &program, &checked, false), expected);
+    }
+
+    #[test]
+    fn anonymous_fns_show_their_checked_types() {
+        // `p` has no type in the source; the tree shows the one it was given.
+        let src = "
+rill main() -> Sample {
+    let f: fn(Pitch) -> Freq = fn(p) { equal(p) }
+    return (A4 |> f) / 1kHz
+}
+";
+        let (program, checked) = crate::lang::compile(src).unwrap();
+        let out = tree(src, &program, &checked, false);
+        let expected = "\
+   ├─ let f: fn(Pitch) -> Freq
+   │  └─ fn : fn(Pitch) -> Freq
+   │     ├─ param p: Pitch
+   │     └─ body
+   │        └─ call equal : Freq
+   │           └─ p : Pitch
+";
+        assert!(out.contains(expected), "{out}");
     }
 }

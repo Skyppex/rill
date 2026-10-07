@@ -1,6 +1,8 @@
 {pkgs, ...}: {
   imports = [
     ./tree-sitter-rill/devenv.nix
+    ./wader/devenv.nix
+    ./flume/devenv.nix
   ];
 
   # https://devenv.sh/packages/

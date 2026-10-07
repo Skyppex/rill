@@ -18,11 +18,12 @@ use super::types::{Signature, Size, Type};
 use super::vm::{Code, EventBinding, EventCode, Instr, Operand, Tuning};
 use crate::ops::{Op1, Op2};
 
-/// A compile-time value: one operand per channel.
+/// A compile-time value: one operand per channel. Frames nest, so a frame's
+/// elements are values themselves.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CVal {
     Scalar(Operand),
-    Frame(Vec<Operand>),
+    Frame(Vec<CVal>),
     Event(Vec<(String, Operand)>),
     Fn(FnVal),
 }
@@ -51,36 +52,69 @@ impl CVal {
         CVal::Frame(Vec::new())
     }
 
-    pub fn operands(&self) -> &[Operand] {
+    /// A flat frame of scalars.
+    pub fn flat_frame(ops: Vec<Operand>) -> CVal {
+        CVal::Frame(ops.into_iter().map(CVal::Scalar).collect())
+    }
+
+    /// Every operand, channels of nested frames in order.
+    pub fn operands(&self) -> Vec<Operand> {
+        let mut out = Vec::new();
+        self.collect_operands(&mut out);
+        out
+    }
+
+    fn collect_operands(&self, out: &mut Vec<Operand>) {
         match self {
-            CVal::Scalar(o) => std::slice::from_ref(o),
-            CVal::Frame(os) => os,
-            CVal::Event(_) | CVal::Fn(_) => &[],
+            CVal::Scalar(o) => out.push(*o),
+            CVal::Frame(xs) => xs.iter().for_each(|x| x.collect_operands(out)),
+            CVal::Event(fields) => out.extend(fields.iter().map(|(_, o)| *o)),
+            CVal::Fn(_) => {}
         }
     }
 
     fn scalar(&self) -> Operand {
         match self {
             CVal::Scalar(o) => *o,
-            CVal::Frame(os) => os[0],
+            CVal::Frame(xs) => xs.first().map_or(Operand::Const(0.0), CVal::scalar),
             CVal::Event(_) | CVal::Fn(_) => Operand::Const(0.0),
         }
     }
 
-    /// Same shape as `self`, with new operands.
+    /// Same shape as `self`, with new operands in [`CVal::operands`] order.
     fn reshape(&self, ops: Vec<Operand>) -> CVal {
+        self.reshape_from(&mut ops.into_iter())
+    }
+
+    fn reshape_from(&self, ops: &mut impl Iterator<Item = Operand>) -> CVal {
+        let mut next = || ops.next().expect("as many operands as the shape has");
         match self {
-            CVal::Scalar(_) => CVal::Scalar(ops[0]),
-            CVal::Frame(_) => CVal::Frame(ops),
+            CVal::Scalar(_) => CVal::Scalar(next()),
+            CVal::Frame(xs) => CVal::Frame(xs.iter().map(|x| x.reshape_from(ops)).collect()),
             CVal::Event(fields) => CVal::Event(
                 fields
                     .iter()
-                    .zip(ops)
-                    .map(|((name, _), op)| (name.clone(), op))
+                    .map(|(name, _)| (name.clone(), ops.next().expect("one per field")))
                     .collect(),
             ),
             CVal::Fn(f) => CVal::Fn(f.clone()),
         }
+    }
+
+    /// How many frame layers wrap the scalars.
+    fn depth(&self) -> usize {
+        match self {
+            CVal::Frame(xs) => 1 + xs.first().map_or(0, CVal::depth),
+            _ => 0,
+        }
+    }
+}
+
+/// How many frame layers a type has.
+fn type_depth(t: &Type) -> usize {
+    match t {
+        Type::Frame(elem, _) => 1 + type_depth(elem),
+        _ => 0,
     }
 }
 
@@ -230,7 +264,7 @@ pub fn compile_instance(
                     input_regs.push(r);
                     ops.push(Operand::Reg(r));
                 }
-                CVal::Frame(ops)
+                CVal::flat_frame(ops)
             }
         });
     }
@@ -239,7 +273,7 @@ pub fn compile_instance(
         instrs: c.code,
         regs: c.regs as usize,
         input_regs,
-        output: out.operands().to_vec(),
+        output: out.operands(),
         state_init: c.state_init,
         events: c.events,
     })
@@ -387,38 +421,70 @@ impl Compiler<'_> {
         Ok(Operand::Reg(dst))
     }
 
-    /// Element-wise `op`, broadcasting a scalar over a frame.
+    /// Element-wise `op`. Two frames pair up element by element; a value
+    /// with fewer layers applies to every element of the other, so it lines
+    /// up with the outer layers.
     fn zip2(&mut self, op: Op2, a: &CVal, b: &CVal) -> CResult<CVal> {
-        let (ao, bo) = (a.operands(), b.operands());
-        let n = ao.len().max(bo.len());
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let x = ao[if ao.len() == 1 { 0 } else { i }];
-            let y = bo[if bo.len() == 1 { 0 } else { i }];
-            out.push(self.op2(op, x, y)?);
+        match (a, b) {
+            (CVal::Frame(xs), CVal::Frame(ys)) => {
+                if xs.len() != ys.len() {
+                    return Err(internal(self.span, "frames of different sizes reached an operator"));
+                }
+                let mut out = Vec::with_capacity(xs.len());
+                for (x, y) in xs.iter().zip(ys) {
+                    out.push(self.zip2(op, x, y)?);
+                }
+                Ok(CVal::Frame(out))
+            }
+            (CVal::Frame(xs), _) => {
+                let mut out = Vec::with_capacity(xs.len());
+                for x in xs {
+                    out.push(self.zip2(op, x, b)?);
+                }
+                Ok(CVal::Frame(out))
+            }
+            (_, CVal::Frame(ys)) => {
+                let mut out = Vec::with_capacity(ys.len());
+                for y in ys {
+                    out.push(self.zip2(op, a, y)?);
+                }
+                Ok(CVal::Frame(out))
+            }
+            _ => Ok(CVal::Scalar(self.op2(op, a.scalar(), b.scalar())?)),
         }
-        Ok(match (a, b) {
-            (CVal::Scalar(_), CVal::Scalar(_)) => CVal::Scalar(out[0]),
-            _ => CVal::Frame(out),
-        })
     }
 
     fn map1(&mut self, op: Op1, x: &CVal) -> CResult<CVal> {
+        self.map_operands(x, |s, o| s.op1(op, o))
+    }
+
+    /// Apply `f` to every operand of `x`, keeping its shape.
+    fn map_operands(
+        &mut self,
+        x: &CVal,
+        mut f: impl FnMut(&mut Self, Operand) -> CResult<Operand>,
+    ) -> CResult<CVal> {
         let mut out = Vec::new();
-        for &o in x.operands() {
-            out.push(self.op1(op, o)?);
+        for o in x.operands() {
+            out.push(f(self, o)?);
         }
         Ok(x.reshape(out))
     }
 
-    /// Fold a frame with `op`.
+    /// Fold the outer layer of a frame with `op`. For a nested frame that
+    /// combines the inner frames element by element.
     fn reduce(&mut self, op: Op2, x: &CVal) -> CResult<CVal> {
-        let ops = x.operands();
-        let mut acc = ops[0];
-        for &o in &ops[1..] {
-            acc = self.op2(op, acc, o)?;
+        let CVal::Frame(xs) = x else {
+            return Ok(x.clone());
+        };
+        let Some((first, rest)) = xs.split_first() else {
+            return Err(internal(self.span, "reducing an empty frame"));
+        };
+        let mut acc = first.clone();
+        for x in rest {
+            acc = self.zip2(op, &acc, x)?;
         }
-        Ok(CVal::Scalar(acc))
+        Ok(acc)
     }
 
     /// Copy `v` into fresh registers if it reads any `state`, so later
@@ -432,7 +498,7 @@ impl Compiler<'_> {
             return Ok(v);
         }
         let mut out = Vec::new();
-        for &o in v.operands() {
+        for o in v.operands() {
             match o {
                 Operand::Reg(r) if self.state_regs.contains(&r) => {
                     let dst = self.reg()?;
@@ -473,8 +539,8 @@ impl Compiler<'_> {
             }
             *slot = Some(v.reshape(regs));
         }
-        let dsts = slot.as_ref().unwrap().operands().to_vec();
-        for (d, &src) in dsts.iter().zip(v.operands()) {
+        let dsts = slot.as_ref().unwrap().operands();
+        for (d, src) in dsts.iter().zip(v.operands()) {
             let Operand::Reg(dst) = *d else {
                 unreachable!()
             };
@@ -488,6 +554,19 @@ impl Compiler<'_> {
             .last_mut()
             .expect("a scope is open")
             .insert(name.to_owned(), Binding { val, mutable });
+    }
+
+    /// Bind the size parameters in `ty` (such as `N` in `[Sample; N]`) to
+    /// the sizes of `val`.
+    fn bind_sizes(&mut self, ty: &Type, val: &CVal) {
+        if let (Type::Frame(elem, size), CVal::Frame(xs)) = (ty, val) {
+            if let Size::Var(v) = size {
+                self.bind(v, CVal::Scalar(Operand::Const(xs.len() as f32)), false);
+            }
+            if let Some(x) = xs.first() {
+                self.bind_sizes(elem, x);
+            }
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<&Binding> {
@@ -510,9 +589,7 @@ impl Compiler<'_> {
         let saved_span = std::mem::replace(&mut self.span, def.name.span);
 
         for (p, a) in sig.params.iter().zip(&args) {
-            if let (Type::Frame(_, Size::Var(v)), CVal::Frame(ops)) = (&p.ty, a) {
-                self.bind(v, CVal::Scalar(Operand::Const(ops.len() as f32)), false);
-            }
+            self.bind_sizes(&p.ty, a);
         }
         for (p, a) in sig.params.iter().zip(args) {
             self.bind(&p.name, a, sig.kind == super::types::DefKind::Rill);
@@ -604,7 +681,7 @@ impl Compiler<'_> {
             Stmt::State { name, init, .. } => {
                 let v = self.expr(init)?;
                 let mut regs = Vec::new();
-                for &o in v.operands() {
+                for o in v.operands() {
                     let Operand::Const(c) = o else {
                         return Err(Diagnostic::error(
                             init.span,
@@ -625,10 +702,10 @@ impl Compiler<'_> {
                 // Detach first so `s = [s[1], s[0]]` reads the old values.
                 let v = self.detach(v)?;
                 let dsts = match self.lookup(&target.name) {
-                    Some(b) if b.mutable => b.val.operands().to_vec(),
+                    Some(b) if b.mutable => b.val.operands(),
                     _ => return Err(internal(target.span, "assignment to a non-state name")),
                 };
-                for (d, &src) in dsts.iter().zip(v.operands()) {
+                for (d, src) in dsts.iter().zip(v.operands()) {
                     if let Operand::Reg(dst) = *d {
                         self.emit(Instr::Copy { dst, src });
                     }
@@ -722,38 +799,44 @@ impl Compiler<'_> {
             ExprKind::If { cond, then, els } => self.if_expr(e, cond, then, els.as_deref()),
             ExprKind::Block(b) => Ok(self.block(b)?.0.unwrap_or_else(CVal::unit)),
             ExprKind::Frame(elems) => {
-                let mut ops = Vec::new();
+                let mut xs = Vec::new();
                 for el in elems {
-                    ops.push(self.expr(el)?.scalar());
+                    xs.push(self.expr(el)?);
                 }
-                Ok(CVal::Frame(ops))
+                Ok(CVal::Frame(xs))
             }
             ExprKind::Index(base, index) => {
                 let b = self.expr(base)?;
                 let i = self.expr(index)?.scalar();
-                let ops = b.operands().to_vec();
+                let CVal::Frame(xs) = b else {
+                    return Err(internal(base.span, "indexing a non-frame value"));
+                };
                 if let Operand::Const(i) = i {
-                    return ops
-                        .get(i as usize)
-                        .map(|&o| CVal::Scalar(o))
-                        .ok_or_else(|| {
-                            Diagnostic::error(index.span, format!("channel {i} is out of range"))
-                        });
-                }
-                // Unknown index: pick with a chain of selects. Out of range
-                // reads channel 0.
-                let dst = self.reg()?;
-                self.emit(Instr::Copy { dst, src: ops[0] });
-                for (c, &o) in ops.iter().enumerate().skip(1) {
-                    let hit = self.op2(Op2::Eq, i, Operand::Const(c as f32))?;
-                    self.emit(Instr::Select {
-                        dst,
-                        cond: hit,
-                        a: o,
-                        b: Operand::Reg(dst),
+                    return xs.get(i as usize).cloned().ok_or_else(|| {
+                        Diagnostic::error(index.span, format!("channel {i} is out of range"))
                     });
                 }
-                Ok(CVal::Scalar(Operand::Reg(dst)))
+                // Unknown index: pick with a chain of selects, one per
+                // channel of the element. Out of range reads element 0.
+                let mut result = None;
+                self.copy_into(&mut result, &xs[0])?;
+                let result = result.expect("copied above");
+                let dsts = result.operands();
+                for (c, x) in xs.iter().enumerate().skip(1) {
+                    let hit = self.op2(Op2::Eq, i, Operand::Const(c as f32))?;
+                    for (d, o) in dsts.iter().zip(x.operands()) {
+                        let Operand::Reg(dst) = *d else {
+                            unreachable!("copy_into allocates registers")
+                        };
+                        self.emit(Instr::Select {
+                            dst,
+                            cond: hit,
+                            a: o,
+                            b: *d,
+                        });
+                    }
+                }
+                Ok(result)
             }
             ExprKind::Field(base, field) => {
                 let CVal::Event(fields) = self.expr(base)? else {
@@ -938,8 +1021,8 @@ impl Compiler<'_> {
     ) -> CResult<Vec<CVal>> {
         let saved = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
         for (p, v) in sig.params.iter().zip(&vals) {
-            if let (Type::Frame(_, Size::Var(n)), Some(CVal::Frame(ops))) = (&p.ty, v) {
-                self.bind(n, CVal::Scalar(Operand::Const(ops.len() as f32)), false);
+            if let Some(v) = v {
+                self.bind_sizes(&p.ty, v);
             }
         }
         let mut filled = Vec::new();
@@ -1071,31 +1154,49 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// Inline `def`, once per channel if a scalar parameter got a frame.
+    /// Inline `def`, once per element if arguments have more frame layers
+    /// than their parameters (lifting). The checker made sure every lifted
+    /// argument has the same extra layers.
     fn call_lifted(&mut self, def: &Def, sig: &Signature, args: Vec<CVal>) -> CResult<CVal> {
-        let lift = sig
+        let extra: Vec<usize> = sig
             .params
             .iter()
             .zip(&args)
-            .find_map(|(p, a)| match (a, &p.ty) {
-                (CVal::Frame(ops), t) if !matches!(t, Type::Frame(..)) => Some(ops.len()),
-                _ => None,
-            });
-        let Some(n) = lift else {
-            return self.inline(def, sig, args);
+            .map(|(p, a)| match a {
+                CVal::Frame(_) => a.depth().saturating_sub(type_depth(&p.ty)),
+                _ => 0,
+            })
+            .collect();
+        self.lift(&extra, &args, &mut |s, args| s.inline(def, sig, args))
+    }
+
+    /// Run `f` once per element of the extra layers of `args`, `extra[i]`
+    /// layers for argument `i`, and collect the results in those layers.
+    fn lift(
+        &mut self,
+        extra: &[usize],
+        args: &[CVal],
+        f: &mut dyn FnMut(&mut Self, Vec<CVal>) -> CResult<CVal>,
+    ) -> CResult<CVal> {
+        let n = extra.iter().zip(args).find_map(|(&e, a)| match a {
+            CVal::Frame(xs) if e > 0 => Some(xs.len()),
+            _ => None,
+        });
+        let Some(n) = n else {
+            return f(self, args.to_vec());
         };
-        let mut out = Vec::new();
+        let inner: Vec<usize> = extra.iter().map(|&e| e.saturating_sub(1)).collect();
+        let mut out = Vec::with_capacity(n);
         for c in 0..n {
-            let per_channel = sig
-                .params
+            let per_element: Vec<CVal> = extra
                 .iter()
-                .zip(&args)
-                .map(|(p, a)| match (a, &p.ty) {
-                    (CVal::Frame(ops), t) if !matches!(t, Type::Frame(..)) => CVal::Scalar(ops[c]),
+                .zip(args)
+                .map(|(&e, a)| match a {
+                    CVal::Frame(xs) if e > 0 => xs[c].clone(),
                     _ => a.clone(),
                 })
                 .collect();
-            out.push(self.inline(def, sig, per_channel)?.scalar());
+            out.push(self.lift(&inner, &per_element, f)?);
         }
         Ok(CVal::Frame(out))
     }
@@ -1166,11 +1267,7 @@ impl Compiler<'_> {
         }
         if let Some(tuning) = Tuning::builtin(name) {
             let (setting, a4) = (vals[1].scalar(), vals[2].scalar());
-            let mut out = Vec::new();
-            for &pitch in vals[0].operands() {
-                out.push(self.tune(tuning, pitch, setting, a4)?);
-            }
-            return Ok(vals[0].reshape(out));
+            return self.map_operands(&vals[0], |s, pitch| s.tune(tuning, pitch, setting, a4));
         }
         match (name, vals.as_slice()) {
             // A gain is stored as its amplitude factor, so the level of an
@@ -1210,7 +1307,7 @@ fn event_fields_for(param: &str) -> &'static [&'static str] {
 fn is_gain(t: &Type) -> bool {
     match t {
         Type::Gain => true,
-        Type::Frame(elem, _) => **elem == Type::Gain,
+        Type::Frame(elem, _) => is_gain(elem),
         _ => false,
     }
 }

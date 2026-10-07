@@ -85,6 +85,7 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | --- | --- | --- |
 | `Sample` | One audio value, nominally \[-1.0, 1.0\] | Storage chosen per target |
 | `[Sample; N]` | A frame of N channels | N is a compile-time constant |
+| `[[Sample; 2]; N]` | Frames nest: N stereo voices or buses | See Polyphony |
 | `Float`, `Int`, `Bool` | Plain values for control logic | Not converted at I/O |
 | `Freq`, `Time` | Unit-carrying numbers | Convert to samples via the host rate |
 | `Pitch`, `Interval` | Abstract musical values | Turned into `Freq` by a tuning (see Pitch) |
@@ -96,15 +97,31 @@ Plain numbers convert with `as`: `x as Float`, `x as Sample`, `x as Int` (which 
 Lifting rules:
 
 1. A `fn` takes exactly what it declares and never lifts. It is called from bodies, where values are already per tick; to accept channels it says so with a size parameter (`fn f<N>(x: [Sample; N])`). Built-in functions follow the same rule.
-2. A rill taking `Sample` can be applied to `[Sample; N]`; it runs N independent copies, each with its own state. Every rill call is its own instance; `let` binds a value, so a bound result used twice is one instance.
+2. A rill applied to an argument with more frame layers than its parameter runs once per element of the extra layers, each copy with its own state, and wraps its result in those layers. A rill taking `Sample` applied to `[Sample; N]` runs N copies; one taking `[Sample; 2]` applied to `[[Sample; 2]; 4]` runs four; `pan(x: Sample) [Sample; 2]` applied to `[Sample; 3]` gives `[[Sample; 2]; 3]`. Every argument that lifts must have the same extra layers; the others are shared by every copy. Every rill call is its own instance; `let` binds a value, so a bound result used twice is one instance.
 3. A constant can be passed wherever a stream of the same type is expected.
-4. Operators on frames are element-wise; `sum`, `max` and similar reduce across channels.
+4. Operators on frames are element-wise. A single value applies to every channel, and a frame whose shape is the outer part of the other side's lines up with the outer layers: `buses * [0.5, 1, 1, 0.2]` gives each of four stereo buses its own gain. Other shapes are an error.
+5. `sum`, `min` and `max` reduce the outer layer: `sum` of `[[Sample; 2]; 3]` is a stereo `[Sample; 2]`.
 
 Rate rules:
 
 1. Streams with different rates cannot be combined without an explicit conversion.
 2. Every path through a 1:1 rill must `return` exactly once per tick; the compiler rejects anything else.
 3. Any cycle in the graph must pass through a delay of at least one sample.
+
+### Polyphony
+
+Lifting makes polyphony the default. A chord is a frame of pitches, so it becomes one voice per note, and a stereo voice becomes a frame of stereo frames:
+
+```rill
+rill pan(x: Sample, pos: Float) [Sample; 2] { return [x * (1 - pos), x * pos] }
+
+rill main() [Sample; 2] {
+    return [C4, E4, G4] |> equal |> sine |> pan(0.3) |> sum
+    //     [Pitch; 3]     [Freq; 3]  [Sample; 3]  [[Sample; 2]; 3]  [Sample; 2]
+}
+```
+
+Per-voice settings are frames of the outer size: `pan([0.2, 0.5, 0.8])` in place of `pan(0.3)` places each voice, and `+ [0dB, -3dB, -6dB]` sets each voice's level. Nesting costs nothing while playing: sizes are known at build time, so `[[Sample; 2]; 4]` is eight values. The entry rill's output and parameters stay flat.
 
 Optional channel layouts name positions without changing the type: `type Surround71 = [Sample; 8] layout(L, R, C, LFE, Ls, Rs, Lb, Rb)` lets code write `x.lfe`.
 
@@ -177,7 +194,7 @@ voice(E4, if minor { just_c } else { equal })   // chosen while playing
 
 Rules:
 
-- Function types are written `fn(A, B) R`. They cannot be `state`, frame channels, event fields or the entry rill's parameters.
+- Function types are written `fn(A, B) R`. They cannot be `state`, frame elements, event fields or the entry rill's parameters.
 - An anonymous fn's parameter and return types can be left out when the surroundings say what they are (a parameter of function type, an annotated `let`, a `return`, or a fn's declared return type). Otherwise they are required.
 - Anonymous fns capture what they use, by value, at the point they are made. They are fns, so they are pure: they read what they capture but cannot change it, and cannot call rills.
 - A named fn can be used where a function type with fewer parameters is expected, if its remaining parameters have defaults. A built-in that works on several types (`sin`) needs an expected type to pick one.

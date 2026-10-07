@@ -4,6 +4,8 @@
 //!
 //! - `T`: a plain number (`Sample`, `Float`, `Int` or a literal)
 //! - `S`: any number, with or without a unit, or a pitch
+//! - `F`: a plain number, or a frame of them (reductions take the outer
+//!   layer off a nested frame)
 
 use super::types::{DefKind, ParamSig, Signature, Size, Type};
 
@@ -23,6 +25,7 @@ pub fn satisfies(param: &str, ty: &Type) -> bool {
     match param {
         "T" => ty.is_plain(),
         "S" => ty.is_quantity(),
+        "F" => ty.leaf().is_plain(),
         _ => unreachable!("unknown builtin type parameter {param}"),
     }
 }
@@ -31,7 +34,8 @@ pub fn satisfies(param: &str, ty: &Type) -> bool {
 pub fn lookup(name: &str) -> Vec<Signature> {
     let t = || Type::Param("T");
     let s = || Type::Param("S");
-    let frame_t = || Type::Frame(Box::new(Type::Param("T")), Size::Var("N".into()));
+    let f = || Type::Param("F");
+    let frame_f = || Type::Frame(Box::new(Type::Param("F")), Size::Var("N".into()));
 
     let sig = |params: &[(&str, Type)], ret: Type| Signature {
         kind: DefKind::Builtin,
@@ -58,10 +62,10 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         | "round" | "wrap" => vec![sig(&[("x", t())], t())],
         "pow" => vec![sig(&[("x", t()), ("y", t())], t())],
         "min" | "max" => vec![
-            sig(&[("x", frame_t())], t()),
+            sig(&[("x", frame_f())], f()),
             sig(&[("a", s()), ("b", s())], s()),
         ],
-        "sum" => vec![sig(&[("x", frame_t())], t())],
+        "sum" => vec![sig(&[("x", frame_f())], f())],
         "clamp" => vec![sig(&[("x", s()), ("lo", s()), ("hi", s())], s())],
         // Per-tick multiplier that decays by 60 dB over `time`.
         "decay" => vec![sig(&[("time", Type::Time)], Type::Sample)],
@@ -127,9 +131,18 @@ pub fn doc(name: &str) -> Option<&'static str> {
             "The fractional part of `x`, in [0, 1). Keeps a phase from growing forever: `phase = wrap(phase + freq / RATE)`."
         }
         "pow" => "`x` raised to the power `y`.",
-        "min" => "The smaller of `a` and `b`, or the smallest channel of a frame.",
-        "max" => "The larger of `a` and `b`, or the largest channel of a frame.",
-        "sum" => "All channels of a frame added together; mixes a frame down to one value.",
+        "min" => {
+            "The smaller of `a` and `b`, or the smallest element of a frame. For a frame of frames, \
+             the smallest channel by channel."
+        }
+        "max" => {
+            "The larger of `a` and `b`, or the largest element of a frame. For a frame of frames, \
+             the largest channel by channel."
+        }
+        "sum" => {
+            "The elements of a frame added together; mixes a frame down to one value. For a frame \
+             of frames, adds them channel by channel, so `sum` of stereo voices is a stereo mix."
+        }
         "clamp" => "`x` limited to the range [`lo`, `hi`].",
         "decay" => {
             "Per-tick multiplier that falls by 60 dB over `time`. Multiply a level by it every tick for an exponential release."

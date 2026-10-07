@@ -787,3 +787,104 @@ fn casting_to_int_truncates_toward_zero() {
         [-2.0, 2.0, -2.0, 3.0]
     );
 }
+
+// ---- nested frames ------------------------------------------------------
+
+/// Stereo frames of `src`, as `[left, right]` pairs.
+fn stereo(src: &str, frames: usize) -> Vec<[f32; 2]> {
+    render_with(src, 2, frames, Blocks::Fixed(3))
+        .chunks(2)
+        .map(|c| [c[0], c[1]])
+        .collect()
+}
+
+#[test]
+fn a_chord_through_a_stereo_voice_mixes_to_stereo() {
+    let voice = "
+        rill pan(x: Sample, pos: Float) [Sample; 2] { return [x * (1 - pos), x * pos] }
+    ";
+    let lifted = format!(
+        "{SINE}{voice}
+        rill main() [Sample; 2] {{
+            return [C4, E4, G4] |> equal |> sine |> pan(0.25) |> sum
+        }}"
+    );
+    let by_hand = format!(
+        "{SINE}{voice}
+        rill main() [Sample; 2] {{
+            let a = pan(sine(equal(C4)), 0.25)
+            let b = pan(sine(equal(E4)), 0.25)
+            let c = pan(sine(equal(G4)), 0.25)
+            return [a[0] + b[0] + c[0], a[1] + b[1] + c[1]]
+        }}"
+    );
+    let ours = render_with(&lifted, 2, 2_000, Blocks::Fixed(64));
+    close(&ours, &render_with(&by_hand, 2, 2_000, Blocks::Fixed(64)), 1e-6);
+    assert!(ours.iter().any(|x| x.abs() > 0.5), "the chord is audible");
+}
+
+#[test]
+fn every_lifted_element_has_its_own_state() {
+    let src = "
+        rill count(step: Sample) Sample {
+            state n: Sample = 0
+            n = n + step
+            return n
+        }
+        rill main() [Sample; 2] { return sum(count([[1, 2], [3, 4]])) }
+    ";
+    assert_eq!(stereo(src, 3), [[4.0, 6.0], [8.0, 12.0], [12.0, 18.0]]);
+
+    // A rill taking a frame runs once per bus, each with its own state.
+    let src = "
+        rill hold(x: [Sample; 2]) [Sample; 2] {
+            state last: [Sample; 2] = [0, 0]
+            let out = last
+            last = x
+            return out
+        }
+        rill main() [Sample; 2] {
+            state t: Sample = 0
+            t = t + 1
+            return sum(hold([[t, 2 * t], [10 * t, 0]]))
+        }
+    ";
+    assert_eq!(stereo(src, 3), [[0.0, 0.0], [11.0, 2.0], [22.0, 4.0]]);
+}
+
+#[test]
+fn nested_frames_in_operators_state_and_indexing() {
+    // A shorter frame lines up with the outer layer: one gain per bus.
+    let src = "rill main() [Sample; 2] { return sum([[1, 2], [3, 4]] * [10, 100]) }";
+    assert_eq!(stereo(src, 1), [[310.0, 420.0]]);
+
+    // One level per voice.
+    let src = "rill main() [Sample; 2] { return sum([[1, 1], [1, 1]] + [0dB, -6dB]) }";
+    let out = stereo(src, 1);
+    assert!((out[0][0] - 1.501).abs() < 1e-3, "{out:?}");
+
+    // Reductions take the outer layer off.
+    let src = "rill main() [Sample; 2] { return max([[1, 5], [3, 2]]) + min([[1, 5], [3, 2]]) }";
+    assert_eq!(stereo(src, 1), [[4.0, 7.0]]);
+
+    // Nested state.
+    let src = "
+        rill main() [Sample; 2] {
+            state s: [[Sample; 2]; 2] = [[0, 0], [0, 0]]
+            s = s + [[1, 2], [3, 4]]
+            return sum(s)
+        }
+    ";
+    assert_eq!(stereo(src, 2), [[4.0, 6.0], [8.0, 12.0]]);
+
+    // An index known only while playing picks a whole inner frame.
+    let src = "
+        rill main() [Sample; 2] {
+            state k: Int = 0
+            let bus = [[1, 2], [3, 4], [5, 6]][k]
+            k = (k + 1) % 3
+            return bus
+        }
+    ";
+    assert_eq!(stereo(src, 4), [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [1.0, 2.0]]);
+}

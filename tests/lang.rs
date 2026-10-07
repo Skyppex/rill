@@ -985,3 +985,147 @@ fn casts_with_as() {
         assert_eq!(h.as_deref(), help, "{stmts}");
     }
 }
+
+// ---- nested frames ------------------------------------------------------
+
+const VOICES: &str = "
+rill drive(x: Sample) Sample { return tanh(x * 2) }
+rill widen(x: [Sample; 2]) [Sample; 2] { return [x[0], x[1] * 0.5] }
+rill pan(x: Sample, pos: Float = 0.5) [Sample; 2] { return [x * (1 - pos), x * pos] }
+rill gain(x: [Sample; 2], g: Float) [Sample; 2] { return x * g }
+";
+
+/// [`VOICES`] plus `stmts` in a `rill main`, with `buses` (four stereo
+/// buses) and `mono` (three voices) in scope.
+fn with_voices(stmts: &str) -> String {
+    format!(
+        "{VOICES}\n{}",
+        body(&format!(
+            "let s = sin(0.1) as Sample
+             let mono = [s, s, s]
+             let buses: [[Sample; 2]; 4] = [[s, s], [s, s], [s, s], [s, s]]
+             {stmts}"
+        ))
+    )
+}
+
+#[test]
+fn frames_nest() {
+    let stereo = || frame(Type::Sample, 2);
+    let src = with_voices("let a = buses[1]\nlet b = buses[1][0]\nlet c = [[1, 2], [3, 4]]");
+    assert_eq!(type_of(&src, "buses"), frame(stereo(), 4));
+    assert_eq!(type_of(&src, "a"), stereo());
+    assert_eq!(type_of(&src, "b"), Type::Sample);
+    assert_eq!(type_of(&src, "c"), frame(frame(Type::Num, 2), 2));
+
+    assert_eq!(
+        error(&body("let x = [[1, 2], [1, 2, 3]]")).0,
+        "frame elements have different shapes: `[number; 2]` and `[number; 3]`"
+    );
+    assert_eq!(
+        errors(&body("let f: [fn(Sample) Sample; 2] = [sin, cos]"))[0],
+        "frames cannot hold functions"
+    );
+}
+
+#[test]
+fn lifting_peels_layers_until_the_argument_fits() {
+    let stereo = || frame(Type::Sample, 2);
+    let src = with_voices(
+        "let a = drive(buses)
+         let b = widen(buses)
+         let c = pan(mono)
+         let d = pan(mono, [0.1, 0.5, 0.9])
+         let e = gain(buses, [1, 0.5, 0.5, 1])
+         let f = mono |> pan |> widen |> drive",
+    );
+    assert_eq!(type_of(&src, "a"), frame(stereo(), 4));
+    assert_eq!(type_of(&src, "b"), frame(stereo(), 4));
+    assert_eq!(type_of(&src, "c"), frame(stereo(), 3));
+    assert_eq!(type_of(&src, "d"), frame(stereo(), 3));
+    assert_eq!(type_of(&src, "e"), frame(stereo(), 4));
+    assert_eq!(type_of(&src, "f"), frame(stereo(), 3));
+
+    // A rill returning a frame lifts over two layers too.
+    let src = with_voices("let g = pan(buses)");
+    assert_eq!(type_of(&src, "g"), frame(frame(stereo(), 2), 4));
+
+    // Tunings lift at any depth.
+    let src = body("let f = [[C4, E4], [D4, F4]] |> equal");
+    assert_eq!(type_of(&src, "f"), frame(frame(Type::Freq, 2), 2));
+}
+
+#[test]
+fn lifted_arguments_need_the_same_extra_layers() {
+    assert_eq!(
+        error(&with_voices("let x = pan(buses, [0.1, 0.2, 0.3, 0.4])")).0,
+        "this runs `pan` over shape `4`, an earlier argument over shape `4 × 2`"
+    );
+    assert_eq!(
+        error(&with_voices("let x = gain(buses, [1, 2])")).0,
+        "channel counts differ: this has 2 channels, an earlier argument has 4"
+    );
+    // Fns still take exactly what they declare.
+    let src = format!(
+        "fn first<N>(x: [Sample; N]) Sample {{ x[0] }}\n{}",
+        with_voices("let x = first(buses)")
+    );
+    assert_eq!(
+        error(&src).0,
+        "`first` takes `[Sample; 2]`, not `[[Sample; 2]; 4]`"
+    );
+}
+
+#[test]
+fn operators_line_up_with_the_outer_layers() {
+    let stereo = || frame(Type::Sample, 2);
+    let src = with_voices(
+        "let a = buses * 0.5
+         let b = buses + buses
+         let c = buses * [0.5, 1, 1, 0.2]
+         let d = -buses
+         let e = buses - 6dB
+         let f = pan(mono) + [0dB, -3dB, -6dB]",
+    );
+    for name in ["a", "b", "c", "d", "e"] {
+        assert_eq!(type_of(&src, name), frame(stereo(), 4), "{name}");
+    }
+    assert_eq!(type_of(&src, "f"), frame(stereo(), 3));
+
+    assert_eq!(
+        error(&with_voices("let x = buses * [1, 2]")).0,
+        "channel counts differ: `[[Sample; 2]; 4]` and `[number; 2]`"
+    );
+}
+
+#[test]
+fn reductions_take_the_outer_layer_off() {
+    let stereo = || frame(Type::Sample, 2);
+    let src = with_voices("let a = sum(buses)\nlet b = max(buses)\nlet c = min(buses)\nlet d = sum(mono)");
+    for name in ["a", "b", "c"] {
+        assert_eq!(type_of(&src, name), stereo(), "{name}");
+    }
+    assert_eq!(type_of(&src, "d"), Type::Sample);
+}
+
+#[test]
+fn the_entry_rill_stays_flat() {
+    let errs = entry_errors(
+        "rill main(x: [[Sample; 2]; 2] = [[0, 0], [0, 0]]) [[Sample; 2]; 2] { return x }",
+        "main",
+    );
+    assert_eq!(
+        errs,
+        [
+            (
+                "`x` cannot be a frame of frames".to_owned(),
+                Some("the entry rill's parameters are live controls; use a flat frame".to_owned())
+            ),
+            (
+                "the entry rill must return flat audio (`Sample` or `[Sample; N]`), found `[[Sample; 2]; 2]`"
+                    .to_owned(),
+                Some("mix the outer layer down with `sum`, as in `return sum(voices)`".to_owned())
+            ),
+        ]
+    );
+}

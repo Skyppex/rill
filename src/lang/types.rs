@@ -26,7 +26,7 @@ pub enum Type {
     /// An unsuffixed number literal not yet pinned to `Sample`, `Float` or
     /// `Int`. It becomes whichever plain numeric type it meets.
     Num,
-    /// `[elem; size]`. `elem` is always a scalar.
+    /// `[elem; size]`. `elem` is a scalar or another frame.
     Frame(Box<Type>, Size),
     /// A function value: `fn(params) ret`.
     Fn(Vec<Type>, Box<Type>),
@@ -115,6 +115,23 @@ impl Type {
     /// Values that can be compared, ordered and put in a frame.
     pub fn is_quantity(&self) -> bool {
         self.is_plain() || self.is_dimensioned() || matches!(self, Type::Pitch | Type::Gain)
+    }
+
+    /// What a frame holds once every layer is taken off; the type itself
+    /// if it is not a frame.
+    pub fn leaf(&self) -> &Type {
+        match self {
+            Type::Frame(elem, _) => elem.leaf(),
+            t => t,
+        }
+    }
+
+    /// How many frame layers wrap the leaf.
+    pub fn depth(&self) -> usize {
+        match self {
+            Type::Frame(elem, _) => 1 + elem.depth(),
+            _ => 0,
+        }
     }
 
     pub fn is_scalar(&self) -> bool {

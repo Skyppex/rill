@@ -1,0 +1,25 @@
+// Polyphony: a chord is a frame of pitches, so every rill it passes through
+// runs once per note. A stereo voice turns three notes into three stereo
+// frames, and `sum` mixes them down to one.
+
+rill sine(freq: Freq) Sample {
+    state phase: Float = 0
+    phase = wrap(phase + freq / RATE)
+    return sin(phase * TAU)
+}
+
+// Equal-power panning: 0 is hard left, 1 hard right.
+rill pan(x: Sample, pos: Float) [Sample; 2] {
+    let angle = pos * PI / 2
+    return [x * cos(angle), x * sin(angle)]
+}
+
+rill main(volume: Gain = -12dB) [Sample; 2] {
+    let voices = [C4, E4, G4] |> equal |> sine   // [Sample; 3]
+
+    // One position and one level per voice.
+    let placed = voices |> pan([0.2, 0.5, 0.8])  // [[Sample; 2]; 3]
+    let shaped = placed + [0dB, -3dB, -6dB]
+
+    return sum(shaped) + volume                  // [Sample; 2]
+}

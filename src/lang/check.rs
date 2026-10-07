@@ -382,8 +382,10 @@ impl Checker {
             }
             TypeExpr::Frame { elem, size, span } => {
                 let elem_ty = self.resolve_type(elem, generics);
-                if matches!(elem_ty, Type::Frame(..)) {
-                    let e = self.error(*span, "frames cannot contain frames");
+                if matches!(elem_ty.leaf(), Type::Fn(..)) {
+                    let e = self
+                        .error(*span, "frames cannot hold functions")
+                        .with_help("pass the functions separately");
                     self.report(e);
                     return Type::Error;
                 }
@@ -802,12 +804,10 @@ impl Checker {
                 }
                 let ok = match op {
                     UnOp::Not => t == Type::Bool,
-                    UnOp::Neg | UnOp::Plus => match &t {
-                        Type::Frame(elem, _) => {
-                            elem.is_plain() || elem.is_dimensioned() || **elem == Type::Gain
-                        }
-                        t => t.is_plain() || t.is_dimensioned() || *t == Type::Gain,
-                    },
+                    UnOp::Neg | UnOp::Plus => {
+                        let t = t.leaf();
+                        t.is_plain() || t.is_dimensioned() || *t == Type::Gain
+                    }
                 };
                 if ok {
                     t
@@ -882,10 +882,10 @@ impl Checker {
                         bad = true;
                         continue;
                     }
-                    if !t.is_quantity() {
+                    if !t.leaf().is_quantity() {
                         let d = self.error(
                             el.span,
-                            format!("a frame channel must be a number, found `{t}`"),
+                            format!("a frame channel must be a number or a frame, found `{t}`"),
                         );
                         self.report(d);
                         bad = true;
@@ -897,10 +897,12 @@ impl Checker {
                             match join(&prev, &t) {
                                 Some(j) => Some(j),
                                 None => {
-                                    let d = self.error(
-                                    el.span,
-                                    format!("frame channels have different types: `{prev}` and `{t}`"),
-                                );
+                                    let msg = if prev.depth() > 0 || t.depth() > 0 {
+                                        format!("frame elements have different shapes: `{prev}` and `{t}`")
+                                    } else {
+                                        format!("frame channels have different types: `{prev}` and `{t}`")
+                                    };
+                                    let d = self.error(el.span, msg);
                                     self.report(d);
                                     bad = true;
                                     Some(prev)
@@ -1185,12 +1187,12 @@ impl Checker {
             return Type::Error;
         }
 
-        // Unify argument types with parameter types. A rill whose scalar
-        // parameter receives a frame runs once per channel (lifting); fns and
-        // built-ins never lift, except the built-ins documented to take a
-        // frame in their first parameter.
+        // Unify argument types with parameter types. A rill whose parameter
+        // receives a value with more frame layers runs once per element of
+        // the extra layers (lifting); fns and built-ins never lift, except
+        // the built-ins documented to take a frame in their first parameter.
         let mut subst = Subst::default();
-        let mut lift: Option<(Size, Span)> = None;
+        let mut lift: Option<(Vec<Size>, Span)> = None;
         for (pi, (p, slot)) in sig.params.iter().zip(&slots).enumerate() {
             let Some(ai) = *slot else { continue };
             let at = &arg_types[ai];
@@ -1199,54 +1201,75 @@ impl Checker {
                 ok = false;
                 continue;
             }
-            let mut trial = subst.clone();
-            if unify(&p.ty, at, &mut trial, &sig.generics) {
-                subst = trial;
-                continue;
-            }
-            if let Type::Frame(elem, n) = at
-                && !matches!(p.ty, Type::Frame(..))
-            {
+            // Peel as few outer layers as it takes for the argument to fit.
+            let mut peeled = Vec::new();
+            let mut inner = at;
+            let fitted = loop {
                 let mut trial = subst.clone();
-                if unify(&p.ty, elem, &mut trial, &sig.generics) {
-                    let lifts = kind == DefKind::Rill
-                        || (kind == DefKind::Builtin && pi == 0 && builtins::takes_frames(name));
-                    if !lifts {
-                        let help = if kind == DefKind::Fn {
-                            format!(
-                                "fns take exactly what they declare; give `{name}` a size parameter, \
-                                 as in `fn {name}<N>(x: [Sample; N])`, or make it a rill to run it per channel"
-                            )
-                        } else {
-                            "built-in functions take one value; to run one per channel, call it from a \
-                             rill and apply that rill to the frame"
-                                .to_owned()
-                        };
-                        let d = self
-                            .error(
-                                arg_span,
-                                format!("`{name}` takes one value, not a frame (`{at}`)"),
-                            )
-                            .with_help(help);
-                        self.report(d);
-                        ok = false;
-                        continue;
+                if unify(&p.ty, inner, &mut trial, &sig.generics) {
+                    break Some(trial);
+                }
+                match inner {
+                    Type::Frame(elem, n) => {
+                        peeled.push(n.clone());
+                        inner = elem;
                     }
-                    match &lift {
-                        Some((m, _)) if m != n => {
-                            let d = self.error(
-                                arg_span,
-                                format!("channel counts differ: this has {n} channels, an earlier argument has {m}"),
-                            );
-                            self.report(d);
-                            ok = false;
-                        }
-                        Some(_) => {}
-                        None => lift = Some((n.clone(), arg_span)),
-                    }
+                    _ => break None,
+                }
+            };
+            if let Some(trial) = fitted {
+                if peeled.is_empty() {
                     subst = trial;
                     continue;
                 }
+                let lifts = kind == DefKind::Rill
+                    || (kind == DefKind::Builtin && pi == 0 && builtins::takes_frames(name));
+                if !lifts {
+                    let msg = if matches!(p.ty, Type::Frame(..)) {
+                        format!("`{name}` takes `{}`, not `{at}`", substitute(&p.ty, &trial))
+                    } else {
+                        format!("`{name}` takes one value, not a frame (`{at}`)")
+                    };
+                    let help = if kind == DefKind::Fn {
+                        format!(
+                            "fns take exactly what they declare; give `{name}` a size parameter, \
+                             as in `fn {name}<N>(x: [Sample; N])`, or make it a rill to run it per channel"
+                        )
+                    } else {
+                        "built-in functions take one value; to run one per channel, call it from a \
+                         rill and apply that rill to the frame"
+                            .to_owned()
+                    };
+                    let d = self.error(arg_span, msg).with_help(help);
+                    self.report(d);
+                    ok = false;
+                    continue;
+                }
+                match &lift {
+                    Some((earlier, _)) if *earlier != peeled => {
+                        let msg = match (earlier.as_slice(), peeled.as_slice()) {
+                            ([m], [n]) => format!(
+                                "channel counts differ: this has {n} channels, an earlier argument has {m}"
+                            ),
+                            _ => format!(
+                                "this runs `{name}` over shape `{}`, an earlier argument over shape `{}`",
+                                shape(&peeled),
+                                shape(earlier)
+                            ),
+                        };
+                        let d = self
+                            .error(arg_span, msg)
+                            .with_help(
+                                "every argument that runs per element needs the same extra layers",
+                            );
+                        self.report(d);
+                        ok = false;
+                    }
+                    Some(_) => {}
+                    None => lift = Some((peeled, arg_span)),
+                }
+                subst = trial;
+                continue;
             }
             let what = format!("argument `{}` of `{name}`", p.name);
             let d = match &p.ty {
@@ -1267,17 +1290,10 @@ impl Checker {
         match lift {
             None => ret,
             Some(_) if ret == Type::Unit => Type::Unit,
-            Some((_, at)) if matches!(ret, Type::Frame(..)) => {
-                let d = self.error(
-                    at,
-                    format!(
-                        "cannot run `{name}` once per channel: it already returns a frame (`{ret}`)"
-                    ),
-                );
-                self.report(d);
-                Type::Error
-            }
-            Some((n, _)) => Type::Frame(Box::new(ret), n),
+            Some((layers, _)) => layers
+                .into_iter()
+                .rev()
+                .fold(ret, |t, n| Type::Frame(Box::new(t), n)),
         }
     }
 
@@ -1704,9 +1720,19 @@ fn var_word(kind: VarKind) -> &'static str {
     }
 }
 
+/// A frame shape for messages, outer layer first: `4 × 2`.
+fn shape(sizes: &[Size]) -> String {
+    sizes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" × ")
+}
+
 fn describe_param(c: &str) -> &'static str {
     match c {
         "T" => "a plain number (`Sample`, `Float` or `Int`)",
+        "F" => "a plain number or a frame of them",
         "S" => "a number",
         _ => "something else",
     }
@@ -2150,6 +2176,17 @@ pub fn check_entry(
             );
         }
     }
+    for (p, ps) in def.params.iter().zip(&sig.params) {
+        if ps.ty.depth() > 1 {
+            errors.push(
+                Diagnostic::error(
+                    p.name.span,
+                    format!("`{}` cannot be a frame of frames", p.name.name),
+                )
+                .with_help("the entry rill's parameters are live controls; use a flat frame"),
+            );
+        }
+    }
     for p in def.params.iter().filter(|p| p.default.is_none()) {
         errors.push(
             Diagnostic::error(p.name.span, format!("`{}` needs a default value", p.name.name)).with_help(
@@ -2169,7 +2206,18 @@ pub fn check_entry(
         Type::Frame(elem, Size::Const(_)) => audio(elem),
         t => audio(t),
     };
-    if !ok_ret && !sig.ret.is_wild() {
+    if sig.ret.depth() > 1 && audio(sig.ret.leaf()) {
+        errors.push(
+            Diagnostic::error(
+                def.ret.span(),
+                format!(
+                    "the entry rill must return flat audio (`Sample` or `[Sample; N]`), found `{}`",
+                    sig.ret
+                ),
+            )
+            .with_help("mix the outer layer down with `sum`, as in `return sum(voices)`"),
+        );
+    } else if !ok_ret && !sig.ret.is_wild() {
         errors.push(Diagnostic::error(
             def.ret.span(),
             format!(

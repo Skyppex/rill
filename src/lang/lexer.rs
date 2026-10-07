@@ -12,6 +12,8 @@ pub enum Unit {
     /// Semitones.
     St,
     Cents,
+    /// Decibels, for a `Gain`.
+    Db,
 }
 
 /// What a unit measures.
@@ -20,16 +22,18 @@ pub enum Dimension {
     Frequency,
     Time,
     Interval,
+    Level,
 }
 
 impl Unit {
-    pub const ALL: [(&'static str, Unit); 6] = [
+    pub const ALL: [(&'static str, Unit); 7] = [
         ("Hz", Unit::Hz),
         ("kHz", Unit::KHz),
         ("ms", Unit::Ms),
         ("s", Unit::S),
         ("st", Unit::St),
         ("cents", Unit::Cents),
+        ("dB", Unit::Db),
     ];
 
     pub fn dimension(self) -> Dimension {
@@ -37,16 +41,19 @@ impl Unit {
             Unit::Hz | Unit::KHz => Dimension::Frequency,
             Unit::Ms | Unit::S => Dimension::Time,
             Unit::St | Unit::Cents => Dimension::Interval,
+            Unit::Db => Dimension::Level,
         }
     }
 
-    /// Convert to the base unit of the dimension: Hz, seconds or semitones.
+    /// Convert to the base unit of the dimension: Hz, seconds, semitones, or
+    /// for levels the amplitude factor (`-6dB` is about 0.5).
     pub fn to_base(self, value: f64) -> f64 {
         match self {
             Unit::Hz | Unit::S | Unit::St => value,
             Unit::KHz => value * 1000.0,
             Unit::Ms => value / 1000.0,
             Unit::Cents => value / 100.0,
+            Unit::Db => 10f64.powf(value / 20.0),
         }
     }
 

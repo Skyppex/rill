@@ -645,3 +645,76 @@ fn ratio_tunings_put_a4_on_the_reference() {
         out[3]
     );
 }
+
+#[test]
+fn levels_scale_amplitude() {
+    let db = |x: f32| 10f32.powf(x / 20.0);
+    let src = "
+        rill main() -> [sample; 8] {
+            let x = 0.5
+            return [
+                x - 6dB,
+                x + 20dB,
+                x - 6dB - 6dB,
+                x - (-12dB * 0.5),
+                amp(-6dB),
+                -12dB / -6dB,
+                amp(level(0.25)),
+                amp(level(0)),
+            ]
+        }
+    ";
+    let out = render_with(src, 8, 1, Blocks::Fixed(1));
+    let expected = [
+        0.5 * db(-6.0),
+        5.0,
+        0.5 * db(-12.0),
+        0.5 * db(6.0),
+        db(-6.0),
+        2.0,
+        0.25,
+        1e-6, // silence is held at -120dB
+    ];
+    for (i, (got, want)) in out.iter().zip(expected).enumerate() {
+        assert!((got - want).abs() < 1e-5, "{i}: {got} vs {want}");
+    }
+    // All constant: folded away.
+    assert_eq!(graph(src, 8).len(), 0);
+}
+
+#[test]
+fn levels_can_change_while_playing() {
+    // A fade moving 20dB down per tick, applied to a frame.
+    let src = "
+        rill main() -> [sample; 2] {
+            state fade: Gain = 0dB
+            let out = [1, 0.5] + fade
+            fade = fade - 20dB
+            return out
+        }
+    ";
+    let out = render_with(src, 2, 3, Blocks::Fixed(1));
+    assert_eq!(out.len(), 6);
+    let expected = [1.0, 0.5, 0.1, 0.05, 0.01, 0.005];
+    for (i, (got, want)) in out.iter().zip(expected).enumerate() {
+        assert!((got - want).abs() < 1e-6, "{i}: {got} vs {want}");
+    }
+}
+
+#[test]
+fn a_gain_parameter_is_a_live_control() {
+    let src = "rill main(volume: Gain = -6dB) -> sample { return 1 + volume }";
+    let mut engine = Engine::new(graph(src, 1), config(1)).unwrap();
+    let mut out = [0.0f32; 4];
+    engine.render_interleaved(&mut out[..1]);
+    assert!(
+        (out[0] - 10f32.powf(-6.0 / 20.0)).abs() < 1e-6,
+        "{}",
+        out[0]
+    );
+    // Hosts send gains as plain amplitude factors.
+    assert!(engine.set_param("volume", 0.25));
+    let mut later = [0.0f32; 4800];
+    engine.render_interleaved(&mut later);
+    assert!((later[4799] - 0.25).abs() < 1e-6, "{}", later[4799]);
+}

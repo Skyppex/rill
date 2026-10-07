@@ -18,6 +18,9 @@ pub enum Type {
     Pitch,
     Time,
     Interval,
+    /// A level change, written in `dB`. Stored as an amplitude factor, so
+    /// any plain number can be used where a `Gain` is expected.
+    Gain,
     /// Dynamically shaped payload passed to an `on event(...)` handler.
     Event,
     /// An unsuffixed number literal not yet pinned to `sample`, `f32` or
@@ -65,6 +68,7 @@ impl fmt::Display for Type {
             Type::Pitch => f.write_str("Pitch"),
             Type::Time => f.write_str("Time"),
             Type::Interval => f.write_str("Interval"),
+            Type::Gain => f.write_str("Gain"),
             Type::Event => f.write_str("event"),
             Type::Num => f.write_str("number"),
             Type::Frame(elem, size) => write!(f, "[{elem}; {size}]"),
@@ -92,6 +96,7 @@ impl Type {
             Dimension::Frequency => Type::Hz,
             Dimension::Time => Type::Time,
             Dimension::Interval => Type::Interval,
+            Dimension::Level => Type::Gain,
         }
     }
 
@@ -109,7 +114,7 @@ impl Type {
 
     /// Values that can be compared, ordered and put in a frame.
     pub fn is_quantity(&self) -> bool {
-        self.is_plain() || self.is_dimensioned() || *self == Type::Pitch
+        self.is_plain() || self.is_dimensioned() || matches!(self, Type::Pitch | Type::Gain)
     }
 
     pub fn is_scalar(&self) -> bool {
@@ -143,6 +148,8 @@ pub fn coerces(from: &Type, to: &Type) -> bool {
     match (from, to) {
         (Type::Num, Type::Sample | Type::F32 | Type::I32) => true,
         (Type::F32, Type::Sample) | (Type::Sample, Type::F32) => true,
+        // A plain number is an amplitude factor, which is what a gain is.
+        (Type::Num | Type::Sample | Type::F32, Type::Gain) => true,
         (Type::Frame(a, n), Type::Frame(b, m)) => n == m && coerces(a, b),
         // A function fits where it can be called the same way: it accepts
         // what the expected type passes, and returns what it promises.
@@ -163,6 +170,7 @@ pub fn join(a: &Type, b: &Type) -> Option<Type> {
         (Type::Error, _) | (_, Type::Error) => Some(Type::Error),
         (Type::Never, t) | (t, Type::Never) => Some(t.clone()),
         (Type::Num, t) | (t, Type::Num) if t.is_plain() => Some(t.clone()),
+        (Type::Num, Type::Gain) | (Type::Gain, Type::Num) => Some(Type::Gain),
         (Type::Sample, Type::F32) | (Type::F32, Type::Sample) => Some(Type::Sample),
         (Type::Frame(x, n), Type::Frame(y, m)) if n == m => {
             Some(Type::Frame(Box::new(join(x, y)?), n.clone()))

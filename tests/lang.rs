@@ -694,7 +694,12 @@ fn garbage_never_panics() {
 fn pitches_are_positions_not_amounts() {
     assert_eq!(type_of(&body("let i = E4 - C4"), "i"), Type::Interval);
     assert_eq!(type_of(&body("let p = C4 + 4st"), "p"), Type::Pitch);
-    assert_eq!(type_of(&body("let p = 7st + C4"), "p"), Type::Pitch);
+    let (m, help) = error(&body("let p = 7st + C4"));
+    assert_eq!(m, "cannot add `Interval` and `Pitch`");
+    assert_eq!(
+        help.as_deref(),
+        Some("the interval comes after the pitch, as in `C4 + 7st`")
+    );
     assert_eq!(type_of(&body("let p = C4 - 50cents"), "p"), Type::Pitch);
     assert_eq!(
         type_of(&body("let chord = [C4, E4, G4]"), "chord"),
@@ -831,4 +836,61 @@ fn recursion_through_function_values_is_rejected() {
          fn spin(x: sample) -> sample { apply(spin, x) }",
     );
     assert_eq!(errs, ["recursion is not allowed: `spin` -> `spin`"]);
+}
+
+// ---- levels -------------------------------------------------------------
+
+#[test]
+fn levels_move_signals_up_and_down() {
+    let t = |stmts: &str, name: &str| type_of(&with_sine(stmts), name);
+    assert_eq!(t("let v = sine(1Hz) - 6dB", "v"), Type::Sample);
+    assert_eq!(t("let v = sine(1Hz) + 3dB", "v"), Type::Sample);
+    assert_eq!(
+        t("let v = [sine(1Hz), sine(2Hz)] - [3dB, 6dB]", "v"),
+        frame(Type::Sample, 2)
+    );
+    assert_eq!(t("let g = -6dB - 3dB", "g"), Type::Gain);
+    assert_eq!(t("let g = -6dB * 0.5", "g"), Type::Gain);
+    assert_eq!(t("let g = 0.5 * -6dB", "g"), Type::Gain);
+    assert_eq!(t("let r = -12dB / -6dB", "r"), Type::F32);
+    assert_eq!(t("let l = level(sine(1Hz))", "l"), Type::Gain);
+    assert_eq!(t("let factor = amp(-6dB)", "factor"), Type::F32);
+    assert_eq!(
+        t("let quiet = level(sine(1Hz)) < -20dB", "quiet"),
+        Type::Bool
+    );
+    // A plain number is an amplitude factor, so it can be used as a gain.
+    assert_ok(&with_sine("let g: Gain = 0.5\nlet v = sine(1Hz) - g"));
+
+    for (stmts, msg, help) in [
+        (
+            "let v = -6dB + sine(1Hz)",
+            "cannot add `Gain` and `sample`",
+            "the level comes after the signal, as in `voice - 6dB`",
+        ),
+        (
+            "let v = sine(1Hz) * -6dB",
+            "cannot multiply `sample` and `Gain`",
+            "to change a signal's level, add or subtract it, as in `voice - 6dB`",
+        ),
+        (
+            "let v = i32(3) - 6dB",
+            "cannot subtract `i32` and `Gain`",
+            "integers have no level; convert with `f32(...)` first",
+        ),
+        (
+            "let q = level(sine(1Hz)) < 0.5",
+            "cannot compare `Gain` and `number` with `<`",
+            "write the level in dB, as in `-6dB`",
+        ),
+    ] {
+        let (m, h) = error(&with_sine(stmts));
+        assert_eq!(m, msg, "{stmts}");
+        assert_eq!(h.as_deref(), Some(help), "{stmts}");
+    }
+    // Without a unit it is ordinary subtraction, not a level change.
+    assert_eq!(
+        type_of(&with_sine("let v = sine(1Hz) - 0.5"), "v"),
+        Type::Sample
+    );
 }

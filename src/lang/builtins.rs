@@ -82,6 +82,9 @@ pub fn lookup(name: &str) -> Vec<Signature> {
             ],
             Type::Hz,
         )],
+        // The level of an amplitude, and the amplitude factor of a level.
+        "level" => vec![sig(&[("x", t())], Type::Gain)],
+        "amp" => vec![sig(&[("gain", Type::Gain)], Type::F32)],
         "f32" => vec![sig(&[("x", t())], Type::F32)],
         "i32" => vec![sig(&[("x", t())], Type::I32)],
         "sample" => vec![sig(&[("x", t())], Type::Sample)],
@@ -106,6 +109,8 @@ pub fn takes_frames(name: &str) -> bool {
 
 /// Every built-in function name, for suggestions.
 pub const FUNCTIONS: &[&str] = &[
+    "level",
+    "amp",
     "sin",
     "cos",
     "tan",

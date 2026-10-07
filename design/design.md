@@ -75,7 +75,7 @@ rill main(depth: Hz = 20Hz) -> sample {
 }
 ```
 
-Literals carry units: `440Hz`, `300ms`, `2s`, `+7st`, `+50cents`, `3/2`. Units convert to samples using the host rate at build time.
+Literals carry units: `440Hz`, `300ms`, `2s`, `+7st`, `+50cents`, `-6dB`, `3/2`. Units convert to samples using the host rate at build time.
 
 ## Type system
 
@@ -88,6 +88,7 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `f32`, `i32`, `bool` | Plain values for control logic | Not converted at I/O |
 | `Hz`, `Time` | Unit-carrying numbers | Convert to samples via the host rate |
 | `Pitch`, `Interval` | Abstract musical values | Turned into `Hz` by a tuning (see Pitch) |
+| `Gain` | A level change, written in `dB` | Any plain number is an amplitude factor (see Levels) |
 | `fn(A, B) -> R` | A function value | See Functions as values |
 
 Lifting rules:
@@ -129,12 +130,31 @@ meantone(pitch: Pitch, root: Pitch, a4: Hz = 440Hz) -> Hz
 
 Rules:
 
-- A `Pitch` is a position, not an amount: `Pitch ± Interval` gives a `Pitch` and `Pitch - Pitch` gives the `Interval` between them. Pitches can be compared, but not scaled or added together.
+- A `Pitch` is a position, not an amount: `Pitch ± Interval` gives a `Pitch` (the interval always comes after) and `Pitch - Pitch` gives the `Interval` between them. Pitches can be compared, but not scaled or added together.
 - `equal` places note names on the nearest of `steps` equal divisions of the octave. The scale tunings build twelve notes from ratios above their root and put A4 exactly on `a4`. In every tuning, fractions of a semitone (cents, bends) stay continuous.
 - A tuning's settings are ordinary arguments, so they can change while playing (`a4` from a live control, say). Your own tuning is any `fn(Pitch) -> Hz`.
 - Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Hz` and mixing on streams. The built-in tunings accept a chord and tune each pitch; passing the result to a rill that takes `Hz` lifts it to one voice per pitch.
 - When every input is known at build time, tuning constant-folds to a number. Otherwise it is evaluated per tick.
 - Note events carry `pitch` as a `Pitch` and `velocity` in 0–1. Velocity is linear; a curve such as `velocity * velocity` sounds more even, since a straight line is too loud at soft velocities.
+
+## Levels
+
+A level change is a `Gain`, written in decibels. A signal moves up or down in level with `+` and `-`, the way a pitch moves by an interval; the level always comes after the signal.
+
+```
+voice - 6dB                     // half the amplitude
+voice + volume                  // volume: Gain, e.g. a live control
+[l, r] - [0dB, 6dB]             // a level per channel
+ramp(-60, 0, 4s) * 1dB          // a fade that moves evenly in level
+level(peak(voice)) < -20dB      // level of an amplitude, for meters and dynamics
+```
+
+Rules:
+
+- `x ± Gain` scales `x` by `10^(±dB/20)`, per channel on frames. `Gain ± x` is an error (the level comes after), and so is multiplying or dividing a signal (`sample`) by a `Gain`: levels are added or subtracted.
+- Levels combine with `+`/`-`, scale with `*`/`/` by plain numbers (half of `-6dB` is `-3dB`), and compare with each other. `Gain / Gain` is a plain ratio.
+- A `Gain` is stored as an amplitude factor (`-6dB` is about 0.5), so any plain number can be passed where a `Gain` is expected: `0.5` means about -6dB. Hosts send `Gain` controls the same way. Inside an expression nothing converts: `voice - 0.5` is ordinary subtraction.
+- `level(x)` is the level of an amplitude (`level(1)` is 0dB; silence is held at -120dB instead of -inf). `amp(g)` is the amplitude factor of a level.
 
 ## Functions as values
 

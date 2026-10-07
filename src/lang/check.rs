@@ -255,9 +255,10 @@ impl Checker {
                 "Pitch" => Type::Pitch,
                 "Time" => Type::Time,
                 "Interval" => Type::Interval,
+                "Gain" => Type::Gain,
                 other => {
-                    const KNOWN: [&str; 8] = [
-                        "sample", "f32", "i32", "bool", "Hz", "Pitch", "Time", "Interval",
+                    const KNOWN: [&str; 9] = [
+                        "sample", "f32", "i32", "bool", "Hz", "Pitch", "Time", "Interval", "Gain",
                     ];
                     let mut e = self.error(id.span, format!("unknown type `{other}`"));
                     if let Some(s) = suggest(other, KNOWN) {
@@ -626,8 +627,10 @@ impl Checker {
                 let ok = match op {
                     UnOp::Not => t == Type::Bool,
                     UnOp::Neg | UnOp::Plus => match &t {
-                        Type::Frame(elem, _) => elem.is_plain() || elem.is_dimensioned(),
-                        t => t.is_plain() || t.is_dimensioned(),
+                        Type::Frame(elem, _) => {
+                            elem.is_plain() || elem.is_dimensioned() || **elem == Type::Gain
+                        }
+                        t => t.is_plain() || t.is_dimensioned() || *t == Type::Gain,
                     },
                 };
                 if ok {
@@ -1584,13 +1587,15 @@ fn compare(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
     let ok = match (a, b) {
         (Type::Bool, Type::Bool) => equality,
         (a, b) if a.is_plain() && b.is_plain() => join(a, b).is_some(),
-        (a, b) => a == b && (a.is_dimensioned() || *a == Type::Pitch),
+        (a, b) => a == b && (a.is_dimensioned() || matches!(a, Type::Pitch | Type::Gain)),
     };
     if ok {
         return Ok(Type::Bool);
     }
     let help = if (*a == Type::Num && *b == Type::Pitch) || (*b == Type::Num && *a == Type::Pitch) {
         Some(NOTE_NAME_HELP.to_owned())
+    } else if *a == Type::Gain || *b == Type::Gain {
+        Some("write the level in dB, as in `-6dB`".to_owned())
     } else if (*a == Type::Num && b.is_dimensioned()) || (*b == Type::Num && a.is_dimensioned()) {
         let dim = if a.is_dimensioned() { a } else { b };
         Some(format!(
@@ -1625,6 +1630,10 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
         (Type::Frame(ea, n), s) => return Ok(Type::Frame(Box::new(arith(op, ea, s)?), n.clone())),
         (s, Type::Frame(eb, n)) => return Ok(Type::Frame(Box::new(arith(op, s, eb)?), n.clone())),
         _ => {}
+    }
+
+    if *a == Type::Gain || *b == Type::Gain {
+        return gain_arith(op, a, b);
     }
 
     let verb = match op {
@@ -1663,9 +1672,14 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
     if matches!(
         (op, a, b),
         (BinOp::Add | BinOp::Sub, Type::Pitch, Type::Interval)
-            | (BinOp::Add, Type::Interval, Type::Pitch)
     ) {
         return Ok(Type::Pitch);
+    }
+    if matches!((op, a, b), (BinOp::Add, Type::Interval, Type::Pitch)) {
+        return Err((
+            "cannot add `Interval` and `Pitch`".into(),
+            Some("the interval comes after the pitch, as in `C4 + 7st`".into()),
+        ));
     }
     if matches!((op, a, b), (BinOp::Sub, Type::Pitch, Type::Pitch)) {
         return Ok(Type::Interval);
@@ -1712,6 +1726,43 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
             _ => fail(),
         },
         _ => unreachable!("not an arithmetic operator"),
+    }
+}
+
+/// Arithmetic involving a `Gain`. A signal moves up or down in level with
+/// `+` and `-`, the level always on the right; levels combine with `+`/`-`
+/// and scale with `*`/`/` by plain numbers.
+fn gain_arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
+    use Type::{F32, Gain, I32, Num, Sample};
+    let verb = match op {
+        BinOp::Add => "add",
+        BinOp::Sub => "subtract",
+        BinOp::Mul => "multiply",
+        BinOp::Div => "divide",
+        _ => "take the remainder of",
+    };
+    let err = |help: Option<&str>| {
+        Err((
+            format!("cannot {verb} `{a}` and `{b}`"),
+            help.map(str::to_owned),
+        ))
+    };
+    match (op, a, b) {
+        (BinOp::Add | BinOp::Sub, Num | Sample | F32, Gain) => Ok(a.clone()),
+        (BinOp::Add | BinOp::Sub, Gain, Gain) => Ok(Gain),
+        (BinOp::Add | BinOp::Sub, I32, Gain) => err(Some(
+            "integers have no level; convert with `f32(...)` first",
+        )),
+        (BinOp::Add | BinOp::Sub, Gain, _) => err(Some(
+            "the level comes after the signal, as in `voice - 6dB`",
+        )),
+        (BinOp::Mul | BinOp::Div, Sample, Gain) | (BinOp::Mul, Gain, Sample) => err(Some(
+            "to change a signal's level, add or subtract it, as in `voice - 6dB`",
+        )),
+        (BinOp::Mul, Gain, Num | F32 | I32) | (BinOp::Mul, Num | F32 | I32, Gain) => Ok(Gain),
+        (BinOp::Div, Gain, Num | F32 | I32) => Ok(Gain),
+        (BinOp::Div, Gain, Gain) => Ok(F32),
+        _ => err(None),
     }
 }
 

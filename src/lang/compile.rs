@@ -684,6 +684,10 @@ impl Compiler<'_> {
                 let v = self.expr(x)?;
                 match op {
                     UnOp::Plus => Ok(v),
+                    // `-6dB`: gains are factors, so negating one inverts it.
+                    UnOp::Neg if is_gain(&self.types[x.id as usize]) => {
+                        self.zip2(Op2::Div, &CVal::Scalar(Operand::Const(1.0)), &v)
+                    }
                     UnOp::Neg => self.map1(Op1::Neg, &v),
                     UnOp::Not => self.map1(Op1::Not, &v),
                 }
@@ -691,6 +695,13 @@ impl Compiler<'_> {
             ExprKind::Binary(op, a, b) => {
                 let va = self.expr(a)?;
                 let vb = self.expr(b)?;
+                let (ga, gb) = (
+                    is_gain(&self.types[a.id as usize]),
+                    is_gain(&self.types[b.id as usize]),
+                );
+                if ga || gb {
+                    return self.gain_binary(*op, &va, &vb, ga, gb, &self.types[e.id as usize]);
+                }
                 let op = op2_for(*op, &self.types[e.id as usize]);
                 self.zip2(op, &va, &vb)
             }
@@ -1076,6 +1087,40 @@ impl Compiler<'_> {
         Ok(CVal::Frame(out))
     }
 
+    /// An operator with a `Gain` on one side. Gains are amplitude factors,
+    /// so moving in level multiplies and scaling a level raises to a power.
+    fn gain_binary(
+        &mut self,
+        op: BinOp,
+        a: &CVal,
+        b: &CVal,
+        a_gain: bool,
+        b_gain: bool,
+        result: &Type,
+    ) -> CResult<CVal> {
+        let one = CVal::Scalar(Operand::Const(1.0));
+        match (op, a_gain, b_gain) {
+            // `x + g`, `x - g`, and combining levels.
+            (BinOp::Add, _, true) => self.zip2(Op2::Mul, a, b),
+            (BinOp::Sub, _, true) => self.zip2(Op2::Div, a, b),
+            // Scaling a level: half of -6dB is -3dB.
+            (BinOp::Mul, true, false) => self.zip2(Op2::Pow, a, b),
+            (BinOp::Mul, false, true) => self.zip2(Op2::Pow, b, a),
+            (BinOp::Div, true, false) => {
+                let inverse = self.zip2(Op2::Div, &one, b)?;
+                self.zip2(Op2::Pow, a, &inverse)
+            }
+            // The ratio of two levels, as a plain number.
+            (BinOp::Div, true, true) => {
+                let la = self.map1(Op1::Log, a)?;
+                let lb = self.map1(Op1::Log, b)?;
+                self.zip2(Op2::Div, &la, &lb)
+            }
+            // Comparisons work on the factors directly.
+            _ => self.zip2(op2_for(op, result), a, b),
+        }
+    }
+
     /// A direct call of a built-in: arguments by position or name, with
     /// defaults for the rest.
     fn call_builtin(&mut self, span: Span, name: &str, args: &[Arg]) -> CResult<CVal> {
@@ -1115,7 +1160,13 @@ impl Compiler<'_> {
             return Ok(vals[0].reshape(out));
         }
         match (name, vals.as_slice()) {
-            ("f32" | "sample", [x]) => Ok(x.clone()),
+            // A gain is stored as its amplitude factor, so the level of an
+            // amplitude is its size, kept above -120dB so silence stays finite.
+            ("level", [x]) => {
+                let size = self.map1(Op1::Abs, x)?;
+                self.zip2(Op2::Max, &size, &CVal::Scalar(Operand::Const(1e-6)))
+            }
+            ("amp" | "f32" | "sample", [x]) => Ok(x.clone()),
             ("pow", [x, y]) => self.zip2(Op2::Pow, x, y),
             ("min", [x, y]) => self.zip2(Op2::Min, x, y),
             ("max", [x, y]) => self.zip2(Op2::Max, x, y),
@@ -1139,6 +1190,15 @@ fn event_fields_for(param: &str) -> &'static [&'static str] {
         "note" => &["pitch", "velocity", "release"],
         "control" => &["channel", "index"],
         _ => &["pitch", "velocity", "release", "channel", "index"],
+    }
+}
+
+/// A `Gain`, or a frame of them.
+fn is_gain(t: &Type) -> bool {
+    match t {
+        Type::Gain => true,
+        Type::Frame(elem, _) => **elem == Type::Gain,
+        _ => false,
     }
 }
 

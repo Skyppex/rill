@@ -14,6 +14,12 @@ rill saw(freq: Freq, phase_offset: Float = 0) Sample {
     return wrap(phase + phase_offset) * 2 - 1
 }
 
+rill square(freq: Freq) Sample {
+    state phase: Float = 0
+    phase = wrap(phase + freq / RATE)
+    return if phase < 0.5 { 1 } else { -1 }
+}
+
 rill bright(freq: Freq, phase_offset: Float = 0) Sample {
     state phase: Float = 0
     phase = wrap(phase + freq / RATE)
@@ -67,6 +73,36 @@ rill unison<N>(pitch: Freq, spread: Interval) [Freq; N] {
     return pitches
 }
 
+rill lowpass(x: Sample, cutoff: Freq) Sample {
+    state y = 0.0
+
+    let alpha = 1.0 - exp(-2.0 * PI * cutoff / RATE)
+
+    y += alpha * (x - y)
+
+    return y
+}
+
+rill gain(x: Sample, gain: Gain) Sample {
+    return x + gain
+}
+
 rill main(volume: Gain = -12dB) [Sample; 2] {
-    return (unison<5>(440Hz, 2cents) |> saw |> unison_pan |> sum) / 5 + volume
+    return (
+        (
+            unison<32>(440Hz, 25cents)
+                |> square
+                |> lowpass(8000Hz)
+                |> lowpass(8000Hz)
+                |> unison_pan
+                |> lowpass(8000Hz)
+                |> lowpass(8000Hz)
+                |> sum
+                |> lowpass(8000Hz)
+                |> lowpass(8000Hz)
+                |> gain(24dB)
+        )
+            / 32
+        + volume
+    )
 }

@@ -32,7 +32,7 @@ Design principles:
 
 Two kinds of definitions: `fn` for pure functions on values, and `rill` for stream processors with optional state. A file contains only definitions; running it instantiates its entry rill, `main` unless another is named, and plays what that rill returns. All syntax here is provisional.
 
-```
+```rill
 // Pure function on one value. Takes exactly what it declares.
 fn abs(x: Sample) Sample {
     if x < 0 { -x } else { x }
@@ -112,7 +112,7 @@ Optional channel layouts name positions without changing the type: `type Surroun
 
 A note name is an abstract `Pitch`, not a frequency; it becomes `Freq` only when it goes through a tuning. A tuning is an ordinary function from `Pitch` to `Freq`. Raw `Hz` literals bypass tuning entirely.
 
-```
+```rill
 E4 |> equal(24, a4: 432Hz) |> sine      // quarter tones, A4 at 432Hz
 E4 |> just(C) |> sine                   // just intonation on C
 (E4 + 4st) |> equal |> sine             // Pitch + Interval -> Pitch
@@ -123,7 +123,7 @@ let tuning = fn(p: Pitch) Freq { pythagorean(p, D) }   // pick one, pass it arou
 
 The built-in tunings take the pitch first, so pipes read naturally:
 
-```
+```rill
 equal(pitch: Pitch, steps: Int = 12, a4: Freq = 440Hz) Freq
 just(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) Freq
 pythagorean(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) Freq
@@ -143,7 +143,7 @@ Rules:
 
 A level change is a `Gain`, written in decibels. A signal moves up or down in level with `+` and `-`, the way a pitch moves by an interval; the level always comes after the signal.
 
-```
+```rill
 voice - 6dB                     // half the amplitude
 voice + volume                  // volume: Gain, e.g. a live control
 [l, r] - [0dB, 6dB]             // a level per channel
@@ -162,7 +162,7 @@ Rules:
 
 Fns are values: they can be bound with `let`, passed to fns and rills, returned from fns, and chosen while playing. Anonymous fns use the named syntax without the name.
 
-```
+```rill
 fn a432(p: Pitch) Freq { 432Hz * pow(2, (p - A4) / 12st) }
 
 rill voice(pitch: Pitch, tune: fn(Pitch) Freq) Sample {

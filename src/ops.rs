@@ -47,7 +47,7 @@ pub enum Op1 {
     Round,
     /// Fractional part, in [0, 1).
     Wrap,
-    /// Toward zero, for conversion to `Int`.
+    /// Toward zero, for `x as Int`.
     Trunc,
     /// Per-tick multiplier that decays by 60 dB over the given seconds.
     Decay,
@@ -171,7 +171,6 @@ impl Op1 {
             "ceil" => Op1::Ceil,
             "round" => Op1::Round,
             "wrap" => Op1::Wrap,
-            "Int" => Op1::Trunc,
             "decay" => Op1::Decay,
             _ => return None,
         })

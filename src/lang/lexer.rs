@@ -79,6 +79,7 @@ pub enum TokenKind {
     Return,
     If,
     Else,
+    As,
     True,
     False,
     // Punctuation.
@@ -127,6 +128,7 @@ impl TokenKind {
             Return => "`return`",
             If => "`if`",
             Else => "`else`",
+            As => "`as`",
             True => "`true`",
             False => "`false`",
             LParen => "`(`",
@@ -172,14 +174,17 @@ pub struct Token {
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
-    Lexer {
-        src,
-        bytes: src.as_bytes(),
-        pos: 0,
-        newline: false,
-        tokens: Vec::new(),
-    }
-    .run()
+    Lexer::new(src, false).run()
+}
+
+/// Lex all of `src`, reporting every error instead of stopping at the
+/// first. A bad character is skipped and a bad unit dropped, so the tokens
+/// are always usable. For tools such as editors, which need something to
+/// work with while the text is broken.
+pub fn lex_partial(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+    let mut lexer = Lexer::new(src, true);
+    let tokens = lexer.run_inner().expect("a recovering lexer does not fail");
+    (tokens, lexer.errors)
 }
 
 struct Lexer<'a> {
@@ -188,9 +193,35 @@ struct Lexer<'a> {
     pos: usize,
     newline: bool,
     tokens: Vec<Token>,
+    /// Keep going after an error, collecting it in `errors`.
+    recover: bool,
+    errors: Vec<Diagnostic>,
 }
 
-impl Lexer<'_> {
+impl<'a> Lexer<'a> {
+    fn new(src: &'a str, recover: bool) -> Lexer<'a> {
+        Lexer {
+            src,
+            bytes: src.as_bytes(),
+            pos: 0,
+            newline: false,
+            tokens: Vec::new(),
+            recover,
+            errors: Vec::new(),
+        }
+    }
+
+    /// Report `d`: an error when stopping at the first problem, otherwise
+    /// recorded so lexing can go on.
+    fn fail(&mut self, d: Diagnostic) -> Result<(), Diagnostic> {
+        if self.recover {
+            self.errors.push(d);
+            Ok(())
+        } else {
+            Err(d)
+        }
+    }
+
     fn peek(&self, ahead: usize) -> u8 {
         self.bytes.get(self.pos + ahead).copied().unwrap_or(0)
     }
@@ -205,13 +236,17 @@ impl Lexer<'_> {
     }
 
     fn run(mut self) -> Result<Vec<Token>, Diagnostic> {
+        self.run_inner()
+    }
+
+    fn run_inner(&mut self) -> Result<Vec<Token>, Diagnostic> {
         loop {
             self.skip_trivia()?;
             let start = self.pos;
             let c = self.peek(0);
             if c == 0 && self.pos >= self.bytes.len() {
                 self.push(TokenKind::Eof, start);
-                return Ok(self.tokens);
+                return Ok(std::mem::take(&mut self.tokens));
             }
             if c.is_ascii_digit() {
                 let kind = self.number()?;
@@ -235,6 +270,7 @@ impl Lexer<'_> {
                     "return" => TokenKind::Return,
                     "if" => TokenKind::If,
                     "else" => TokenKind::Else,
+                    "as" => TokenKind::As,
                     "true" => TokenKind::True,
                     "false" => TokenKind::False,
                     _ => TokenKind::Ident,
@@ -279,7 +315,7 @@ impl Lexer<'_> {
                         let ch = self.src[start..].chars().next().unwrap();
                         let span = Span::new(start, start + ch.len_utf8());
                         let err = Diagnostic::error(span, format!("unexpected character `{ch}`"));
-                        return Err(if ch == '|' {
+                        self.fail(if ch == '|' {
                             err.with_help("use `|>` to pipe or `||` for logical or")
                         } else if ch == '&' {
                             err.with_help("use `&&` for logical and")
@@ -287,7 +323,9 @@ impl Lexer<'_> {
                             err.with_help("`#` only appears in note names, like `F#4`")
                         } else {
                             err
-                        });
+                        })?;
+                        self.pos = start + ch.len_utf8();
+                        continue;
                     }
                 },
             };
@@ -316,10 +354,11 @@ impl Lexer<'_> {
                     while depth > 0 {
                         match (self.peek(0), self.peek(1)) {
                             (0, _) if self.pos >= self.bytes.len() => {
-                                return Err(Diagnostic::error(
+                                self.fail(Diagnostic::error(
                                     Span::new(start, start + 2),
                                     "unterminated block comment",
-                                ));
+                                ))?;
+                                return Ok(());
                             }
                             (b'/', b'*') => {
                                 depth += 1;
@@ -369,9 +408,16 @@ impl Lexer<'_> {
             .chars()
             .filter(|&c| c != '_')
             .collect();
-        let value: f64 = text
-            .parse()
-            .map_err(|_| Diagnostic::error(Span::new(start, self.pos), "malformed number"))?;
+        let value: f64 = match text.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                self.fail(Diagnostic::error(
+                    Span::new(start, self.pos),
+                    "malformed number",
+                ))?;
+                0.0
+            }
+        };
 
         let unit_start = self.pos;
         while self.peek(0).is_ascii_alphanumeric() || self.peek(0) == b'_' {
@@ -390,7 +436,7 @@ impl Lexer<'_> {
                         Span::new(unit_start, self.pos),
                         format!("unknown unit `{suffix}`"),
                     );
-                    return Err(
+                    self.fail(
                         match super::diag::suggest(suffix, names).or_else(|| {
                             Unit::ALL
                                 .iter()
@@ -400,7 +446,8 @@ impl Lexer<'_> {
                             Some(s) => err.with_help(format!("did you mean `{s}`?")),
                             None => err.with_help(format!("known units: {known}")),
                         },
-                    );
+                    )?;
+                    None
                 }
             }
         };
@@ -510,5 +557,34 @@ mod tests {
         );
         assert!(lex("a#").is_err());
         assert!(lex("H#4").is_err());
+    }
+
+    #[test]
+    fn partial_lexing_reports_everything_and_keeps_going() {
+        let (tokens, errors) = lex_partial("a | b 440hz é c /* open");
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "unexpected character `|`",
+                "unknown unit `hz`",
+                "unexpected character `é`",
+                "unterminated block comment"
+            ]
+        );
+        let kinds: Vec<TokenKind> = tokens.into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Ident,
+                TokenKind::Ident,
+                num(440.0, None, true),
+                TokenKind::Ident,
+                TokenKind::Eof
+            ]
+        );
+        // Valid text lexes the same either way.
+        let src = "rill f(x: Sample) -> Sample { return x |> g(300ms) }";
+        assert_eq!(lex_partial(src), (lex(src).unwrap(), vec![]));
     }
 }

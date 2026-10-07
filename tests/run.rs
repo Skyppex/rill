@@ -766,3 +766,24 @@ fn levels_per_channel_and_negated_while_playing() {
         assert!((got - want).abs() < 1e-4, "{i}: {got} vs {want}");
     }
 }
+
+#[test]
+fn casting_to_int_truncates_toward_zero() {
+    let src = "
+        rill main() -> [Sample; 4] {
+            state x: Float = 2.75
+            x = -x
+            return [
+                (x as Int) as Sample,
+                (2.75 as Int) as Sample,
+                (-2.75 as Int) as Sample,
+                (7 as Int / 2 as Int) as Sample,
+            ]
+        }
+    ";
+    // `x` is -2.75 on the first tick, read while playing.
+    assert_eq!(
+        render_with(src, 4, 1, Blocks::Fixed(1)),
+        [-2.0, 2.0, -2.0, 3.0]
+    );
+}

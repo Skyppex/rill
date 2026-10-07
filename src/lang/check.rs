@@ -35,10 +35,74 @@ pub struct Checked {
     /// Every fn and rill, in source order.
     pub signatures: Vec<Signature>,
     pub warnings: Vec<Diagnostic>,
+    /// Every named value: parameters, size parameters, `let`, `state`, and
+    /// the parameters of anonymous fns. Indexed by [`BindingId`].
+    pub bindings: Vec<Binding>,
+    /// What each name in the program refers to, by the span of the name.
+    /// Covers names in expressions, callees, named arguments, assignment
+    /// targets and types. Declarations are in `bindings` and the program's
+    /// definitions instead.
+    pub resolutions: Vec<(Span, Resolution)>,
+}
+
+/// Index into [`Checked::bindings`].
+pub type BindingId = usize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingKind {
+    Param,
+    /// A size parameter like `N` in `mix_down<N>`.
+    Size,
+    Let,
+    State,
+    /// A parameter of an anonymous fn.
+    FnParam,
+}
+
+/// A named value and where it can be used.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Binding {
+    pub name: String,
+    /// The name where it is declared.
+    pub span: Span,
+    pub kind: BindingKind,
+    pub ty: Type,
+    /// Where the name can be used: from the end of its declaration to the
+    /// end of the enclosing block, or the whole definition for parameters.
+    pub scope: Span,
+    /// Index of the fn or rill it belongs to, into [`Checked::signatures`]
+    /// (the same as the program's items).
+    pub def: usize,
+}
+
+/// What a name refers to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Resolution {
+    Binding(BindingId),
+    /// A fn or rill, by index into [`Checked::signatures`].
+    Def(usize),
+    Builtin(String),
+    Constant(String),
+    /// A note name like `F#4`.
+    Note,
+    /// A built-in type like `Sample`.
+    Type,
 }
 
 /// Check `program`. On failure the list holds the errors and any warnings.
 pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
+    let (checked, diags) = check_partial(program);
+    if diags.iter().any(Diagnostic::is_error) {
+        Err(diags)
+    } else {
+        Ok(checked)
+    }
+}
+
+/// Check `program` and return everything found, errors or not, for tools
+/// such as editors. Where something is wrong, types are
+/// [`Type::Error`]. The list holds the errors and warnings, by position.
+pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
     let mut c = Checker {
         defs: HashMap::new(),
         signatures: Vec::new(),
@@ -53,6 +117,12 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
         tail_expect: None,
         calls: HashMap::new(),
         def_order: Vec::new(),
+        bindings: Vec::new(),
+        resolutions: Vec::new(),
+        def_bindings: Vec::new(),
+        scope_spans: Vec::new(),
+        sizes: Vec::new(),
+        current_def: 0,
     };
 
     for item in &program.items {
@@ -67,19 +137,20 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
 
     c.check_recursion();
 
-    let (errors, warnings): (Vec<_>, Vec<_>) = c.diags.into_iter().partition(|d| d.is_error());
-    if errors.is_empty() {
-        Ok(Checked {
-            types: c.types,
-            signatures: c.signatures,
-            warnings,
-        })
-    } else {
-        let mut all = errors;
-        all.extend(warnings);
-        all.sort_by_key(|d| d.span.start);
-        Err(all)
-    }
+    let warnings = c.diags.iter().filter(|d| !d.is_error()).cloned().collect();
+    let (mut errors, others): (Vec<_>, Vec<_>) = c.diags.into_iter().partition(|d| d.is_error());
+    // Errors first, so a stable sort keeps them ahead of warnings at the
+    // same place.
+    errors.extend(others);
+    errors.sort_by_key(|d| d.span.start);
+    let checked = Checked {
+        types: c.types,
+        signatures: c.signatures,
+        warnings,
+        bindings: c.bindings,
+        resolutions: c.resolutions,
+    };
+    (checked, errors)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +172,7 @@ enum VarKind {
 struct Var {
     ty: Type,
     kind: VarKind,
+    id: BindingId,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -133,9 +205,43 @@ struct Checker {
     /// Mentioning a fn as a value counts as a call.
     calls: HashMap<String, Vec<(String, Span)>>,
     def_order: Vec<String>,
+    bindings: Vec<Binding>,
+    resolutions: Vec<(Span, Resolution)>,
+    /// Per definition: the bindings of its size parameters and parameters.
+    def_bindings: Vec<(Vec<BindingId>, Vec<BindingId>)>,
+    /// The span of each scope in `scopes`, for [`Binding::scope`].
+    scope_spans: Vec<Span>,
+    /// Size parameters of the definition being looked at, for resolving
+    /// sizes in types.
+    sizes: Vec<(String, BindingId)>,
+    /// Index of the definition being checked.
+    current_def: usize,
 }
 
 impl Checker {
+    fn resolve(&mut self, span: Span, r: Resolution) {
+        self.resolutions.push((span, r));
+    }
+
+    fn new_binding(
+        &mut self,
+        name: &Ident,
+        kind: BindingKind,
+        ty: Type,
+        scope: Span,
+        def: usize,
+    ) -> BindingId {
+        self.bindings.push(Binding {
+            name: name.name.clone(),
+            span: name.span,
+            kind,
+            ty,
+            scope,
+            def,
+        });
+        self.bindings.len() - 1
+    }
+
     fn error(&mut self, span: Span, message: impl Into<String>) -> Diagnostic {
         Diagnostic::error(span, message)
     }
@@ -167,6 +273,18 @@ impl Checker {
             }
             generics.push(g.name.clone());
         }
+        let index = self.signatures.len();
+        let generic_ids: Vec<BindingId> = d
+            .generics
+            .iter()
+            .map(|g| self.new_binding(g, BindingKind::Size, Type::Num, d.span, index))
+            .collect();
+        self.sizes = generics
+            .iter()
+            .cloned()
+            .zip(generic_ids.iter().copied())
+            .collect();
+        let mut param_ids = Vec::new();
 
         let mut params = Vec::new();
         let mut seen = HashSet::new();
@@ -179,6 +297,13 @@ impl Checker {
                 self.report(e);
             }
             let ty = self.resolve_type(&p.ty, &generics);
+            param_ids.push(self.new_binding(
+                &p.name,
+                BindingKind::Param,
+                ty.clone(),
+                d.body.span,
+                index,
+            ));
             if let Some(default) = &p.default {
                 self.check_default(default, &ty, &p.name.name);
             }
@@ -189,6 +314,8 @@ impl Checker {
             });
         }
         let ret = self.resolve_type(&d.ret, &generics);
+        self.sizes.clear();
+        self.def_bindings.push((generic_ids, param_ids));
 
         for g in &d.generics {
             let used = params.iter().any(|p| mentions_size(&p.ty, &g.name));
@@ -246,31 +373,13 @@ impl Checker {
 
     fn resolve_type(&mut self, te: &TypeExpr, generics: &[String]) -> Type {
         match te {
-            TypeExpr::Named(id) => match id.name.as_str() {
-                "Sample" => Type::Sample,
-                "Float" => Type::Float,
-                "Int" => Type::Int,
-                "Bool" => Type::Bool,
-                "Freq" => Type::Freq,
-                "Pitch" => Type::Pitch,
-                "Time" => Type::Time,
-                "Interval" => Type::Interval,
-                "Gain" => Type::Gain,
-                other => {
-                    const KNOWN: [&str; 9] = [
-                        "Sample", "Float", "Int", "Bool", "Freq", "Pitch", "Time", "Interval",
-                        "Gain",
-                    ];
-                    let mut e = self.error(id.span, format!("unknown type `{other}`"));
-                    if let Some(help) = renamed_type(other) {
-                        e = e.with_help(help);
-                    } else if let Some(s) = suggest(other, KNOWN) {
-                        e = e.with_help(format!("did you mean `{s}`?"));
-                    }
-                    self.report(e);
-                    Type::Error
+            TypeExpr::Named(id) => {
+                let t = self.named_type(id);
+                if t != Type::Error {
+                    self.resolve(id.span, Resolution::Type);
                 }
-            },
+                t
+            }
             TypeExpr::Frame { elem, size, span } => {
                 let elem_ty = self.resolve_type(elem, generics);
                 if matches!(elem_ty, Type::Frame(..)) {
@@ -291,6 +400,9 @@ impl Checker {
                             self.report(e);
                             return Type::Error;
                         }
+                        if let Some(&(_, b)) = self.sizes.iter().find(|(n, _)| *n == id.name) {
+                            self.resolve(id.span, Resolution::Binding(b));
+                        }
                         Size::Var(id.name.clone())
                     }
                 };
@@ -307,6 +419,34 @@ impl Checker {
         }
     }
 
+    /// A built-in type by name, or an error.
+    fn named_type(&mut self, id: &Ident) -> Type {
+        match id.name.as_str() {
+            "Sample" => Type::Sample,
+            "Float" => Type::Float,
+            "Int" => Type::Int,
+            "Bool" => Type::Bool,
+            "Freq" => Type::Freq,
+            "Pitch" => Type::Pitch,
+            "Time" => Type::Time,
+            "Interval" => Type::Interval,
+            "Gain" => Type::Gain,
+            other => {
+                const KNOWN: [&str; 9] = [
+                    "Sample", "Float", "Int", "Bool", "Freq", "Pitch", "Time", "Interval", "Gain",
+                ];
+                let mut e = self.error(id.span, format!("unknown type `{other}`"));
+                if let Some(help) = renamed_type(other) {
+                    e = e.with_help(help);
+                } else if let Some(s) = suggest(other, KNOWN) {
+                    e = e.with_help(format!("did you mean `{s}`?"));
+                }
+                self.report(e);
+                Type::Error
+            }
+        }
+    }
+
     // ---- bodies -------------------------------------------------------
 
     fn check_def(&mut self, d: &Def, index: usize) {
@@ -319,26 +459,32 @@ impl Checker {
         self.current = Some(d.name.name.clone());
         self.ret = sig.ret.clone();
 
+        self.current_def = index;
+        let (generic_ids, param_ids) = self.def_bindings[index].clone();
         let mut scope = HashMap::new();
-        for g in &sig.generics {
+        for (g, &id) in sig.generics.iter().zip(&generic_ids) {
             scope.insert(
                 g.clone(),
                 Var {
                     ty: Type::Num,
                     kind: VarKind::Size,
+                    id,
                 },
             );
         }
-        for p in &sig.params {
+        for (p, &id) in sig.params.iter().zip(&param_ids) {
             scope.insert(
                 p.name.clone(),
                 Var {
                     ty: p.ty.clone(),
                     kind: VarKind::Param,
+                    id,
                 },
             );
         }
         self.scopes = vec![scope];
+        self.scope_spans = vec![d.span];
+        self.sizes = sig.generics.iter().cloned().zip(generic_ids).collect();
 
         if sig.kind == DefKind::Fn {
             self.tail_expect = Some(sig.ret.clone());
@@ -373,6 +519,7 @@ impl Checker {
     fn block(&mut self, b: &Block, allow_state: bool) -> (Type, bool) {
         let tail = self.tail_expect.take();
         self.scopes.push(HashMap::new());
+        self.scope_spans.push(b.span);
         let mut value = Type::Unit;
         let mut diverged = false;
         for (i, s) in b.stmts.iter().enumerate() {
@@ -399,6 +546,7 @@ impl Checker {
             }
         }
         self.scopes.pop();
+        self.scope_spans.pop();
         if diverged {
             (Type::Never, true)
         } else {
@@ -406,11 +554,24 @@ impl Checker {
         }
     }
 
-    fn bind(&mut self, name: &str, ty: Type, kind: VarKind) {
+    /// Bind `name` in the innermost scope, usable from `visible_from` on.
+    fn bind(&mut self, name: &Ident, ty: Type, kind: VarKind, visible_from: u32) {
+        let end = self.scope_spans.last().map_or(visible_from, |s| s.end);
+        let binding_kind = match kind {
+            VarKind::Param => BindingKind::Param,
+            VarKind::Let => BindingKind::Let,
+            VarKind::State => BindingKind::State,
+            VarKind::Size => BindingKind::Size,
+        };
+        let scope = Span {
+            start: visible_from,
+            end,
+        };
+        let id = self.new_binding(name, binding_kind, ty.clone(), scope, self.current_def);
         self.scopes
             .last_mut()
             .expect("a scope is always open")
-            .insert(name.to_owned(), Var { ty, kind });
+            .insert(name.name.clone(), Var { ty, kind, id });
     }
 
     fn lookup(&self, name: &str) -> Option<&Var> {
@@ -425,7 +586,10 @@ impl Checker {
     fn stmt(&mut self, s: &Stmt, allow_state: bool, last: bool) -> (Type, bool) {
         match s {
             Stmt::Let {
-                name, ty, value, ..
+                name,
+                ty,
+                value,
+                span,
             } => {
                 let declared = ty
                     .as_ref()
@@ -442,7 +606,7 @@ impl Checker {
                     }
                     None => t.clone(),
                 };
-                self.bind(&name.name, bound, VarKind::Let);
+                self.bind(name, bound, VarKind::Let, span.end);
                 (Type::Unit, t == Type::Never)
             }
             Stmt::State {
@@ -492,11 +656,15 @@ impl Checker {
                     );
                     self.report(e);
                 }
-                self.bind(&name.name, bound, VarKind::State);
+                self.bind(name, bound, VarKind::State, span.end);
                 (Type::Unit, false)
             }
             Stmt::Assign { target, value, .. } => {
                 let t = self.expr(value);
+                if let Some(var) = self.lookup(&target.name) {
+                    let id = var.id;
+                    self.resolve(target.span, Resolution::Binding(id));
+                }
                 let captured = matches!(
                     (self.lambda_floor, self.lookup_depth(&target.name)),
                     (Some(floor), Some(depth)) if depth < floor
@@ -554,18 +722,20 @@ impl Checker {
                     return (Type::Unit, false);
                 }
                 self.scopes.push(HashMap::new());
+                self.scope_spans.push(body.span);
                 for param in params {
                     let ty = if param.name == "cc" {
                         Type::Sample
                     } else {
                         Type::Event
                     };
-                    self.bind(&param.name, ty, VarKind::Let);
+                    self.bind(param, ty, VarKind::Let, param.span.end);
                 }
                 let saved = std::mem::replace(&mut self.in_event, true);
                 let (_, diverged) = self.block(body, false);
                 self.in_event = saved;
                 self.scopes.pop();
+                self.scope_spans.pop();
                 (Type::Unit, diverged)
             }
             Stmt::Expr(e) => {
@@ -606,13 +776,16 @@ impl Checker {
             }
             ExprKind::Bool(_) => Type::Bool,
             ExprKind::Name(name) => {
-                if let Some(var) = self.lookup(name) {
-                    return var.ty.clone();
+                if let Some(var) = self.lookup(name).cloned() {
+                    self.resolve(e.span, Resolution::Binding(var.id));
+                    return var.ty;
                 }
                 if pitch_literal(name).is_some() {
+                    self.resolve(e.span, Resolution::Note);
                     return Type::Pitch;
                 }
                 if let Some(t) = builtins::constant(name) {
+                    self.resolve(e.span, Resolution::Constant(name.clone()));
                     return t.clone();
                 }
                 if self.defs.contains_key(name) || !builtins::lookup(name).is_empty() {
@@ -786,6 +959,11 @@ impl Checker {
                 }
             }
             ExprKind::Fn { params, ret, body } => self.lambda(e, params, ret.as_ref(), body, None),
+            ExprKind::Cast(x, te) => {
+                let from = self.expr(x);
+                let to = self.resolve_type(te, &self.generics());
+                self.cast(e.span, &from, to)
+            }
             ExprKind::Field(base, field) => {
                 let base_ty = self.expr(base);
                 if base_ty == Type::Event {
@@ -825,6 +1003,7 @@ impl Checker {
 
         // A variable holding a function.
         if let Some(var) = self.lookup(name).cloned() {
+            self.resolve(callee.span, Resolution::Binding(var.id));
             if let Type::Fn(params, ret) = &var.ty {
                 return self.call_value(span, callee, args, params, ret);
             }
@@ -864,6 +1043,14 @@ impl Checker {
             return Type::Error;
         }
 
+        let def = self.defs.get(name).copied();
+        self.resolve(
+            callee.span,
+            match def {
+                Some(i) => Resolution::Def(i),
+                None => Resolution::Builtin(name.to_owned()),
+            },
+        );
         let kind = sigs[0].kind;
         if kind == DefKind::Rill && self.place == Place::Fn {
             let d = if self.lambda_floor.is_some() {
@@ -939,7 +1126,13 @@ impl Checker {
                 Some(id) => {
                     seen_named = true;
                     match sig.params.iter().position(|p| p.name == id.name) {
-                        Some(pi) => pi,
+                        Some(pi) => {
+                            if let Some(i) = def {
+                                let param = self.def_bindings[i].1[pi];
+                                self.resolve(id.span, Resolution::Binding(param));
+                            }
+                            pi
+                        }
                         None => {
                             let mut d = self
                                 .error(id.span, format!("`{name}` has no parameter `{}`", id.name));
@@ -1194,6 +1387,11 @@ impl Checker {
             Some(&i) => vec![self.signatures[i].clone()],
             None => builtins::lookup(name),
         };
+        let r = match self.defs.get(name) {
+            Some(&i) => Resolution::Def(i),
+            None => Resolution::Builtin(name.to_owned()),
+        };
+        self.resolve(span, r);
         let kind = sigs[0].kind;
         if kind == DefKind::Rill {
             let d = self
@@ -1299,11 +1497,19 @@ impl Checker {
                     Type::Error
                 }
             };
+            let id = self.new_binding(
+                &p.name,
+                BindingKind::FnParam,
+                ty.clone(),
+                body.span,
+                self.current_def,
+            );
             scope.insert(
                 p.name.name.clone(),
                 Var {
                     ty: ty.clone(),
                     kind: VarKind::Param,
+                    id,
                 },
             );
             param_types.push(ty);
@@ -1316,9 +1522,11 @@ impl Checker {
         let saved_event = std::mem::replace(&mut self.in_event, false);
         let saved_floor = self.lambda_floor.replace(self.scopes.len());
         self.scopes.push(scope);
+        self.scope_spans.push(body.span);
         self.tail_expect = declared.clone();
         let (t, diverges) = self.block(body, false);
         self.scopes.pop();
+        self.scope_spans.pop();
         self.place = saved_place;
         self.ret = saved_ret;
         self.in_event = saved_event;
@@ -1348,12 +1556,49 @@ impl Checker {
         Type::Fn(param_types, Box::new(ret))
     }
 
+    /// `x as to`. Plain numbers convert between `Sample`, `Float` and
+    /// `Int`; units and levels never disappear by a cast.
+    fn cast(&mut self, span: Span, from: &Type, to: Type) -> Type {
+        if from.is_wild() || to.is_wild() {
+            return Type::Error;
+        }
+        if !matches!(to, Type::Sample | Type::Float | Type::Int) {
+            let d = self
+                .error(span, format!("cannot cast to `{to}`"))
+                .with_help("`as` converts between `Sample`, `Float` and `Int`");
+            self.report(d);
+            return Type::Error;
+        }
+        if from.is_plain() {
+            return to;
+        }
+        let help = match from {
+            Type::Freq => {
+                Some("units never disappear on their own; divide by one, as in `x / 1Hz`")
+            }
+            Type::Time => Some("units never disappear on their own; divide by one, as in `x / 1s`"),
+            Type::Interval => {
+                Some("units never disappear on their own; divide by one, as in `x / 1st`")
+            }
+            Type::Gain => Some("use `amp(x)` for the amplitude factor of a level"),
+            Type::Bool => Some("pick the numbers yourself, as in `if b { 1 } else { 0 }`"),
+            Type::Frame(..) => Some("cast the channels one at a time, as in `x[0] as Float`"),
+            _ => None,
+        };
+        let mut d = self.error(span, format!("cannot cast `{from}` to `{to}`"));
+        if let Some(h) = help {
+            d = d.with_help(h);
+        }
+        self.report(d);
+        Type::Error
+    }
+
     /// Known before audio starts: literals, built-in constants, size
     /// parameters, and built-in functions of those.
     fn is_const(&self, e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Number { .. } | ExprKind::Bool(_) => true,
-            ExprKind::Unary(_, x) => self.is_const(x),
+            ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => self.is_const(x),
             ExprKind::Binary(_, a, b) => self.is_const(a) && self.is_const(b),
             ExprKind::Frame(xs) => xs.iter().all(|x| self.is_const(x)),
             ExprKind::Name(n) => match self.lookup(n) {
@@ -1443,9 +1688,9 @@ fn renamed_type(name: &str) -> Option<String> {
 /// Help for a conversion called by its old name.
 fn renamed_conversion(name: &str) -> Option<&'static str> {
     Some(match name {
-        "sample" => "conversions are named after the types: `Sample(...)`",
-        "f32" => "conversions are named after the types: `Float(...)`",
-        "i32" => "conversions are named after the types: `Int(...)`",
+        "sample" | "Sample" => "convert with `as`, as in `x as Sample`",
+        "f32" | "Float" => "convert with `as`, as in `x as Float`",
+        "i32" | "Int" => "convert with `as`, as in `x as Int`",
         _ => return None,
     })
 }
@@ -1497,7 +1742,7 @@ fn mismatch(span: Span, what: &str, expected: &Type, found: &Type) -> Diagnostic
         ));
     }
     if found.is_plain() && *expected == Type::Int {
-        return d.with_help("convert it with `Int(...)`");
+        return d.with_help("convert it with `as`, as in `x as Int`");
     }
     if *found == Type::Int && expected.is_plain() {
         return d.with_help(format!("convert it with `{expected}(...)`"));
@@ -1688,7 +1933,7 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
                 unit_example(dim)
             ))
         } else if (*a == Type::Int && b.is_plain()) || (*b == Type::Int && a.is_plain()) {
-            Some("convert the `Int` with `Float(...)` or `Sample(...)`".into())
+            Some("convert the `Int` with `as Float` or `as Sample`".into())
         } else if (a.is_plain() && b.is_dimensioned()) || (b.is_plain() && a.is_dimensioned()) {
             let (plain, dim) = if a.is_plain() { (a, b) } else { (b, a) };
             Some(format!(
@@ -1785,7 +2030,7 @@ fn gain_arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
         (BinOp::Add | BinOp::Sub, Num | Sample | Float, Gain) => Ok(a.clone()),
         (BinOp::Add | BinOp::Sub, Gain, Gain) => Ok(Gain),
         (BinOp::Add | BinOp::Sub, Int, Gain) => err(Some(
-            "integers have no level; convert with `Float(...)` first",
+            "integers have no level; convert with `as Float` first",
         )),
         (BinOp::Add | BinOp::Sub, Gain, _) => err(Some(
             "the level comes after the signal, as in `voice - 6dB`",

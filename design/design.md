@@ -91,6 +91,8 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `Gain` | A level change, written in `dB` | Any plain number is an amplitude factor (see Levels) |
 | `fn(A, B) -> R` | A function value | See Functions as values |
 
+Plain numbers convert with `as`: `x as Float`, `x as Sample`, `x as Int` (which truncates toward zero). `as` binds tighter than arithmetic, so `a + b as Int` casts only `b`. Units and levels never disappear by a cast: `freq / 1Hz` gives a plain number, and `amp(g)` the factor of a level.
+
 Lifting rules:
 
 1. A `fn` takes exactly what it declares and never lifts. It is called from bodies, where values are already per tick; to accept channels it says so with a size parameter (`fn f<N>(x: [Sample; N])`). Built-in functions follow the same rule.

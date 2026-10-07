@@ -627,7 +627,7 @@ fn names_and_suggestions() {
     assert_eq!(msg, "unknown fn or rill `f32`");
     assert_eq!(
         help.as_deref(),
-        Some("conversions are named after the types: `Float(...)`")
+        Some("convert with `as`, as in `x as Float`")
     );
 }
 
@@ -891,9 +891,9 @@ fn levels_move_signals_up_and_down() {
             "to change a signal's level, add or subtract it, as in `voice - 6dB`",
         ),
         (
-            "let v = Int(3) - 6dB",
+            "let v = 3 as Int - 6dB",
             "cannot subtract `Int` and `Gain`",
-            "integers have no level; convert with `Float(...)` first",
+            "integers have no level; convert with `as Float` first",
         ),
         (
             "let q = level(sine(1Hz)) < 0.5",
@@ -923,4 +923,53 @@ fn named_fns_only_at_the_top_level() {
         errs[0].help.as_deref(),
         Some("leave the name out for an anonymous fn, as in `let double = fn(x) { ... }`")
     );
+}
+
+#[test]
+fn casts_with_as() {
+    let t = |stmts: &str, name: &str| type_of(&with_sine(stmts), name);
+    // `as` binds tighter than `*`: this casts only the 10.
+    assert_eq!(
+        error(&with_sine("let i = sine(1Hz) * 10 as Int")).0,
+        "cannot multiply `Sample` and `Int`"
+    );
+    assert_eq!(t("let i = (sine(1Hz) * 10) as Int", "i"), Type::Int);
+    assert_eq!(t("let f = 3 as Int as Float", "f"), Type::Float);
+    assert_eq!(t("let s = 2.5 as Sample", "s"), Type::Sample);
+    // A leading `-` binds tighter: this is `(-x) as Int`.
+    let stmts = parse_body("let i = -x as Int").unwrap();
+    let Stmt::Let { value, .. } = &stmts[0] else {
+        panic!()
+    };
+    let ExprKind::Cast(inner, _) = &value.kind else {
+        panic!("{value:?}")
+    };
+    assert!(matches!(inner.kind, ExprKind::Unary(..)));
+
+    for (stmts, msg, help) in [
+        (
+            "let f = 440Hz as Float",
+            "cannot cast `Freq` to `Float`",
+            Some("units never disappear on their own; divide by one, as in `x / 1Hz`"),
+        ),
+        (
+            "let f = -6dB as Float",
+            "cannot cast `Gain` to `Float`",
+            Some("use `amp(x)` for the amplitude factor of a level"),
+        ),
+        (
+            "let f = 1 as Freq",
+            "cannot cast to `Freq`",
+            Some("`as` converts between `Sample`, `Float` and `Int`"),
+        ),
+        (
+            "let f = Float(1)",
+            "unknown fn or rill `Float`",
+            Some("convert with `as`, as in `x as Float`"),
+        ),
+    ] {
+        let (m, h) = error(&with_sine(stmts));
+        assert_eq!(m, msg, "{stmts}");
+        assert_eq!(h.as_deref(), help, "{stmts}");
+    }
 }

@@ -126,7 +126,9 @@ fn collect_lambdas<'a>(e: &'a Expr, out: &mut HashMap<u32, &'a Expr>) {
             out.insert(e.id, e);
             collect_lambdas_in_block(body, out);
         }
-        ExprKind::Unary(_, x) | ExprKind::Field(x, _) => collect_lambdas(x, out),
+        ExprKind::Unary(_, x) | ExprKind::Field(x, _) | ExprKind::Cast(x, _) => {
+            collect_lambdas(x, out)
+        }
         ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
             collect_lambdas(a, out);
             collect_lambdas(b, out);
@@ -667,6 +669,17 @@ impl Compiler<'_> {
                 }
                 Err(internal(e.span, &format!("unknown name `{name}`")))
             }
+            ExprKind::Cast(x, _) => {
+                let v = self.expr(x)?;
+                // Only `as Int` changes the value: it drops the fraction.
+                let to_int = self.types[e.id as usize] == Type::Int
+                    && self.types[x.id as usize] != Type::Int;
+                if to_int {
+                    self.map1(Op1::Trunc, &v)
+                } else {
+                    Ok(v)
+                }
+            }
             ExprKind::Fn { .. } => {
                 // Capture by value: `state` read now keeps this tick's value.
                 let mut captured = self.scopes.clone();
@@ -1166,7 +1179,7 @@ impl Compiler<'_> {
                 let size = self.map1(Op1::Abs, x)?;
                 self.zip2(Op2::Max, &size, &CVal::Scalar(Operand::Const(1e-6)))
             }
-            ("amp" | "Float" | "Sample", [x]) => Ok(x.clone()),
+            ("amp", [x]) => Ok(x.clone()),
             ("pow", [x, y]) => self.zip2(Op2::Pow, x, y),
             ("min", [x, y]) => self.zip2(Op2::Min, x, y),
             ("max", [x, y]) => self.zip2(Op2::Max, x, y),

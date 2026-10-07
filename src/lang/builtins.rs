@@ -85,10 +85,6 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         // The level of an amplitude, and the amplitude factor of a level.
         "level" => vec![sig(&[("x", t())], Type::Gain)],
         "amp" => vec![sig(&[("gain", Type::Gain)], Type::Float)],
-        // Conversions, named after the type they produce.
-        "Float" => vec![sig(&[("x", t())], Type::Float)],
-        "Int" => vec![sig(&[("x", t())], Type::Int)],
-        "Sample" => vec![sig(&[("x", t())], Type::Sample)],
         _ => Vec::new(),
     }
 }
@@ -106,6 +102,56 @@ pub fn default_value(name: &str, param: &str) -> Option<f32> {
 /// result per channel. Tunings do, so a chord can be tuned in one go.
 pub fn takes_frames(name: &str) -> bool {
     matches!(name, "equal" | "just" | "pythagorean" | "meantone")
+}
+
+/// What a built-in function or constant does, for tools such as editors.
+pub fn doc(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "PI" => "Half a turn, π ≈ 3.14159.",
+        "TAU" => {
+            "A full turn, 2π ≈ 6.28319. `sin(phase * TAU)` makes one cycle as `phase` goes from 0 to 1."
+        }
+        "RATE" => "The host sample rate. One tick lasts `1 / RATE`.",
+        "sin" => "Sine of `x`, in radians.",
+        "cos" => "Cosine of `x`, in radians.",
+        "tan" => "Tangent of `x`, in radians.",
+        "tanh" => "Hyperbolic tangent: a smooth soft clipper that maps any number into (-1, 1).",
+        "exp" => "e raised to the power `x`.",
+        "log" => "Natural logarithm of `x`.",
+        "sqrt" => "Square root of `x`.",
+        "abs" => "`x` without its sign.",
+        "floor" => "The largest whole number not above `x`.",
+        "ceil" => "The smallest whole number not below `x`.",
+        "round" => "`x` rounded to the nearest whole number.",
+        "wrap" => {
+            "The fractional part of `x`, in [0, 1). Keeps a phase from growing forever: `phase = wrap(phase + freq / RATE)`."
+        }
+        "pow" => "`x` raised to the power `y`.",
+        "min" => "The smaller of `a` and `b`, or the smallest channel of a frame.",
+        "max" => "The larger of `a` and `b`, or the largest channel of a frame.",
+        "sum" => "All channels of a frame added together; mixes a frame down to one value.",
+        "clamp" => "`x` limited to the range [`lo`, `hi`].",
+        "decay" => {
+            "Per-tick multiplier that falls by 60 dB over `time`. Multiply a level by it every tick for an exponential release."
+        }
+        "equal" => {
+            "Equal temperament: places `pitch` on the nearest of `steps` equal divisions of the octave, with A4 at `a4`. Accepts a chord and tunes each pitch."
+        }
+        "just" => {
+            "Just intonation built from whole-number ratios above `root`, with A4 at `a4`. Accepts a chord and tunes each pitch."
+        }
+        "pythagorean" => {
+            "Pythagorean tuning built from pure fifths above `root`, with A4 at `a4`. Accepts a chord and tunes each pitch."
+        }
+        "meantone" => {
+            "Quarter-comma meantone built on `root`, with A4 at `a4`. Accepts a chord and tunes each pitch."
+        }
+        "level" => {
+            "The level of an amplitude, as a `Gain`: `level(1)` is 0dB. Silence is held at -120dB instead of -inf."
+        }
+        "amp" => "The amplitude factor of a level: `amp(-6dB)` is about 0.5.",
+        _ => return None,
+    })
 }
 
 /// Every built-in function name, for suggestions.
@@ -134,9 +180,6 @@ pub const FUNCTIONS: &[&str] = &[
     "just",
     "pythagorean",
     "meantone",
-    "Float",
-    "Int",
-    "Sample",
 ];
 
 #[cfg(test)]
@@ -149,5 +192,13 @@ mod tests {
             assert!(!lookup(name).is_empty(), "{name}");
         }
         assert!(lookup("nope").is_empty());
+    }
+
+    #[test]
+    fn everything_built_in_is_documented() {
+        let constants = CONSTANTS.iter().map(|(n, _)| n);
+        for name in FUNCTIONS.iter().chain(constants) {
+            assert!(doc(name).is_some(), "{name}");
+        }
     }
 }

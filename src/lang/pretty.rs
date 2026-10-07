@@ -356,6 +356,16 @@ impl Printer<'_> {
                 typed(prop("field").plain(" .").ident(&field.name)),
                 vec![self.expr(base)],
             ),
+            ExprKind::Cast(x, to) => Node::new(
+                typed(
+                    prop("cast")
+                        .plain(" ")
+                        .kw("as")
+                        .plain(" ")
+                        .ty(self.text(to.span())),
+                ),
+                vec![self.expr(x)],
+            ),
             ExprKind::Fn { params, body, .. } => {
                 // Parameter types are shown as checked, including ones the
                 // source leaves out.

@@ -20,7 +20,8 @@
 //! and     := cmp ("&&" cmp)*
 //! cmp     := sum (("<" | "<=" | ">" | ">=" | "==" | "!=") sum)?
 //! sum     := term (("+" | "-") term)*
-//! term    := unary (("*" | "/" | "%") unary)*
+//! term    := cast (("*" | "/" | "%") cast)*
+//! cast    := unary ("as" type)*
 //! unary   := ("-" | "+" | "!") unary | postfix
 //! postfix := primary ("[" expr "]")*
 //! primary := NUMBER UNIT? | "true" | "false" | NAME ("(" args ")")?
@@ -41,33 +42,21 @@ use super::diag::{Diagnostic, Span};
 use super::lexer::{Token, TokenKind};
 
 pub fn parse(src: &str, tokens: Vec<Token>) -> Result<Program, Vec<Diagnostic>> {
-    let mut p = Parser {
-        src,
-        tokens,
-        pos: 0,
-        nest: 0,
-        next_id: 0,
-        errors: Vec::new(),
-    };
-    let mut items = Vec::new();
-    while !p.at(TokenKind::Eof) {
-        match p.item() {
-            Ok(Some(item)) => items.push(item),
-            Ok(None) => {}
-            Err(err) => {
-                p.errors.push(err);
-                p.recover();
-            }
-        }
-    }
-    if p.errors.is_empty() {
-        Ok(Program {
-            items,
-            expr_count: p.next_id,
-        })
+    let (program, errors) = Parser::new(src, tokens, false).program();
+    if errors.is_empty() {
+        Ok(program)
     } else {
-        Err(p.errors)
+        Err(errors)
     }
+}
+
+/// Parse as much as possible, for tools such as editors. Besides skipping
+/// to the next definition after an error, a statement that fails to parse
+/// is skipped on its own, and a block left open at the end of the file (or
+/// where the next definition starts) is closed there. The program always
+/// comes back, along with every error found.
+pub fn parse_partial(src: &str, tokens: Vec<Token>) -> (Program, Vec<Diagnostic>) {
+    Parser::new(src, tokens, true).program()
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -80,6 +69,41 @@ struct Parser<'a> {
     nest: u32,
     next_id: u32,
     errors: Vec<Diagnostic>,
+    /// Recover inside blocks too; see [`parse_partial`].
+    recover: bool,
+}
+
+impl<'a> Parser<'a> {
+    fn new(src: &'a str, tokens: Vec<Token>, recover: bool) -> Parser<'a> {
+        Parser {
+            src,
+            tokens,
+            pos: 0,
+            nest: 0,
+            next_id: 0,
+            errors: Vec::new(),
+            recover,
+        }
+    }
+
+    fn program(mut self) -> (Program, Vec<Diagnostic>) {
+        let mut items = Vec::new();
+        while !self.at(TokenKind::Eof) {
+            match self.item() {
+                Ok(Some(item)) => items.push(item),
+                Ok(None) => {}
+                Err(err) => {
+                    self.errors.push(err);
+                    self.recover();
+                }
+            }
+        }
+        let program = Program {
+            items,
+            expr_count: self.next_id,
+        };
+        (program, self.errors)
+    }
 }
 
 impl Parser<'_> {
@@ -322,10 +346,29 @@ impl Parser<'_> {
         let saved = std::mem::replace(&mut self.nest, 0);
         let mut stmts = Vec::new();
         while !self.at(TokenKind::RBrace) {
-            if self.at(TokenKind::Eof) {
-                return Err(Diagnostic::error(open.span, "this `{` is never closed"));
+            let unclosed = self.at(TokenKind::Eof)
+                || (self.recover && self.peek().newline_before && self.at_def_start());
+            if unclosed {
+                let err = Diagnostic::error(open.span, "this `{` is never closed");
+                if !self.recover {
+                    return Err(err);
+                }
+                self.errors.push(err);
+                self.nest = saved;
+                return Ok(Block {
+                    stmts,
+                    span: self.span_from(open.span),
+                });
             }
-            stmts.push(self.stmt()?);
+            let stmt_start = self.pos;
+            match self.stmt() {
+                Ok(stmt) => stmts.push(stmt),
+                Err(err) if self.recover => {
+                    self.errors.push(err);
+                    self.skip_stmt(stmt_start);
+                }
+                Err(err) => return Err(err),
+            }
         }
         self.bump();
         self.nest = saved;
@@ -401,6 +444,52 @@ impl Parser<'_> {
             });
         }
         Ok(stmt)
+    }
+
+    /// At `fn name` or `rill name`: a definition, not an anonymous fn.
+    fn at_def_start(&self) -> bool {
+        (self.at(TokenKind::Fn) || self.at(TokenKind::Rill))
+            && self.peek_at(1).kind == TokenKind::Ident
+    }
+
+    /// After the statement starting at token `stmt_start` failed to parse:
+    /// skip to where the next one starts (a line break or `;` outside
+    /// brackets opened since), or to the `}` closing the block. A line
+    /// starting with `let`, `state` or `return` always starts a statement,
+    /// even inside brackets left open.
+    fn skip_stmt(&mut self, stmt_start: usize) {
+        self.nest = 0;
+        let mut depth = 0u32;
+        let mut first = true;
+        loop {
+            let t = self.peek();
+            let starts_stmt = matches!(
+                t.kind,
+                TokenKind::Let | TokenKind::State | TokenKind::Return
+            );
+            if self.pos > stmt_start && t.newline_before && starts_stmt {
+                return;
+            }
+            match t.kind {
+                TokenKind::Eof => return,
+                TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket if depth == 0 => {
+                    if t.kind == TokenKind::RBrace {
+                        return;
+                    }
+                }
+                _ if depth == 0 && !first && t.newline_before => return,
+                _ if depth == 0 && !first && self.at_def_start() => return,
+                TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => depth -= 1,
+                TokenKind::Semi if depth == 0 => {
+                    self.bump();
+                    return;
+                }
+                _ => {}
+            }
+            self.bump();
+            first = false;
+        }
     }
 
     fn at_ident(&self, name: &str) -> bool {
@@ -503,7 +592,7 @@ impl Parser<'_> {
 
     /// Precedence climbing over the binary operators below `|>`.
     fn binary(&mut self, min_level: u8) -> PResult<Expr> {
-        let mut lhs = self.unary()?;
+        let mut lhs = self.cast()?;
         loop {
             if !self.continues() {
                 break;
@@ -534,6 +623,18 @@ impl Parser<'_> {
             lhs = self.expr_node(ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)), span);
         }
         Ok(lhs)
+    }
+
+    /// `x as Float`. Binds tighter than the binary operators and looser
+    /// than a leading `-`, so `-x as Int` is `(-x) as Int`.
+    fn cast(&mut self) -> PResult<Expr> {
+        let mut e = self.unary()?;
+        while self.continues() && self.eat(TokenKind::As).is_some() {
+            let ty = self.ty()?;
+            let span = e.span.to(ty.span());
+            e = self.expr_node(ExprKind::Cast(Box::new(e), ty), span);
+        }
+        Ok(e)
     }
 
     fn unary(&mut self) -> PResult<Expr> {

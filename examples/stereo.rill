@@ -1,13 +1,13 @@
 // Channel lifting: `peak` takes one sample, so applied to a stereo frame it
 // runs one independent copy per channel.
 
-rill sine(freq: Freq) -> Sample {
+rill sine(freq: Freq) Sample {
     state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return sin(phase * TAU)
 }
 
-rill peak(x: Sample, release: Time = 300ms) -> Sample {
+rill peak(x: Sample, release: Time = 300ms) Sample {
     state level: Sample = 0
     let a = abs(x)
     level = if a > level { a } else { level * decay(release) }
@@ -15,16 +15,16 @@ rill peak(x: Sample, release: Time = 300ms) -> Sample {
 }
 
 // Equal-power pan of a mono signal into a stereo frame.
-fn pan(x: Sample, position: Float) -> [Sample; 2] {
+fn pan(x: Sample, position: Float) [Sample; 2] {
     let angle = (position + 1) * PI / 4
     return [x * cos(angle), x * sin(angle)]
 }
 
-rill mix_down<N>(x: [Sample; N]) -> [Sample; 1] {
+rill mix_down<N>(x: [Sample; N]) [Sample; 1] {
     return [sum(x) / N]
 }
 
-rill main() -> [Sample; 2] {
+rill main() [Sample; 2] {
     let pair = [sine(220Hz), sine(330Hz)] * 0.25
 
     // One envelope follower per channel: `peak` is a rill, so it runs once

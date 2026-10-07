@@ -5,10 +5,10 @@
 //! ```text
 //! program := item*
 //! item    := "fn" def | "rill" def
-//! def     := NAME ("<" NAME ("," NAME)* ">")? "(" params ")" "->" type
+//! def     := NAME ("<" NAME ("," NAME)* ">")? "(" params ")" type
 //!            ("@" "rate" (("*" | "/") INT)?)? block
 //! param   := NAME ":" type ("=" expr)?
-//! type    := NAME | "[" type ";" (INT | NAME) "]" | "fn" "(" types ")" "->" type
+//! type    := NAME | "[" type ";" (INT | NAME) "]" | "fn" "(" types ")" type
 //! block   := "{" stmt* "}"
 //! stmt    := "let" NAME (":" type)? "=" expr
 //!          | "state" NAME (":" type)? "=" expr
@@ -26,7 +26,7 @@
 //! postfix := primary ("[" expr "]")*
 //! primary := NUMBER UNIT? | "true" | "false" | NAME ("(" args ")")?
 //!          | "(" expr ")" | "[" expr ("," expr)* "]" | if | block | lambda
-//! lambda  := "fn" "(" (NAME (":" type)?),* ")" ("->" type)? block
+//! lambda  := "fn" "(" (NAME (":" type)?),* ")" type? block
 //! if      := "if" expr block ("else" (if | block))?
 //! args    := (NAME ":")? expr ("," (NAME ":")? expr)*
 //! ```
@@ -152,6 +152,19 @@ impl Parser<'_> {
         &self.src[t.span.start as usize..t.span.end as usize]
     }
 
+    /// Return types follow the parameters directly; `->` is a leftover
+    /// from the old syntax.
+    fn no_arrow(&mut self, example: &str) -> PResult<()> {
+        match self.at(TokenKind::Arrow) {
+            true => Err(Diagnostic::error(
+                self.peek().span,
+                "return types come right after the parameters, without `->`",
+            )
+            .with_help(format!("write it as `{example}`"))),
+            false => Ok(()),
+        }
+    }
+
     fn ident(&mut self, context: &str) -> PResult<Ident> {
         let t = self.expect(TokenKind::Ident, context)?;
         Ok(Ident {
@@ -238,12 +251,13 @@ impl Parser<'_> {
         self.expect(TokenKind::RParen, "to close the parameter list")?;
         self.nest -= 1;
 
-        self.expect(TokenKind::Arrow, "and a return type")
-            .map_err(|e| {
-                e.with_help(format!(
-                    "{keyword}s declare what they return, e.g. `-> Sample`"
-                ))
-            })?;
+        self.no_arrow(&format!("{keyword} {}(x: Sample) Sample", name.name))?;
+        if self.at(TokenKind::LBrace) {
+            return Err(self.unexpected("a return type").with_help(format!(
+                "{keyword}s declare what they return after the parameters, as in `{keyword} {}(x: Sample) Sample`",
+                name.name
+            )));
+        }
         let ret = self.ty()?;
 
         let rate = if let Some(at) = self.eat(TokenKind::At) {
@@ -309,10 +323,7 @@ impl Parser<'_> {
             }
             self.expect(TokenKind::RParen, "to close the parameter types")?;
             self.nest -= 1;
-            self.expect(
-                TokenKind::Arrow,
-                "and a return type, as in `fn(Pitch) -> Freq`",
-            )?;
+            self.no_arrow("fn(Pitch) Freq")?;
             let ret = self.ty()?;
             return Ok(TypeExpr::Fn {
                 params,
@@ -805,9 +816,10 @@ impl Parser<'_> {
         }
         self.expect(TokenKind::RParen, "to close the parameter list")?;
         self.nest -= 1;
-        let ret = match self.eat(TokenKind::Arrow) {
-            Some(_) => Some(self.ty()?),
-            None => None,
+        self.no_arrow("fn(p: Pitch) Freq { ... }")?;
+        let ret = match self.at(TokenKind::LBrace) {
+            true => None,
+            false => Some(self.ty()?),
         };
         let body = self.block()?;
         let span = self.span_from(start);

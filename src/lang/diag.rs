@@ -187,7 +187,7 @@ mod tests {
         let d = Diagnostic::error(Span::default(), "there is no rill named `main` to run")
             .with_help("add one");
         assert_eq!(
-            d.render("x.rill", "fn f() -> Sample { 0 }"),
+            d.render("x.rill", "fn f() Sample { 0 }"),
             "error: there is no rill named `main` to run\n --> x.rill\n  = help: add one\n"
         );
     }

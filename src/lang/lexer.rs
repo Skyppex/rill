@@ -503,9 +503,9 @@ mod tests {
     fn operators_keywords_and_comments() {
         use TokenKind::*;
         assert_eq!(
-            kinds("rill f(x) -> Sample { x |> g /* c /* nested */ */ } // end\n a != b || !c"),
+            kinds("rill f(x) Sample { x |> g /* c /* nested */ */ } // end\n a != b || !c"),
             vec![
-                Rill, Ident, LParen, Ident, RParen, Arrow, Ident, LBrace, Ident, Pipe, Ident,
+                Rill, Ident, LParen, Ident, RParen, Ident, LBrace, Ident, Pipe, Ident,
                 RBrace, Ident, Ne, Ident, OrOr, Bang, Ident, Eof
             ]
         );
@@ -584,7 +584,7 @@ mod tests {
             ]
         );
         // Valid text lexes the same either way.
-        let src = "rill f(x: Sample) -> Sample { return x |> g(300ms) }";
+        let src = "rill f(x: Sample) Sample { return x |> g(300ms) }";
         assert_eq!(lex_partial(src), (lex(src).unwrap(), vec![]));
     }
 }

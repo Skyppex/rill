@@ -61,13 +61,13 @@ fn strict_and_partial_agree_on_valid_programs() {
 #[test]
 fn a_bad_statement_does_not_lose_its_def() {
     let src = "
-rill f(x: Sample) -> Sample {
+rill f(x: Sample) Sample {
     let a = x * 2
     let b = (a +
     let c = a
     return c
 }
-rill g() -> Sample { return 0 }
+rill g() Sample { return 0 }
 ";
     let (program, checked, errors) = analyze(src);
     assert_eq!(names(&program), ["f", "g"]);
@@ -85,11 +85,11 @@ rill g() -> Sample { return 0 }
 #[test]
 fn unclosed_blocks_end_at_the_next_definition() {
     let src = "
-rill f(x: Sample) -> Sample {
+rill f(x: Sample) Sample {
     let a = x
     return a
 
-rill g() -> Sample { return 0 }
+rill g() Sample { return 0 }
 ";
     let (program, _, errors) = analyze(src);
     assert_eq!(names(&program), ["f", "g"]);
@@ -97,7 +97,7 @@ rill g() -> Sample { return 0 }
 
     // And at the end of the file, mid-statement.
     let (program, checked, _) =
-        analyze("rill f(x: Sample) -> Sample {\n    let a = x\n    return a |> ");
+        analyze("rill f(x: Sample) Sample {\n    let a = x\n    return a |> ");
     assert_eq!(names(&program), ["f"]);
     assert!(checked.bindings.iter().any(|b| b.name == "a"));
 }
@@ -105,14 +105,14 @@ rill g() -> Sample { return 0 }
 #[test]
 fn lexer_errors_do_not_stop_the_parse() {
     let (program, _, errors) =
-        analyze("rill f() -> Sample { return 1hz }\nrill g() -> Sample { return 0 }");
+        analyze("rill f() Sample { return 1hz }\nrill g() Sample { return 0 }");
     assert_eq!(names(&program), ["f", "g"]);
     assert_eq!(errors[0], "unknown unit `hz`");
 }
 
 #[test]
 fn checking_goes_on_after_errors() {
-    let src = "rill f(x: Sample) -> Sample {\n    let a = nope\n    let b = x * 2\n    return b\n}";
+    let src = "rill f(x: Sample) Sample {\n    let a = nope\n    let b = x * 2\n    return b\n}";
     let (_, checked, errors) = analyze(src);
     assert_eq!(errors, ["unknown name `nope`"]);
     let b = checked.bindings.iter().find(|b| b.name == "b").unwrap();
@@ -121,7 +121,7 @@ fn checking_goes_on_after_errors() {
 
 #[test]
 fn bindings_and_their_scopes() {
-    let src = "rill f<N>(x: [Sample; N], g: Gain = 0dB) -> Sample {\n    state s: Sample = 0\n    let a = sum(x)\n    if a > 0 {\n        let inner = a\n        s = inner\n    }\n    let h = fn(v: Sample) -> Sample { v * 2 }\n    return h(a + s)\n}";
+    let src = "rill f<N>(x: [Sample; N], g: Gain = 0dB) Sample {\n    state s: Sample = 0\n    let a = sum(x)\n    if a > 0 {\n        let inner = a\n        s = inner\n    }\n    let h = fn(v: Sample) Sample { v * 2 }\n    return h(a + s)\n}";
     let (_, checked, errors) = analyze(src);
     assert!(errors.is_empty(), "{errors:?}");
     let get = |name: &str| checked.bindings.iter().find(|b| b.name == name).unwrap();
@@ -150,15 +150,15 @@ fn bindings_and_their_scopes() {
 #[test]
 fn every_kind_of_name_resolves() {
     let src = "
-fn half(x: Sample) -> Sample { x / 2 }
-rill f<N>(xs: [Sample; N], freq: Freq = 440Hz) -> Sample {
+fn half(x: Sample) Sample { x / 2 }
+rill f<N>(xs: [Sample; N], freq: Freq = 440Hz) Sample {
     state level: Sample = 0
     level = half(sum(xs))
     let t = equal(A4, a4: freq) / RATE
     let k = f2(y: level)
     return k + t * PI
 }
-rill f2(y: Sample) -> Sample { return y |> half }
+rill f2(y: Sample) Sample { return y |> half }
 ";
     let (program, checked, errors) = analyze(src);
     assert!(errors.is_empty(), "{errors:?}");

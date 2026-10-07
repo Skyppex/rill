@@ -1,7 +1,7 @@
 //! Tree view of a checked program, for `rill check ast`.
 //!
 //! ```text
-//! rill peak -> Sample
+//! rill peak Sample
 //! ├─ param x: Sample
 //! ├─ param release: Time
 //! │  └─ 300ms : Time
@@ -200,11 +200,7 @@ impl Printer<'_> {
             }
             label = label.plain(">");
         }
-        label = label
-            .plain(" ")
-            .op("->")
-            .plain(" ")
-            .ty(self.text(d.ret.span()));
+        label = label.plain(" ").ty(self.text(d.ret.span()));
         if let Some(rate) = &d.rate {
             label = label.plain(" ").op("@").plain(" ").kw("rate");
             if rate.den != 1 {
@@ -401,12 +397,12 @@ mod tests {
     use super::*;
 
     const SRC: &str = "\
-rill peak(x: Sample, release: Time = 300ms) -> Sample {
+rill peak(x: Sample, release: Time = 300ms) Sample {
     state level: Sample = 0
     level = if abs(x) > level { abs(x) } else { level * decay(release) }
     return level
 }
-rill main() -> Sample {
+rill main() Sample {
     let y = [0.5, 1] |> peak(release: 10ms)
     return y[0]
 }
@@ -416,7 +412,7 @@ rill main() -> Sample {
     fn renders_a_typed_tree() {
         let (program, checked) = crate::lang::compile(SRC).unwrap();
         let expected = "\
-rill peak -> Sample
+rill peak Sample
 ├─ param x: Sample
 ├─ param release: Time
 │  └─ 300ms : Time
@@ -441,7 +437,7 @@ rill peak -> Sample
    └─ return
       └─ level : Sample
 
-rill main -> Sample
+rill main Sample
 └─ body
    ├─ let y
    │  └─ call peak (piped) : [Sample; 2]
@@ -461,16 +457,16 @@ rill main -> Sample
     fn anonymous_fns_show_their_checked_types() {
         // `p` has no type in the source; the tree shows the one it was given.
         let src = "
-rill main() -> Sample {
-    let f: fn(Pitch) -> Freq = fn(p) { equal(p) }
+rill main() Sample {
+    let f: fn(Pitch) Freq = fn(p) { equal(p) }
     return (A4 |> f) / 1kHz
 }
 ";
         let (program, checked) = crate::lang::compile(src).unwrap();
         let out = tree(src, &program, &checked, false);
         let expected = "\
-   ├─ let f: fn(Pitch) -> Freq
-   │  └─ fn : fn(Pitch) -> Freq
+   ├─ let f: fn(Pitch) Freq
+   │  └─ fn : fn(Pitch) Freq
    │     ├─ param p: Pitch
    │     └─ body
    │        └─ call equal : Freq

@@ -1,16 +1,16 @@
 // Live control example highlighting parameters, smoothing and events.
 // The entry rill exposes `depth` (LFO speed) and `gain` as realtime controls.
-rill sine(freq: Freq) -> Sample {
+rill sine(freq: Freq) Sample {
     state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return sin(phase * TAU)
 }
 
-rill main() -> Sample {
+rill main() Sample {
     return live_control()
 }
 
-rill live_control(depth: Freq = 0.5Hz, gain: Sample = 0.25) -> Sample {
+rill live_control(depth: Freq = 0.5Hz, gain: Sample = 0.25) Sample {
     // Preserve the last note's pitch and release so events can shape the tone.
     state pitch: Pitch = A4
     state release: Sample = 0.0

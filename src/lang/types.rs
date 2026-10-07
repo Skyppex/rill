@@ -28,13 +28,13 @@ pub enum Type {
     Num,
     /// `[elem; size]`. `elem` is always a scalar.
     Frame(Box<Type>, Size),
-    /// A function value: `fn(params) -> ret`.
+    /// A function value: `fn(params) ret`.
     Fn(Vec<Type>, Box<Type>),
     /// No value, e.g. `out(x)` or an `if` without `else`.
     Unit,
     /// The expression always `return`s, so it never produces a value.
     Never,
-    /// A type parameter of a built-in, e.g. `T` in `min(a: T, b: T) -> T`.
+    /// A type parameter of a built-in, e.g. `T` in `min(a: T, b: T) T`.
     Param(&'static str),
     /// Stands in after an error so one mistake is reported once.
     Error,
@@ -80,7 +80,7 @@ impl fmt::Display for Type {
                     }
                     write!(f, "{p}")?;
                 }
-                write!(f, ") -> {ret}")
+                write!(f, ") {ret}")
             }
             Type::Unit => f.write_str("()"),
             Type::Never => f.write_str("!"),
@@ -231,7 +231,7 @@ impl fmt::Display for Signature {
                 f.write_str(" = ..")?;
             }
         }
-        write!(f, ") -> {}", self.ret)?;
+        write!(f, ") {}", self.ret)?;
         match self.rate {
             (1, 1) => Ok(()),
             (1, d) => write!(f, " @ rate / {d}"),

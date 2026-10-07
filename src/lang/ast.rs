@@ -70,7 +70,7 @@ pub enum TypeExpr {
         size: SizeExpr,
         span: Span,
     },
-    /// `fn(params) -> ret`
+    /// `fn(params) ret`
     Fn {
         params: Vec<TypeExpr>,
         ret: Box<TypeExpr>,
@@ -192,7 +192,7 @@ pub enum ExprKind {
     Field(Box<Expr>, Ident),
     /// `x as Float`
     Cast(Box<Expr>, TypeExpr),
-    /// An anonymous fn: `fn(p) { ... }` or `fn(p: Pitch) -> Freq { ... }`.
+    /// An anonymous fn: `fn(p) { ... }` or `fn(p: Pitch) Freq { ... }`.
     Fn {
         params: Vec<FnParam>,
         ret: Option<TypeExpr>,

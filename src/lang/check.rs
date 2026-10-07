@@ -1435,7 +1435,7 @@ impl Checker {
                 format!("`{name}` has size parameters, so it cannot be used as a value yet")
             } else {
                 format!(
-                    "`{name}` works on several types; say which one where it goes, as in `let f: fn(Sample) -> Sample = {name}`"
+                    "`{name}` works on several types; say which one where it goes, as in `let f: fn(Sample) Sample = {name}`"
                 )
             };
             let d = self
@@ -1547,7 +1547,7 @@ impl Checker {
             None if diverges => {
                 let d = self
                     .error(e.span, "cannot tell what this fn returns")
-                    .with_help("annotate it, as in `fn(p: Pitch) -> Freq { ... }`");
+                    .with_help("annotate it, as in `fn(p: Pitch) Freq { ... }`");
                 self.report(d);
                 Type::Error
             }
@@ -1755,7 +1755,7 @@ fn mismatch(span: Span, what: &str, expected: &Type, found: &Type) -> Diagnostic
 }
 
 /// Can a fn with signature `sig` be used as a value of type
-/// `fn(params) -> ret`? Its extra parameters must have defaults.
+/// `fn(params) ret`? Its extra parameters must have defaults.
 fn fits(sig: &Signature, params: &[Type], ret: &Type) -> bool {
     if params.len() > sig.params.len() || sig.params[params.len()..].iter().any(|p| !p.has_default)
     {
@@ -2114,7 +2114,7 @@ pub fn check_entry(
         let help = match suggest(entry, rills.iter().copied()) {
             Some(s) => format!("did you mean `{s}`?"),
             None if rills.is_empty() => {
-                format!("add one, as in `rill {entry}() -> Sample {{ return 0 }}`")
+                format!("add one, as in `rill {entry}() Sample {{ return 0 }}`")
             }
             None => format!("pick one with `--entry`: {}", rills.join(", ")),
         };

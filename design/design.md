@@ -34,12 +34,12 @@ Two kinds of definitions: `fn` for pure functions on values, and `rill` for stre
 
 ```
 // Pure function on one value. Takes exactly what it declares.
-fn abs(x: Sample) -> Sample {
+fn abs(x: Sample) Sample {
     if x < 0 { -x } else { x }
 }
 
 // Stateful 1:1 rill. Body runs once per tick.
-rill peak(x: Sample, release: Time = 300ms) -> Sample {
+rill peak(x: Sample, release: Time = 300ms) Sample {
     state level: Sample = 0
     let a = abs(x)
     level = if a > level { a } else { level * decay(release) }
@@ -47,20 +47,20 @@ rill peak(x: Sample, release: Time = 300ms) -> Sample {
 }
 
 // Composition with pipes.
-rill meter(x: Sample) -> Sample {
+rill meter(x: Sample) Sample {
     return x |> abs |> peak
 }
 
 // Generic over channel count. Only needed when a rill works ACROSS channels.
-rill mix_down<N>(x: [Sample; N]) -> [Sample; 1] {
+rill mix_down<N>(x: [Sample; N]) [Sample; 1] {
     return [sum(x) / N]
 }
 
 // Rate-changing rill: the ratio is part of the signature.
-rill decimate(x: Sample) -> Sample @ rate / 2 { ... }
+rill decimate(x: Sample) Sample @ rate / 2 { ... }
 
 // Generator: no audio input.
-rill sine(freq: Freq) -> Sample {
+rill sine(freq: Freq) Sample {
     state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return sin(phase * TAU)
@@ -68,7 +68,7 @@ rill sine(freq: Freq) -> Sample {
 
 // Entry point: its return value goes to the device. Parameters need defaults;
 // they are the program's controls.
-rill main(depth: Freq = 20Hz) -> Sample {
+rill main(depth: Freq = 20Hz) Sample {
     let lfo   = sine(0.5Hz) * depth + 440Hz
     let voice = sine(lfo) * 0.3
     return voice
@@ -89,7 +89,7 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `Freq`, `Time` | Unit-carrying numbers | Convert to samples via the host rate |
 | `Pitch`, `Interval` | Abstract musical values | Turned into `Freq` by a tuning (see Pitch) |
 | `Gain` | A level change, written in `dB` | Any plain number is an amplitude factor (see Levels) |
-| `fn(A, B) -> R` | A function value | See Functions as values |
+| `fn(A, B) R` | A function value | See Functions as values |
 
 Plain numbers convert with `as`: `x as Float`, `x as Sample`, `x as Int` (which truncates toward zero). `as` binds tighter than arithmetic, so `a + b as Int` casts only `b`. Units and levels never disappear by a cast: `freq / 1Hz` gives a plain number, and `amp(g)` the factor of a level.
 
@@ -118,23 +118,23 @@ E4 |> just(C) |> sine                   // just intonation on C
 (E4 + 4st) |> equal |> sine             // Pitch + Interval -> Pitch
 sum([E4, F#4, B4] |> equal |> sine)     // a chord: three voices, mixed
 
-let tuning = fn(p: Pitch) -> Freq { pythagorean(p, D) }   // pick one, pass it around
+let tuning = fn(p: Pitch) Freq { pythagorean(p, D) }   // pick one, pass it around
 ```
 
 The built-in tunings take the pitch first, so pipes read naturally:
 
 ```
-equal(pitch: Pitch, steps: Int = 12, a4: Freq = 440Hz) -> Freq
-just(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) -> Freq
-pythagorean(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) -> Freq
-meantone(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) -> Freq
+equal(pitch: Pitch, steps: Int = 12, a4: Freq = 440Hz) Freq
+just(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) Freq
+pythagorean(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) Freq
+meantone(pitch: Pitch, root: Pitch, a4: Freq = 440Hz) Freq
 ```
 
 Rules:
 
 - A `Pitch` is a position, not an amount: `Pitch ± Interval` gives a `Pitch` (the interval always comes after) and `Pitch - Pitch` gives the `Interval` between them. Pitches can be compared, but not scaled or added together.
 - `equal` places note names on the nearest of `steps` equal divisions of the octave. The scale tunings build twelve notes from ratios above their root and put A4 exactly on `a4`. In every tuning, fractions of a semitone (cents, bends) stay continuous.
-- A tuning's settings are ordinary arguments, so they can change while playing (`a4` from a live control, say). Your own tuning is any `fn(Pitch) -> Freq`.
+- A tuning's settings are ordinary arguments, so they can change while playing (`a4` from a live control, say). Your own tuning is any `fn(Pitch) Freq`.
 - Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Freq` and mixing on streams. The built-in tunings accept a chord and tune each pitch; passing the result to a rill that takes `Freq` lifts it to one voice per pitch.
 - When every input is known at build time, tuning constant-folds to a number. Otherwise it is evaluated per tick.
 - Note events carry `pitch` as a `Pitch` and `velocity` in 0–1. Velocity is linear; a curve such as `velocity * velocity` sounds more even, since a straight line is too loud at soft velocities.
@@ -163,9 +163,9 @@ Rules:
 Fns are values: they can be bound with `let`, passed to fns and rills, returned from fns, and chosen while playing. Anonymous fns use the named syntax without the name.
 
 ```
-fn a432(p: Pitch) -> Freq { 432Hz * pow(2, (p - A4) / 12st) }
+fn a432(p: Pitch) Freq { 432Hz * pow(2, (p - A4) / 12st) }
 
-rill voice(pitch: Pitch, tune: fn(Pitch) -> Freq) -> Sample {
+rill voice(pitch: Pitch, tune: fn(Pitch) Freq) Sample {
     return pitch |> tune |> sine
 }
 
@@ -177,7 +177,7 @@ voice(E4, if minor { just_c } else { equal })   // chosen while playing
 
 Rules:
 
-- Function types are written `fn(A, B) -> R`. They cannot be `state`, frame channels, event fields or the entry rill's parameters.
+- Function types are written `fn(A, B) R`. They cannot be `state`, frame channels, event fields or the entry rill's parameters.
 - An anonymous fn's parameter and return types can be left out when the surroundings say what they are (a parameter of function type, an annotated `let`, a `return`, or a fn's declared return type). Otherwise they are required.
 - Anonymous fns capture what they use, by value, at the point they are made. They are fns, so they are pure: they read what they capture but cannot change it, and cannot call rills.
 - A named fn can be used where a function type with fewer parameters is expected, if its remaining parameters have defaults. A built-in that works on several types (`sin`) needs an expected type to pick one.

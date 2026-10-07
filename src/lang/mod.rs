@@ -2,17 +2,17 @@
 //!
 //! ```
 //! let src = "
-//!     rill sine(freq: Freq) -> Sample {
+//!     rill sine(freq: Freq) Sample {
 //!         state phase: Float = 0
 //!         phase = wrap(phase + freq / RATE)
 //!         return sin(phase * TAU)
 //!     }
-//!     rill main(freq: Freq = 440Hz) -> Sample {
+//!     rill main(freq: Freq = 440Hz) Sample {
 //!         return sine(freq) * 0.3
 //!     }
 //! ";
 //! let (program, checked) = rill::lang::compile(src).unwrap();
-//! assert_eq!(checked.signatures[0].to_string(), "rill sine(freq: Freq) -> Sample");
+//! assert_eq!(checked.signatures[0].to_string(), "rill sine(freq: Freq) Sample");
 //!
 //! let config = rill::Config::default();
 //! let (graph, _warnings) = rill::lang::load(src, &config, "main").unwrap();

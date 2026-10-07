@@ -5,25 +5,25 @@ use rill::lang::types::{Size, Type};
 use rill::lang::{self, Diagnostic};
 
 const SINE: &str = "
-rill sine(freq: Freq) -> Sample {
+rill sine(freq: Freq) Sample {
     state phase: Float = 0
     phase = wrap(phase + freq / RATE)
     return sin(phase * TAU)
 }
-rill peak(x: Sample, release: Time = 300ms) -> Sample {
+rill peak(x: Sample, release: Time = 300ms) Sample {
     state level: Sample = 0
     let a = abs(x)
     level = if a > level { a } else { level * decay(release) }
     return level
 }
-rill mix_down<N>(x: [Sample; N]) -> [Sample; 1] {
+rill mix_down<N>(x: [Sample; N]) [Sample; 1] {
     return [sum(x) / N]
 }
 ";
 
 /// `stmts` as the body of a `rill main`.
 fn body(stmts: &str) -> String {
-    format!("rill main() -> Sample {{\n{stmts}\nreturn 0\n}}")
+    format!("rill main() Sample {{\n{stmts}\nreturn 0\n}}")
 }
 
 /// [`SINE`] plus `stmts` in a `rill main`.
@@ -33,7 +33,7 @@ fn with_sine(stmts: &str) -> String {
 
 /// The statements of `stmts` parsed as a rill body.
 fn parse_body(stmts: &str) -> Result<Vec<Stmt>, Vec<Diagnostic>> {
-    let program = lang::parse(&format!("rill main() -> Sample {{\n{stmts}\n}}"))?;
+    let program = lang::parse(&format!("rill main() Sample {{\n{stmts}\n}}"))?;
     Ok(program.items[0].def().body.stmts.clone())
 }
 
@@ -215,15 +215,27 @@ fn line_breaks_end_statements() {
 
 #[test]
 fn parse_errors_point_at_the_problem() {
-    let src = "rill f(x: Sample) Sample { return x }";
+    let src = "rill f(x: Sample) { return x }";
+    let errs = lang::parse(src).unwrap_err();
+    assert_eq!(errs[0].message, "expected a return type, found `{`");
+    assert_eq!(
+        &src[errs[0].span.start as usize..errs[0].span.end as usize],
+        "{"
+    );
+
+    let src = "rill f(x: Sample) -> Sample { return x }";
     let errs = lang::parse(src).unwrap_err();
     assert_eq!(
         errs[0].message,
-        "expected `->` and a return type, found `Sample`"
+        "return types come right after the parameters, without `->`"
     );
     assert_eq!(
         &src[errs[0].span.start as usize..errs[0].span.end as usize],
-        "Sample"
+        "->"
+    );
+    assert_eq!(
+        lang::parse("rill main(f: fn(Pitch) -> Freq) Sample { return 0 }").unwrap_err()[0].message,
+        "return types come right after the parameters, without `->`"
     );
 
     assert_eq!(
@@ -231,7 +243,7 @@ fn parse_errors_point_at_the_problem() {
         "comparisons cannot be chained"
     );
     assert_eq!(
-        lang::parse("rill f() -> Sample {\n return 1\n").unwrap_err()[0].message,
+        lang::parse("rill f() Sample {\n return 1\n").unwrap_err()[0].message,
         "this `{` is never closed"
     );
     assert_eq!(
@@ -243,7 +255,7 @@ fn parse_errors_point_at_the_problem() {
 #[test]
 fn parser_recovers_at_the_next_definition() {
     let errs = lang::parse(
-        "fn a( -> Sample { 1 }\nfn b() -> Sample { 2 }\nrill c(x: ) -> Sample { return x }",
+        "fn a( -> Sample { 1 }\nfn b() Sample { 2 }\nrill c(x: ) Sample { return x }",
     )
     .unwrap_err();
     assert_eq!(errs.len(), 2, "{errs:#?}");
@@ -334,8 +346,8 @@ fn rills_lift_over_channels() {
 #[test]
 fn fns_and_builtins_do_not_lift() {
     let src = "
-        fn double(x: Sample) -> Sample { x * 2 }
-        rill main() -> Sample { return double([1, 2])[0] }
+        fn double(x: Sample) Sample { x * 2 }
+        rill main() Sample { return double([1, 2])[0] }
     ";
     let (msg, help) = error(src);
     assert_eq!(msg, "`double` takes one value, not a frame (`[number; 2]`)");
@@ -350,8 +362,8 @@ fn fns_and_builtins_do_not_lift() {
 
     // Saying so with a size parameter works.
     let src = "
-        fn double<N>(x: [Sample; N]) -> [Sample; N] { x * 2 }
-        rill main() -> Sample {
+        fn double<N>(x: [Sample; N]) [Sample; N] { x * 2 }
+        rill main() Sample {
             let d = double([1, 2])
             return d[0]
         }
@@ -362,8 +374,8 @@ fn fns_and_builtins_do_not_lift() {
 #[test]
 fn lifting_needs_matching_channel_counts() {
     let src = "
-        rill mix(a: Sample, b: Sample) -> Sample { return a + b }
-        rill main() -> Sample { return mix([1, 2], [3, 4, 5])[0] }
+        rill mix(a: Sample, b: Sample) Sample { return a + b }
+        rill main() Sample { return mix([1, 2], [3, 4, 5])[0] }
     ";
     assert_eq!(
         error(src).0,
@@ -385,7 +397,7 @@ fn lifting_needs_matching_channel_counts() {
 
 #[test]
 fn generic_sizes_are_inferred() {
-    let swap = "rill swap<N>(a: [Sample; N], b: [Sample; N]) -> [Sample; N] { return b }";
+    let swap = "rill swap<N>(a: [Sample; N], b: [Sample; N]) [Sample; N] { return b }";
     let src = format!("{swap}\n{}", body("let x = swap([1, 2], [3, 4])"));
     assert_eq!(type_of(&src, "x"), frame(Type::Sample, 2));
     let src = format!("{swap}\n{}", body("let x = swap([1, 2], [3, 4, 5])"));
@@ -394,11 +406,11 @@ fn generic_sizes_are_inferred() {
         "argument `b` of `swap` expects `[Sample; 2]`, found `[number; 3]`"
     );
     assert_eq!(
-        error("rill f<N>(x: Sample) -> Sample { return x }").0,
+        error("rill f<N>(x: Sample) Sample { return x }").0,
         "size `N` is not used by any parameter"
     );
     assert_eq!(
-        error("rill f(x: [Sample; M]) -> Sample { return x[0] }").0,
+        error("rill f(x: [Sample; M]) Sample { return x[0] }").0,
         "unknown size `M`"
     );
 }
@@ -407,51 +419,51 @@ fn generic_sizes_are_inferred() {
 
 #[test]
 fn rills_must_return_on_every_path() {
-    let (msg, help) = error("rill f(x: Sample) -> Sample { x }");
+    let (msg, help) = error("rill f(x: Sample) Sample { x }");
     assert_eq!(msg, "not every path through rill `f` returns");
     assert!(help.unwrap().contains("add `return`"));
 
     assert_eq!(
-        error("rill f(x: Sample) -> Sample { if x > 0 { return x } }").0,
+        error("rill f(x: Sample) Sample { if x > 0 { return x } }").0,
         "not every path through rill `f` returns"
     );
-    assert_ok("rill f(x: Sample) -> Sample { if x > 0 { return x } else { return -x } }");
+    assert_ok("rill f(x: Sample) Sample { if x > 0 { return x } else { return -x } }");
     assert_eq!(
-        error("rill f(x: Sample) -> Sample { return x\n return x }").0,
+        error("rill f(x: Sample) Sample { return x\n return x }").0,
         "unreachable code"
     );
 }
 
 #[test]
 fn state_rules() {
-    let (msg, help) = error("fn f(x: Sample) -> Sample { state s: Sample = 0\n x }");
+    let (msg, help) = error("fn f(x: Sample) Sample { state s: Sample = 0\n x }");
     assert_eq!(msg, "`state` is only allowed in rills");
     assert!(help.unwrap().contains("make this a rill"));
 
     assert_eq!(
-        error("rill f(x: Sample) -> Sample { if x > 0 { state s: Sample = 0 }\n return x }").0,
+        error("rill f(x: Sample) Sample { if x > 0 { state s: Sample = 0 }\n return x }").0,
         "`state` must be declared at the top level of the rill body"
     );
     assert_eq!(
-        error("rill f(x: Sample) -> Sample { state s: Sample = x\n return s }").0,
+        error("rill f(x: Sample) Sample { state s: Sample = x\n return s }").0,
         "the initial value of `state` must be a constant"
     );
     assert_eq!(
-        error("rill f(x: Sample) -> Sample { let y = x\n y = 1\n return y }").0,
+        error("rill f(x: Sample) Sample { let y = x\n y = 1\n return y }").0,
         "cannot assign to `y`"
     );
     assert_eq!(
-        error("rill f(x: Sample) -> Sample { x = 1\n return x }").0,
+        error("rill f(x: Sample) Sample { x = 1\n return x }").0,
         "cannot assign to `x`"
     );
     // Untyped state settles on `sample`.
-    assert_ok("rill f(x: Sample) -> Sample { state s = 0\n s = s + x\n return s }");
-    assert_ok("rill f<N>(x: [Sample; N]) -> Sample { state s: Float = N * 2\n return x[0] + s }");
+    assert_ok("rill f(x: Sample) Sample { state s = 0\n s = s + x\n return s }");
+    assert_ok("rill f<N>(x: [Sample; N]) Sample { state s: Float = N * 2\n return x[0] + s }");
 }
 
 #[test]
 fn fns_are_pure() {
-    let src = format!("{SINE}\nfn f(x: Sample) -> Sample {{ peak(x) }}");
+    let src = format!("{SINE}\nfn f(x: Sample) Sample {{ peak(x) }}");
     let (msg, help) = error(&src);
     assert_eq!(msg, "fn `f` cannot call rill `peak`");
     assert!(help.unwrap().contains("make `f` a rill"));
@@ -459,14 +471,14 @@ fn fns_are_pure() {
 
 #[test]
 fn fn_bodies_produce_their_return_type() {
-    assert_ok("fn f(x: Sample) -> Sample { x * 2 }");
-    assert_ok("fn f(x: Sample) -> Sample { return x * 2 }");
+    assert_ok("fn f(x: Sample) Sample { x * 2 }");
+    assert_ok("fn f(x: Sample) Sample { return x * 2 }");
     assert_eq!(
-        error("fn f(x: Sample) -> Freq { x * 2 }").0,
+        error("fn f(x: Sample) Freq { x * 2 }").0,
         "fn `f` should return `Freq`, but its body produces `Sample`"
     );
     assert_eq!(
-        error("fn f(x: Sample) -> Sample { let y = x }").0,
+        error("fn f(x: Sample) Sample { let y = x }").0,
         "fn `f` should return `Sample`, but its body produces `()`"
     );
 }
@@ -474,9 +486,9 @@ fn fn_bodies_produce_their_return_type() {
 #[test]
 fn recursion_is_rejected() {
     let errs = errors(
-        "fn a(x: Sample) -> Sample { b(x) }
-         fn b(x: Sample) -> Sample { a(x) }
-         rill c(x: Sample) -> Sample { return c(x) }",
+        "fn a(x: Sample) Sample { b(x) }
+         fn b(x: Sample) Sample { a(x) }
+         rill c(x: Sample) Sample { return c(x) }",
     );
     assert_eq!(
         errs,
@@ -493,36 +505,36 @@ fn recursion_is_rejected() {
 fn entry_rill_rules() {
     assert!(
         entry_errors(
-            "rill main(gain: Sample = 0.5) -> Sample { return gain }",
+            "rill main(gain: Sample = 0.5) Sample { return gain }",
             "main"
         )
         .is_empty()
     );
-    assert!(entry_errors("rill main() -> [Sample; 2] { return [0, 0] }", "main").is_empty());
+    assert!(entry_errors("rill main() [Sample; 2] { return [0, 0] }", "main").is_empty());
 
     assert_eq!(
-        entry_errors("fn f(x: Sample) -> Sample { x }", "main"),
+        entry_errors("fn f(x: Sample) Sample { x }", "main"),
         [(
             "there is no rill named `main` to run".to_owned(),
-            Some("add one, as in `rill main() -> Sample { return 0 }`".to_owned())
+            Some("add one, as in `rill main() Sample { return 0 }`".to_owned())
         )]
     );
     assert_eq!(
-        entry_errors("rill mian() -> Sample { return 0 }", "main")[0]
+        entry_errors("rill mian() Sample { return 0 }", "main")[0]
             .1
             .as_deref(),
         Some("did you mean `mian`?")
     );
     assert_eq!(
         entry_errors(
-            "rill a() -> Sample { return 0 }\nrill b() -> Sample { return 0 }",
+            "rill a() Sample { return 0 }\nrill b() Sample { return 0 }",
             "main"
         )[0]
         .1
         .as_deref(),
         Some("pick one with `--entry`: a, b")
     );
-    assert!(entry_errors("rill other() -> Sample { return 0 }", "other").is_empty());
+    assert!(entry_errors("rill other() Sample { return 0 }", "other").is_empty());
 
     let messages = |src: &str| -> Vec<String> {
         entry_errors(src, "main")
@@ -531,26 +543,26 @@ fn entry_rill_rules() {
             .collect()
     };
     assert_eq!(
-        messages("fn main() -> Sample { 0 }"),
+        messages("fn main() Sample { 0 }"),
         ["`main` is a fn, but the program must start at a rill"]
     );
     assert_eq!(
-        messages("rill main<N>(x: [Sample; N]) -> Sample { return 0 }"),
+        messages("rill main<N>(x: [Sample; N]) Sample { return 0 }"),
         [
             "the entry rill cannot have size parameters",
             "`x` needs a default value"
         ]
     );
     assert_eq!(
-        messages("rill main(freq: Freq) -> Sample { return 0 }"),
+        messages("rill main(freq: Freq) Sample { return 0 }"),
         ["`freq` needs a default value"]
     );
     assert_eq!(
-        messages("rill main() -> Sample @ rate / 2 { return 0 }"),
+        messages("rill main() Sample @ rate / 2 { return 0 }"),
         ["the entry rill cannot change the sample rate"]
     );
     assert_eq!(
-        messages("rill main() -> Freq { return 1Hz }"),
+        messages("rill main() Freq { return 1Hz }"),
         ["the entry rill must return audio (`Sample` or `[Sample; N]`), found `Freq`"]
     );
 }
@@ -608,7 +620,7 @@ fn names_and_suggestions() {
         "`a` is a value of type `number`, not a fn or rill"
     );
     assert_eq!(
-        error("fn f(x: Sample) -> Sample { x }\nfn f(x: Sample) -> Sample { x }").0,
+        error("fn f(x: Sample) Sample { x }\nfn f(x: Sample) Sample { x }").0,
         "`f` is defined more than once"
     );
     let (msg, help) = error(&body("let x: bool = true"));
@@ -635,7 +647,7 @@ fn names_and_suggestions() {
 fn user_definitions_shadow_builtins() {
     // The design doc defines its own `abs`.
     assert_ok(&format!(
-        "fn abs(x: Sample) -> Sample {{ if x < 0 {{ -x }} else {{ x }} }}\n{}",
+        "fn abs(x: Sample) Sample {{ if x < 0 {{ -x }} else {{ x }} }}\n{}",
         body("let y = abs(-1)")
     ));
 }
@@ -669,7 +681,7 @@ fn conditions_and_branches() {
 #[test]
 fn every_error_is_reported() {
     let src = format!(
-        "{}\nfn f(x: Sample) -> Sample {{ state s = 0\n x }}",
+        "{}\nfn f(x: Sample) Sample {{ state s = 0\n x }}",
         body("let a = 1Hz + 1\nlet b = nope")
     );
     assert_eq!(errors(&src).len(), 3, "{:?}", errors(&src));
@@ -753,7 +765,7 @@ fn tunings_are_functions() {
         frame(Type::Freq, 3)
     );
     // Settings may vary while playing.
-    assert_ok("rill main(a4: Freq = 440Hz) -> Sample {\n return (A4 |> equal(a4: a4)) / 1kHz\n}");
+    assert_ok("rill main(a4: Freq = 440Hz) Sample {\n return (A4 |> equal(a4: a4)) / 1kHz\n}");
 
     let (msg, help) = error(&body("let t = equal(12)"));
     assert_eq!(
@@ -769,16 +781,16 @@ fn tunings_are_functions() {
 #[test]
 fn functions_are_values() {
     let defs = "
-        fn a432(p: Pitch) -> Freq { 432Hz * pow(2, (p - A4) / 12st) }
-        rill voice(pitch: Pitch, tune: fn(Pitch) -> Freq) -> Sample {
+        fn a432(p: Pitch) Freq { 432Hz * pow(2, (p - A4) / 12st) }
+        rill voice(pitch: Pitch, tune: fn(Pitch) Freq) Sample {
             return (pitch |> tune) / 1kHz
         }
-        fn tuned(steps: Int) -> fn(Pitch) -> Freq { fn(p) { equal(p, steps) } }
+        fn tuned(steps: Int) fn(Pitch) Freq { fn(p) { equal(p, steps) } }
     ";
     let with = |stmts: &str| format!("{SINE}\n{defs}\n{}", body(stmts));
 
     assert_eq!(
-        type_of(&with("let t = fn(p: Pitch) -> Freq { equal(p) }"), "t"),
+        type_of(&with("let t = fn(p: Pitch) Freq { equal(p) }"), "t"),
         Type::Fn(vec![Type::Pitch], Box::new(Type::Freq))
     );
     assert_eq!(
@@ -789,9 +801,9 @@ fn functions_are_values() {
         "let a = voice(E4, a432)
          let b = voice(E4, fn(p) { equal(p, 24) })
          let c = voice(E4, equal)
-         let t: fn(Pitch) -> Freq = equal
+         let t: fn(Pitch) Freq = equal
          let d = E4 |> t
-         let f: fn(Sample) -> Sample = sin
+         let f: fn(Sample) Sample = sin
          let e = f(0.5)",
     ));
 
@@ -807,17 +819,17 @@ fn functions_are_values() {
             "this fn should return `Freq`, but its body produces `Pitch`",
         ),
         (
-            "let f = fn(x: Sample) -> Sample { sine(1Hz) }",
+            "let f = fn(x: Sample) Sample { sine(1Hz) }",
             "an anonymous fn cannot call rill `sine`",
         ),
         ("state f = a432", "a function cannot be `state`"),
         (
-            "let t = fn(p: Pitch) -> Freq { equal(p) }\nlet x = t(A4, B4)",
+            "let t = fn(p: Pitch) Freq { equal(p) }\nlet x = t(A4, B4)",
             "`t` takes 1 argument(s), but 2 were given",
         ),
         (
             "let a = voice(E4, decay)",
-            "`decay` does not fit `fn(Pitch) -> Freq`",
+            "`decay` does not fit `fn(Pitch) Freq`",
         ),
     ] {
         assert_eq!(error(&with(stmts)).0, msg, "{stmts}");
@@ -825,9 +837,9 @@ fn functions_are_values() {
 
     let src = format!(
         "{SINE}\n{}",
-        "rill main() -> Sample {
+        "rill main() Sample {
             state s: Sample = 0
-            let f = fn(x: Sample) -> Sample {
+            let f = fn(x: Sample) Sample {
                 s = x
                 x
             }
@@ -838,7 +850,7 @@ fn functions_are_values() {
 
     assert_eq!(
         entry_errors(
-            "rill main(t: fn(Pitch) -> Freq = equal) -> Sample { return 0 }",
+            "rill main(t: fn(Pitch) Freq = equal) Sample { return 0 }",
             "main"
         )[0]
         .0,
@@ -849,8 +861,8 @@ fn functions_are_values() {
 #[test]
 fn recursion_through_function_values_is_rejected() {
     let errs = errors(
-        "fn apply(f: fn(Sample) -> Sample, x: Sample) -> Sample { f(x) }
-         fn spin(x: Sample) -> Sample { apply(spin, x) }",
+        "fn apply(f: fn(Sample) Sample, x: Sample) Sample { f(x) }
+         fn spin(x: Sample) Sample { apply(spin, x) }",
     );
     assert_eq!(errs, ["recursion is not allowed: `spin` -> `spin`"]);
 }
@@ -914,7 +926,7 @@ fn levels_move_signals_up_and_down() {
 
 #[test]
 fn named_fns_only_at_the_top_level() {
-    let errs = parse_body("let f = fn double(x: Sample) -> Sample { x * 2 }").unwrap_err();
+    let errs = parse_body("let f = fn double(x: Sample) Sample { x * 2 }").unwrap_err();
     assert_eq!(
         errs[0].message,
         "a fn with a name can only be defined at the top level"

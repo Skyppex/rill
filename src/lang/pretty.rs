@@ -184,6 +184,13 @@ struct Printer<'a> {
     checked: &'a Checked,
 }
 
+fn size_span(size: &SizeExpr) -> Span {
+    match size {
+        SizeExpr::Lit(_, span) => *span,
+        SizeExpr::Var(id) => id.span,
+    }
+}
+
 impl Printer<'_> {
     fn text(&self, span: Span) -> &str {
         &self.src[span.start as usize..span.end as usize]
@@ -283,12 +290,15 @@ impl Printer<'_> {
         match s {
             Stmt::Let {
                 name, ty, value, ..
-            } => Node::new(annotated("let", name, ty), vec![self.expr(value)]),
+            } => Node::new(
+                annotated("let", name, ty),
+                value.iter().map(|e| self.expr(e)).collect(),
+            ),
             Stmt::State { name, ty, init, .. } => {
                 Node::new(annotated("state", name, ty), vec![self.expr(init)])
             }
             Stmt::Assign { target, value, .. } => Node::new(
-                prop("assign").plain(" ").ident(&target.name),
+                prop("assign").plain(" ").ident(&target.name().name),
                 vec![self.expr(value)],
             ),
             Stmt::Return { value, .. } => Node::new(kw("return"), vec![self.expr(value)]),
@@ -304,6 +314,15 @@ impl Printer<'_> {
                 }
                 Node::new(label.plain(")"), vec![self.block(prop("body"), body)])
             }
+            Stmt::For {
+                name, iter, body, ..
+            } => Node::new(
+                kw("for").plain(" ").ident(&name.name),
+                vec![
+                    Node::new(prop("in"), vec![self.expr(iter)]),
+                    self.block(prop("body"), body),
+                ],
+            ),
             Stmt::Expr(e) => self.expr(e),
         }
     }
@@ -334,12 +353,35 @@ impl Printer<'_> {
                 typed(prop("binary").plain(" ").op(op.symbol())),
                 vec![self.expr(a), self.expr(b)],
             ),
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => Node::new(
+                typed(
+                    prop("range")
+                        .plain(" ")
+                        .op(if *inclusive { "..=" } else { ".." }),
+                ),
+                vec![self.expr(start), self.expr(end)],
+            ),
             ExprKind::Call {
                 callee,
+                sizes,
                 args,
                 piped,
             } => {
                 let mut label = prop("call").plain(" ").callable(&callee.name);
+                if !sizes.is_empty() {
+                    label = label.plain("<");
+                    for (i, size) in sizes.iter().enumerate() {
+                        if i > 0 {
+                            label = label.plain(", ");
+                        }
+                        label = label.ty(self.text(size_span(size)));
+                    }
+                    label = label.plain(">");
+                }
                 if *piped {
                     label = label.plain(" (").prop("piped").plain(")");
                 }

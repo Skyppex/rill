@@ -180,6 +180,10 @@ fn collect_lambdas<'a>(e: &'a Expr, out: &mut HashMap<u32, &'a Expr>) {
             collect_lambdas(a, out);
             collect_lambdas(b, out);
         }
+        ExprKind::Range { start, end, .. } => {
+            collect_lambdas(start, out);
+            collect_lambdas(end, out);
+        }
         ExprKind::Call { args, .. } => {
             for a in args {
                 collect_lambdas(&a.value, out);
@@ -205,12 +209,17 @@ fn collect_lambdas<'a>(e: &'a Expr, out: &mut HashMap<u32, &'a Expr>) {
 fn collect_lambdas_in_block<'a>(b: &'a Block, out: &mut HashMap<u32, &'a Expr>) {
     for s in &b.stmts {
         match s {
-            Stmt::Let { value: e, .. }
+            Stmt::Let { value: Some(e), .. }
             | Stmt::State { init: e, .. }
             | Stmt::Assign { value: e, .. }
             | Stmt::Return { value: e, .. }
             | Stmt::Expr(e) => collect_lambdas(e, out),
+            Stmt::Let { value: None, .. } => {}
             Stmt::EventHandler { body, .. } => collect_lambdas_in_block(body, out),
+            Stmt::For { iter, body, .. } => {
+                collect_lambdas(iter, out);
+                collect_lambdas_in_block(body, out);
+            }
         }
     }
 }
@@ -281,7 +290,7 @@ pub fn compile_instance(
             }
         });
     }
-    let out = c.inline(def, sig, vals)?;
+    let out = c.inline(def, sig, vals, HashMap::new())?;
     Ok(Code {
         instrs: c.code,
         regs: c.regs as usize,
@@ -585,25 +594,87 @@ impl Compiler<'_> {
         }
     }
 
+    fn zero_for_type(&self, ty: &TypeExpr) -> CResult<CVal> {
+        match ty {
+            TypeExpr::Named(_) => Ok(CVal::Scalar(Operand::Const(0.0))),
+            TypeExpr::Frame { elem, size, .. } => {
+                let n = match size {
+                    SizeExpr::Lit(n, _) => *n,
+                    SizeExpr::Var(id) => {
+                        let Some(binding) = self.lookup(&id.name) else {
+                            return Err(internal(id.span, "unknown frame size"));
+                        };
+                        let Operand::Const(n) = binding.val.scalar() else {
+                            return Err(internal(id.span, "frame size is not constant"));
+                        };
+                        n as u32
+                    }
+                };
+                let elem = self.zero_for_type(elem)?;
+                Ok(CVal::Frame((0..n).map(|_| elem.clone()).collect()))
+            }
+            TypeExpr::Fn { span, .. } => Err(internal(*span, "cannot zero-initialize a function")),
+        }
+    }
+
     fn lookup(&self, name: &str) -> Option<&Binding> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
+    }
+
+    fn lookup_mut(&mut self, name: &str) -> Option<&mut Binding> {
+        self.scopes.iter_mut().rev().find_map(|s| s.get_mut(name))
+    }
+
+    fn rebind(&mut self, name: &str, val: CVal) {
+        if let Some(binding) = self.lookup_mut(name) {
+            binding.val = val;
+        }
+    }
+
+    fn rebind_index(&mut self, name: &str, index: usize, val: CVal) -> CResult<()> {
+        let Some(binding) = self.lookup_mut(name) else {
+            return Err(internal(self.span, "assignment to an unknown name"));
+        };
+        let CVal::Frame(xs) = &mut binding.val else {
+            return Err(internal(self.span, "index assignment to a non-frame"));
+        };
+        let Some(slot) = xs.get_mut(index) else {
+            return Err(internal(self.span, "index assignment out of range"));
+        };
+        *slot = val;
+        Ok(())
     }
 
     // ---- bodies ---------------------------------------------------------
 
     /// Compile `def`'s body in place with `args` bound to its parameters,
     /// and return its result.
-    fn inline(&mut self, def: &Def, sig: &Signature, args: Vec<CVal>) -> CResult<CVal> {
+    fn inline(
+        &mut self,
+        def: &Def,
+        sig: &Signature,
+        args: Vec<CVal>,
+        sizes: HashMap<String, CVal>,
+    ) -> CResult<CVal> {
         self.enter(&def.name.name, def.name.span)?;
-        let result = self.inline_body(def, sig, args);
+        let result = self.inline_body(def, sig, args, sizes);
         self.inlining.pop();
         result
     }
 
-    fn inline_body(&mut self, def: &Def, sig: &Signature, args: Vec<CVal>) -> CResult<CVal> {
+    fn inline_body(
+        &mut self,
+        def: &Def,
+        sig: &Signature,
+        args: Vec<CVal>,
+        sizes: HashMap<String, CVal>,
+    ) -> CResult<CVal> {
         let saved_scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
         let saved_span = std::mem::replace(&mut self.span, def.name.span);
 
+        for (name, val) in sizes {
+            self.bind(&name, val, false);
+        }
         for (p, a) in sig.params.iter().zip(&args) {
             self.bind_sizes(&p.ty, a);
         }
@@ -688,8 +759,15 @@ impl Compiler<'_> {
 
     fn stmt(&mut self, s: &Stmt) -> CResult<(Option<CVal>, bool)> {
         match s {
-            Stmt::Let { name, value, .. } => {
-                let v = self.expr(value)?;
+            Stmt::Let {
+                name, ty, value, ..
+            } => {
+                let v = match value {
+                    Some(value) => self.expr(value)?,
+                    None => self.zero_for_type(ty.as_ref().ok_or_else(|| {
+                        internal(name.span, "uninitialized local without a type")
+                    })?)?,
+                };
                 let v = self.detach(v)?;
                 self.bind(&name.name, v, false);
                 Ok((None, false))
@@ -717,15 +795,55 @@ impl Compiler<'_> {
                 let v = self.expr(value)?;
                 // Detach first so `s = [s[1], s[0]]` reads the old values.
                 let v = self.detach(v)?;
-                let dsts = match self.lookup(&target.name) {
-                    Some(b) if b.mutable => b.val.operands(),
-                    _ => return Err(internal(target.span, "assignment to a non-state name")),
-                };
-                for (d, src) in dsts.iter().zip(v.operands()) {
-                    if let Operand::Reg(dst) = *d {
-                        self.emit(Instr::Copy { dst, src });
+                match target {
+                    AssignTarget::Name(name) => match self.lookup(&name.name) {
+                        Some(b) if b.mutable => {
+                            let dsts = b.val.operands();
+                            for (d, src) in dsts.iter().zip(v.operands()) {
+                                if let Operand::Reg(dst) = *d {
+                                    self.emit(Instr::Copy { dst, src });
+                                }
+                            }
+                        }
+                        Some(_) => self.rebind(&name.name, v),
+                        None => return Err(internal(name.span, "assignment to an unknown name")),
+                    },
+                    AssignTarget::Index { base, index, .. } => {
+                        let i = self.expr(index)?.scalar();
+                        let Some(b) = self.lookup(&base.name) else {
+                            return Err(internal(base.span, "assignment to an unknown name"));
+                        };
+                        let mutable = b.mutable;
+                        let CVal::Frame(xs) = &b.val else {
+                            return Err(internal(base.span, "index assignment to a non-frame"));
+                        };
+                        let Operand::Const(i) = i else {
+                            return Err(Diagnostic::error(
+                                index.span,
+                                "assigned channel index must be known before audio starts",
+                            ));
+                        };
+                        let i = i as usize;
+                        let dsts = xs
+                            .get(i)
+                            .ok_or_else(|| {
+                                Diagnostic::error(
+                                    index.span,
+                                    format!("channel {i} is out of range"),
+                                )
+                            })?
+                            .operands();
+                        if mutable {
+                            for (d, src) in dsts.iter().zip(v.operands()) {
+                                if let Operand::Reg(dst) = *d {
+                                    self.emit(Instr::Copy { dst, src });
+                                }
+                            }
+                        } else {
+                            self.rebind_index(&base.name, i, v)?;
+                        }
                     }
-                }
+                };
                 Ok((None, false))
             }
             Stmt::Return { value, .. } => {
@@ -734,6 +852,23 @@ impl Compiler<'_> {
                 Ok((None, true))
             }
             Stmt::EventHandler { .. } => Ok((None, false)),
+            Stmt::For {
+                name, iter, body, ..
+            } => {
+                let values = self.loop_values(iter)?;
+                let mut returned = false;
+                for value in values {
+                    self.scopes.push(HashMap::new());
+                    self.bind(&name.name, value, false);
+                    let (_, diverged) = self.branch(|s| s.block(body))?;
+                    self.scopes.pop();
+                    if diverged {
+                        returned = true;
+                        break;
+                    }
+                }
+                Ok((None, returned))
+            }
             Stmt::Expr(e) => {
                 let v = self.expr(e)?;
                 Ok((Some(v), self.types[e.id as usize] == Type::Never))
@@ -811,7 +946,16 @@ impl Compiler<'_> {
                 let op = op2_for(*op, &self.types[e.id as usize]);
                 self.zip2(op, &va, &vb)
             }
-            ExprKind::Call { callee, args, .. } => self.call(e, callee, args),
+            ExprKind::Range { .. } => Err(Diagnostic::error(
+                e.span,
+                "a range can only be used as a `for` loop iterable",
+            )),
+            ExprKind::Call {
+                callee,
+                sizes,
+                args,
+                ..
+            } => self.call(e, callee, sizes, args),
             ExprKind::If { cond, then, els } => self.if_expr(e, cond, then, els.as_deref()),
             ExprKind::Block(b) => Ok(self.block(b)?.0.unwrap_or_else(CVal::unit)),
             ExprKind::Frame(elems) => {
@@ -954,6 +1098,43 @@ impl Compiler<'_> {
         Ok(result.unwrap_or_else(CVal::unit))
     }
 
+    fn loop_values(&mut self, iter: &Expr) -> CResult<Vec<CVal>> {
+        match &iter.kind {
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let start = self.expr(start)?.scalar();
+                let end = self.expr(end)?.scalar();
+                let (Operand::Const(start), Operand::Const(end)) = (start, end) else {
+                    return Err(Diagnostic::error(
+                        iter.span,
+                        "range bounds must be known before audio starts",
+                    ));
+                };
+                let start = range_bound(start, iter.span, "start")?;
+                let mut end = range_bound(end, iter.span, "end")?;
+                if *inclusive {
+                    end = end.checked_add(1).ok_or_else(|| {
+                        Diagnostic::error(iter.span, "inclusive range end is too large")
+                    })?;
+                }
+                Ok((start..end)
+                    .map(|i| CVal::Scalar(Operand::Const(i as f32)))
+                    .collect())
+            }
+            _ => {
+                let value = self.expr(iter)?;
+                let value = self.detach(value)?;
+                let CVal::Frame(values) = value else {
+                    return Err(internal(iter.span, "looping over a non-iterable value"));
+                };
+                Ok(values)
+            }
+        }
+    }
+
     /// `if c { f } else { g }` where the result is a function and `c` is
     /// only known while playing. Each side still runs only when taken, for
     /// any code it has; the result calls one or the other depending on `c`.
@@ -993,11 +1174,23 @@ impl Compiler<'_> {
         r
     }
 
-    fn call(&mut self, e: &Expr, callee: &Ident, args: &[Arg]) -> CResult<CVal> {
+    fn call(
+        &mut self,
+        e: &Expr,
+        callee: &Ident,
+        sizes: &[SizeExpr],
+        args: &[Arg],
+    ) -> CResult<CVal> {
         let name = callee.name.as_str();
         if let Some(binding) = self.lookup(name)
             && let CVal::Fn(f) = binding.val.clone()
         {
+            if !sizes.is_empty() {
+                return Err(Diagnostic::error(
+                    callee.span,
+                    "function values do not take explicit size arguments",
+                ));
+            }
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
                 vals.push(self.expr(&a.value)?);
@@ -1018,7 +1211,14 @@ impl Compiler<'_> {
                 });
             }
             let filled = self.fill_defaults(def, sig, vals, e.span)?;
-            return self.call_lifted(def, sig, filled);
+            let sizes = self.size_values(sizes, sig)?;
+            return self.call_lifted(def, sig, filled, sizes);
+        }
+        if !sizes.is_empty() {
+            return Err(Diagnostic::error(
+                callee.span,
+                "built-in functions do not take explicit size arguments",
+            ));
         }
         self.call_builtin(e.span, name, args)
     }
@@ -1062,6 +1262,25 @@ impl Compiler<'_> {
         result.map(|()| filled)
     }
 
+    fn size_values(
+        &mut self,
+        sizes: &[SizeExpr],
+        sig: &Signature,
+    ) -> CResult<HashMap<String, CVal>> {
+        let mut out = HashMap::new();
+        for (name, size) in sig.generics.iter().zip(sizes) {
+            let val = match size {
+                SizeExpr::Lit(n, _) => CVal::Scalar(Operand::Const(*n as f32)),
+                SizeExpr::Var(id) => self
+                    .lookup(&id.name)
+                    .map(|b| b.val.clone())
+                    .ok_or_else(|| internal(id.span, &format!("unknown size `{}`", id.name)))?,
+            };
+            out.insert(name.clone(), val);
+        }
+        Ok(out)
+    }
+
     /// Call a function value with positional arguments. Missing trailing
     /// arguments take the function's defaults.
     fn call_value(&mut self, f: &FnVal, vals: Vec<CVal>, span: Span) -> CResult<CVal> {
@@ -1071,7 +1290,7 @@ impl Compiler<'_> {
                     let mut slots: Vec<Option<CVal>> = vals.into_iter().map(Some).collect();
                     slots.resize(sig.params.len(), None);
                     let filled = self.fill_defaults(def, sig, slots, span)?;
-                    return self.inline(def, sig, filled);
+                    return self.inline(def, sig, filled, HashMap::new());
                 }
                 let sigs = super::builtins::lookup(name);
                 let mut vals = vals;
@@ -1170,7 +1389,13 @@ impl Compiler<'_> {
     /// Inline `def`, once per element if arguments have more frame layers
     /// than their parameters (lifting). The checker made sure every lifted
     /// argument has the same extra layers.
-    fn call_lifted(&mut self, def: &Def, sig: &Signature, args: Vec<CVal>) -> CResult<CVal> {
+    fn call_lifted(
+        &mut self,
+        def: &Def,
+        sig: &Signature,
+        args: Vec<CVal>,
+        sizes: HashMap<String, CVal>,
+    ) -> CResult<CVal> {
         let extra: Vec<usize> = sig
             .params
             .iter()
@@ -1180,7 +1405,9 @@ impl Compiler<'_> {
                 _ => 0,
             })
             .collect();
-        self.lift(&extra, &args, &mut |s, args| s.inline(def, sig, args))
+        self.lift(&extra, &args, &mut |s, args| {
+            s.inline(def, sig, args, sizes.clone())
+        })
     }
 
     /// Run `f` once per element of the extra layers of `args`, `extra[i]`
@@ -1368,4 +1595,20 @@ pub fn rate_unsupported(span: Span, name: &str) -> Diagnostic {
         format!("`{name}` changes the sample rate, which is not supported yet"),
     )
     .with_help("rate-changing rills type-check, but cannot be run until resampling lands")
+}
+
+fn range_bound(value: f32, span: Span, name: &str) -> CResult<i32> {
+    if value.fract() != 0.0 {
+        return Err(Diagnostic::error(
+            span,
+            format!("range {name} must be a whole number"),
+        ));
+    }
+    if value < i32::MIN as f32 || value > i32::MAX as f32 {
+        return Err(Diagnostic::error(
+            span,
+            format!("range {name} is out of bounds"),
+        ));
+    }
+    Ok(value as i32)
 }

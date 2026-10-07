@@ -30,6 +30,8 @@ pub enum Type {
     Num,
     /// `[elem; size]`. `elem` is a scalar or another frame.
     Frame(Box<Type>, Size),
+    /// A fixed integer range, usable as a `for` iterable.
+    Range,
     /// A function value: `fn(params) ret`.
     Fn(Vec<Type>, Box<Type>),
     /// No value, e.g. `out(x)` or an `if` without `else`.
@@ -75,6 +77,7 @@ impl fmt::Display for Type {
             Type::NoteOff => f.write_str("NoteOff"),
             Type::Num => f.write_str("number"),
             Type::Frame(elem, size) => write!(f, "[{elem}; {size}]"),
+            Type::Range => f.write_str("range"),
             Type::Fn(params, ret) => {
                 f.write_str("fn(")?;
                 for (i, p) in params.iter().enumerate() {
@@ -134,6 +137,7 @@ impl Type {
     pub fn leaf(&self) -> &Type {
         match self {
             Type::Frame(elem, _) => elem.leaf(),
+            Type::Range => self,
             t => t,
         }
     }
@@ -142,6 +146,7 @@ impl Type {
     pub fn depth(&self) -> usize {
         match self {
             Type::Frame(elem, _) => 1 + elem.depth(),
+            Type::Range => 0,
             _ => 0,
         }
     }
@@ -161,6 +166,7 @@ impl Type {
         match self {
             Type::Num => Type::Sample,
             Type::Frame(elem, n) => Type::Frame(Box::new(elem.settle()), n),
+            Type::Range => Type::Range,
             t => t,
         }
     }

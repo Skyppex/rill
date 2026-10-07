@@ -76,8 +76,9 @@ fn find_let<'p>(program: &'p Program, name: &str) -> &'p rill::lang::ast::Expr {
         for s in &item.def().body.stmts {
             if let Stmt::Let { name: n, value, .. } = s
                 && n.name == name
+                && value.is_some()
             {
-                return value;
+                return value.as_ref().unwrap();
             }
         }
     }
@@ -158,6 +159,7 @@ fn pipes_desugar_to_calls() {
         callee,
         args,
         piped,
+        ..
     } = &value.kind
     else {
         panic!("{value:?}")
@@ -180,7 +182,10 @@ fn pipes_desugar_to_calls() {
 #[test]
 fn precedence() {
     let stmts = parse_body("let x = 1 + 2 * 3 < 4 && true").unwrap();
-    let Stmt::Let { value, .. } = &stmts[0] else {
+    let Stmt::Let {
+        value: Some(value), ..
+    } = &stmts[0]
+    else {
         panic!()
     };
     let ExprKind::Binary(BinOp::And, cmp, _) = &value.kind else {
@@ -406,11 +411,45 @@ fn generic_sizes_are_inferred() {
     );
     assert_eq!(
         error("rill f<N>(x: Sample) Sample { return x }").0,
-        "size `N` is not used by any parameter"
+        "size `N` is not used"
     );
     assert_eq!(
         error("rill f(x: [Sample; M]) Sample { return x[0] }").0,
         "unknown size `M`"
+    );
+}
+
+#[test]
+fn for_loops_iterate_ranges_and_frames() {
+    let src = body(
+        "
+        let acc = 0
+        for x in [1, 2, 3] {
+            acc += x
+        }
+        let total = acc
+    ",
+    );
+    assert_eq!(type_of(&src, "total"), Type::Num);
+
+    let src = "
+        rill freqs<N>() [Freq; N] {
+            let xs: [Freq; N]
+            for i in 0..=N - 1 {
+                xs[i] = 440Hz
+            }
+            return xs
+        }
+        rill main() Sample {
+            let xs = freqs<2>()
+            return 0
+        }
+    ";
+    assert_eq!(type_of(src, "xs"), frame(Type::Freq, 2));
+
+    assert_eq!(
+        error(&body("for x in 1 { let y = x }")).0,
+        "cannot loop over `number`"
     );
 }
 
@@ -447,10 +486,7 @@ fn state_rules() {
         error("rill f(x: Sample) Sample { state s: Sample = x\n return s }").0,
         "the initial value of `state` must be a constant"
     );
-    assert_eq!(
-        error("rill f(x: Sample) Sample { let y = x\n y = 1\n return y }").0,
-        "cannot assign to `y`"
-    );
+    assert_ok("rill f(x: Sample) Sample { let y = x\n y = 1\n return y }");
     assert_eq!(
         error("rill f(x: Sample) Sample { x = 1\n return x }").0,
         "cannot assign to `x`"
@@ -949,7 +985,10 @@ fn casts_with_as() {
     assert_eq!(t("let s = 2.5 as Sample", "s"), Type::Sample);
     // A leading `-` binds tighter: this is `(-x) as Int`.
     let stmts = parse_body("let i = -x as Int").unwrap();
-    let Stmt::Let { value, .. } = &stmts[0] else {
+    let Stmt::Let {
+        value: Some(value), ..
+    } = &stmts[0]
+    else {
         panic!()
     };
     let ExprKind::Cast(inner, _) = &value.kind else {

@@ -11,13 +11,15 @@
 //! param   := NAME ":" type ("=" expr)?
 //! type    := NAME | "[" type ";" (INT | NAME) "]" | "fn" "(" types ")" type
 //! block   := "{" stmt* "}"
-//! stmt    := "let" NAME (":" type)? "=" expr
+//! stmt    := "let" NAME (":" type)? ("=" expr)?
 //!          | "state" NAME (":" type)? "=" expr
 //!          | "return" expr
-//!          | NAME "=" expr
+//!          | "for" NAME "in" expr block
+//!          | assignable ("=" | "+=") expr
 //!          | "on" NAME ("(" NAME,* ")")? block
 //!          | expr
-//! expr    := or ("|>" NAME ("(" args ")")?)*
+//! expr    := range ("|>" NAME size_args? ("(" args ")")?)*
+//! range   := or ((".." | "..=") or)?
 //! or      := and ("||" and)*
 //! and     := cmp ("&&" cmp)*
 //! cmp     := sum (("<" | "<=" | ">" | ">=" | "==" | "!=") sum)?
@@ -412,14 +414,17 @@ impl Parser<'_> {
                     Some(_) => Some(self.ty()?),
                     None => None,
                 };
-                self.expect(TokenKind::Assign, "and an initial value")?;
-                let value = self.expr()?;
+                let value = match self.eat(TokenKind::Assign) {
+                    Some(_) => Some(self.expr()?),
+                    None if !is_state && ty.is_some() => None,
+                    None => return Err(self.unexpected("and an initial value")),
+                };
                 let span = self.span_from(start);
                 if is_state {
                     Stmt::State {
                         name,
                         ty,
-                        init: value,
+                        init: value.expect("state always has an initial value"),
                         span,
                     }
                 } else {
@@ -439,10 +444,27 @@ impl Parser<'_> {
                     span: self.span_from(start),
                 }
             }
-            TokenKind::Ident if self.peek_at(1).kind == TokenKind::Assign => {
-                let target = self.ident("")?;
-                self.bump();
+            TokenKind::For => self.for_stmt()?,
+            TokenKind::Ident if self.at_assignment(TokenKind::Assign) => {
+                let target = self.assign_target()?;
+                self.expect(TokenKind::Assign, "in assignment")?;
                 let value = self.expr()?;
+                Stmt::Assign {
+                    target,
+                    value,
+                    span: self.span_from(start),
+                }
+            }
+            TokenKind::Ident if self.at_assignment(TokenKind::PlusAssign) => {
+                let target = self.assign_target()?;
+                self.expect(TokenKind::PlusAssign, "in assignment")?;
+                let rhs = self.expr()?;
+                let lhs = self.assign_target_expr(&target);
+                let span = lhs.span.to(rhs.span);
+                let value = self.expr_node(
+                    ExprKind::Binary(BinOp::Add, Box::new(lhs), Box::new(rhs)),
+                    span,
+                );
                 Stmt::Assign {
                     target,
                     value,
@@ -467,6 +489,67 @@ impl Parser<'_> {
         Ok(stmt)
     }
 
+    fn at_assignment(&self, op: TokenKind) -> bool {
+        if same_kind(&self.peek_at(1).kind, &op) {
+            return true;
+        }
+        self.peek_at(1).kind == TokenKind::LBracket
+            && self
+                .assign_op_after_index()
+                .is_some_and(|k| same_kind(&k, &op))
+    }
+
+    fn assign_op_after_index(&self) -> Option<TokenKind> {
+        let mut pos = self.pos + 1;
+        if self.tokens.get(pos)?.kind != TokenKind::LBracket {
+            return None;
+        }
+        let mut depth = 0u32;
+        loop {
+            let t = *self.tokens.get(pos)?;
+            match t.kind {
+                TokenKind::LBracket | TokenKind::LParen => depth += 1,
+                TokenKind::RBracket | TokenKind::RParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let op = self.tokens.get(pos + 1)?.kind;
+                        return matches!(op, TokenKind::Assign | TokenKind::PlusAssign)
+                            .then_some(op);
+                    }
+                }
+                TokenKind::Eof | TokenKind::RBrace => return None,
+                _ => {}
+            }
+            pos += 1;
+        }
+    }
+
+    fn assign_target(&mut self) -> PResult<AssignTarget> {
+        let base = self.ident("")?;
+        if self.eat(TokenKind::LBracket).is_none() {
+            return Ok(AssignTarget::Name(base));
+        }
+        self.nest += 1;
+        let index = self.expr()?;
+        self.expect(TokenKind::RBracket, "to close the index")?;
+        self.nest -= 1;
+        let span = self.span_from(base.span);
+        Ok(AssignTarget::Index { base, index, span })
+    }
+
+    fn assign_target_expr(&mut self, target: &AssignTarget) -> Expr {
+        match target {
+            AssignTarget::Name(id) => self.expr_node(ExprKind::Name(id.name.clone()), id.span),
+            AssignTarget::Index { base, index, span } => {
+                let base_expr = self.expr_node(ExprKind::Name(base.name.clone()), base.span);
+                self.expr_node(
+                    ExprKind::Index(Box::new(base_expr), Box::new(index.clone())),
+                    *span,
+                )
+            }
+        }
+    }
+
     /// At `fn name` or `rill name`: a definition, not an anonymous fn.
     fn at_def_start(&self) -> bool {
         (self.at(TokenKind::Fn) || self.at(TokenKind::Rill))
@@ -486,7 +569,7 @@ impl Parser<'_> {
             let t = self.peek();
             let starts_stmt = matches!(
                 t.kind,
-                TokenKind::Let | TokenKind::State | TokenKind::Return
+                TokenKind::Let | TokenKind::State | TokenKind::Return | TokenKind::For
             );
             if self.pos > stmt_start && t.newline_before && starts_stmt {
                 return;
@@ -563,6 +646,22 @@ impl Parser<'_> {
         })
     }
 
+    fn for_stmt(&mut self) -> PResult<Stmt> {
+        let start = self.bump().span; // for
+        let name = self.ident("after `for`")?;
+        self.expect(TokenKind::In, "after the loop variable")?;
+        let saved = std::mem::replace(&mut self.nest, 0);
+        let iter = self.expr()?;
+        self.nest = saved;
+        let body = self.block()?;
+        Ok(Stmt::For {
+            name,
+            iter,
+            body,
+            span: self.span_from(start),
+        })
+    }
+
     fn event_handler(&mut self) -> PResult<Stmt> {
         let start = self.bump().span; // on
         let name = self.ident("after `on`")?;
@@ -595,11 +694,16 @@ impl Parser<'_> {
     }
 
     pub fn expr(&mut self) -> PResult<Expr> {
-        let mut lhs = self.binary(0)?;
+        let mut lhs = self.range()?;
         while self.continues() && self.eat(TokenKind::Pipe).is_some() {
             let callee = self.ident("after `|>`").map_err(|e| {
                 e.with_help("the right side of `|>` must name a fn or rill, as in `x |> peak`")
             })?;
+            let sizes = if self.at_size_call_args() {
+                self.size_args()?
+            } else {
+                Vec::new()
+            };
             let mut args = vec![Arg {
                 name: None,
                 value: lhs,
@@ -614,6 +718,7 @@ impl Parser<'_> {
             lhs = self.expr_node(
                 ExprKind::Call {
                     callee,
+                    sizes,
                     args,
                     piped: true,
                 },
@@ -621,6 +726,30 @@ impl Parser<'_> {
             );
         }
         Ok(lhs)
+    }
+
+    fn range(&mut self) -> PResult<Expr> {
+        let lhs = self.binary(0)?;
+        if !self.continues() {
+            return Ok(lhs);
+        }
+        let inclusive = if self.eat(TokenKind::DotDotEq).is_some() {
+            true
+        } else if self.eat(TokenKind::DotDot).is_some() {
+            false
+        } else {
+            return Ok(lhs);
+        };
+        let rhs = self.binary(0)?;
+        let span = lhs.span.to(rhs.span);
+        Ok(self.expr_node(
+            ExprKind::Range {
+                start: Box::new(lhs),
+                end: Box::new(rhs),
+                inclusive,
+            },
+            span,
+        ))
     }
 
     /// Precedence climbing over the binary operators below `|>`.
@@ -728,6 +857,49 @@ impl Parser<'_> {
         Ok(args)
     }
 
+    fn size_args(&mut self) -> PResult<Vec<SizeExpr>> {
+        if self.peek().newline_before || self.eat(TokenKind::Lt).is_none() {
+            return Ok(Vec::new());
+        }
+        let mut sizes = Vec::new();
+        loop {
+            if self.at(TokenKind::Ident) {
+                sizes.push(SizeExpr::Var(self.ident("as a size argument")?));
+            } else {
+                let at = self.peek().span;
+                sizes.push(SizeExpr::Lit(self.int("as a size argument")?, at));
+            }
+            if self.eat(TokenKind::Comma).is_none() || self.at(TokenKind::Gt) {
+                break;
+            }
+        }
+        self.expect(TokenKind::Gt, "to close the size arguments")?;
+        Ok(sizes)
+    }
+
+    fn at_size_call_args(&self) -> bool {
+        if self.peek().newline_before || self.peek().kind != TokenKind::Lt {
+            return false;
+        }
+        let mut pos = self.pos + 1;
+        loop {
+            match self.tokens.get(pos).map(|t| t.kind) {
+                Some(TokenKind::Ident | TokenKind::Number { .. }) => pos += 1,
+                _ => return false,
+            }
+            match self.tokens.get(pos).map(|t| t.kind) {
+                Some(TokenKind::Comma) => pos += 1,
+                Some(TokenKind::Gt) => {
+                    let Some(next) = self.tokens.get(pos + 1) else {
+                        return false;
+                    };
+                    return !next.newline_before && next.kind == TokenKind::LParen;
+                }
+                _ => return false,
+            }
+        }
+    }
+
     fn primary(&mut self) -> PResult<Expr> {
         let t = self.peek();
         match t.kind {
@@ -752,18 +924,29 @@ impl Parser<'_> {
             }
             TokenKind::Ident => {
                 let name = self.ident("")?;
+                let sizes = if self.at_size_call_args() {
+                    self.size_args()?
+                } else {
+                    Vec::new()
+                };
                 if self.at(TokenKind::LParen) && !self.peek().newline_before {
                     let args = self.args()?;
                     let span = self.span_from(name.span);
                     Ok(self.expr_node(
                         ExprKind::Call {
                             callee: name,
+                            sizes,
                             args,
                             piped: false,
                         },
                         span,
                     ))
                 } else {
+                    if !sizes.is_empty() {
+                        return Err(self
+                            .unexpected("`(` after explicit size arguments")
+                            .with_help("write explicit sizes on a call, as in `unison<8>(...)`"));
+                    }
                     Ok(self.expr_node(ExprKind::Name(name.name), name.span))
                 }
             }

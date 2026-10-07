@@ -195,6 +195,8 @@ enum VarKind {
     State,
     /// A size parameter like `N`, usable as a number.
     Size,
+    /// A `for` loop variable.
+    Loop,
     /// The payload of an `on` handler.
     EventParam,
 }
@@ -468,11 +470,12 @@ impl Checker {
         self.def_bindings.push((generic_ids, param_ids));
 
         for g in &d.generics {
-            let used = params.iter().any(|p| mentions_size(&p.ty, &g.name));
+            let used = params.iter().any(|p| mentions_size(&p.ty, &g.name))
+                || mentions_size(&ret, &g.name);
             if !used {
                 let e = self
-                    .error(g.span, format!("size `{}` is not used by any parameter", g.name))
-                    .with_help("sizes are inferred from the arguments, so each one must appear in a parameter type");
+                    .error(g.span, format!("size `{}` is not used", g.name))
+                    .with_help("use it in a parameter or return type");
                 self.report(e);
             }
         }
@@ -714,6 +717,7 @@ impl Checker {
             VarKind::Let => BindingKind::Let,
             VarKind::State => BindingKind::State,
             VarKind::Size => BindingKind::Size,
+            VarKind::Loop => BindingKind::Let,
             VarKind::EventParam => BindingKind::EventParam,
         };
         let scope = Span {
@@ -747,10 +751,14 @@ impl Checker {
                 let declared = ty
                     .as_ref()
                     .map(|te| self.resolve_type(te, &self.generics()));
-                let t = self.expr_expect(value, declared.as_ref());
+                let t = match value {
+                    Some(value) => self.expr_expect(value, declared.as_ref()),
+                    None => declared.clone().unwrap_or(Type::Error),
+                };
                 let bound = match declared {
                     Some(declared) => {
-                        if !coerces(&t, &declared) {
+                        if value.is_some() && !coerces(&t, &declared) {
+                            let value = value.as_ref().expect("checked above");
                             let e =
                                 mismatch(value.span, &format!("`{}`", name.name), &declared, &t);
                             self.report(e);
@@ -814,39 +822,62 @@ impl Checker {
             }
             Stmt::Assign { target, value, .. } => {
                 let t = self.expr(value);
-                if let Some(var) = self.lookup(&target.name) {
+                let name = target.name();
+                if let AssignTarget::Index { index, .. } = target {
+                    let ti = self.expr(index);
+                    if !ti.is_wild() && !matches!(ti, Type::Int | Type::Num) {
+                        let d = self.error(
+                            index.span,
+                            format!("channel index must be a whole number, found `{ti}`"),
+                        );
+                        self.report(d);
+                    }
+                }
+                if let Some(var) = self.lookup(&name.name) {
                     let id = var.id;
-                    self.resolve(target.span, Resolution::Binding(id));
+                    self.resolve(name.span, Resolution::Binding(id));
                 }
                 let captured = matches!(
-                    (self.lambda_floor, self.lookup_depth(&target.name)),
+                    (self.lambda_floor, self.lookup_depth(&name.name)),
                     (Some(floor), Some(depth)) if depth < floor
                 );
-                match self.lookup(&target.name).cloned() {
+                match self.lookup(&name.name).cloned() {
                     Some(_) if captured => {
                         let e = self
-                            .error(target.span, format!("an anonymous fn cannot change `{}`", target.name))
+                            .error(name.span, format!("an anonymous fn cannot change `{}`", name.name))
                             .with_help("fns are pure, including anonymous ones: they can read what they capture, but not change it");
                         self.report(e);
                     }
                     Some(var)
                         if var.kind == VarKind::State
+                            || var.kind == VarKind::Let
                             || (self.in_event && var.kind == VarKind::Param) =>
                     {
-                        if !coerces(&t, &var.ty) {
+                        let expected = match (target, &var.ty) {
+                            (AssignTarget::Index { .. }, Type::Frame(elem, _)) => *elem.clone(),
+                            (AssignTarget::Index { .. }, other) => {
+                                let e = self
+                                    .error(target.span(), format!("cannot index `{other}`"))
+                                    .with_help("only frames have channels to index");
+                                self.report(e);
+                                Type::Error
+                            }
+                            _ => var.ty.clone(),
+                        };
+                        if !coerces(&t, &expected) {
                             let e =
-                                mismatch(value.span, &format!("`{}`", target.name), &var.ty, &t);
+                                mismatch(value.span, &format!("`{}`", name.name), &expected, &t);
                             self.report(e);
                         }
                     }
                     Some(_) => {
                         let e = self
-                            .error(target.span, format!("cannot assign to `{}`", target.name))
-                            .with_help("only `state` variables change between ticks; `let` bindings and parameters are fixed");
+                            .error(name.span, format!("cannot assign to `{}`", name.name))
+                            .with_help("only local `let` bindings and `state` variables can be assigned to");
                         self.report(e);
                     }
                     None => {
-                        let e = self.unknown_name(&target.name, target.span);
+                        let e = self.unknown_name(&name.name, name.span);
                         self.report(e);
                     }
                 }
@@ -903,6 +934,30 @@ impl Checker {
                 let saved = std::mem::replace(&mut self.in_event, true);
                 let (_, diverged) = self.block(body, false);
                 self.in_event = saved;
+                self.scopes.pop();
+                self.scope_spans.pop();
+                (Type::Unit, diverged)
+            }
+            Stmt::For {
+                name, iter, body, ..
+            } => {
+                let iter_ty = self.expr(iter);
+                let elem_ty = match iter_ty {
+                    Type::Range => Type::Int,
+                    Type::Frame(elem, _) => *elem,
+                    Type::Error | Type::Never => Type::Error,
+                    other => {
+                        let e = self
+                            .error(iter.span, format!("cannot loop over `{other}`"))
+                            .with_help("loop over a range like `0..4` or a frame like `[1, 2]`");
+                        self.report(e);
+                        Type::Error
+                    }
+                };
+                self.scopes.push(HashMap::new());
+                self.scope_spans.push(body.span);
+                self.bind(name, elem_ty, VarKind::Loop, name.span.end);
+                let (_, diverged) = self.block(body, false);
                 self.scopes.pop();
                 self.scope_spans.pop();
                 (Type::Unit, diverged)
@@ -1011,7 +1066,39 @@ impl Checker {
                     }
                 }
             }
-            ExprKind::Call { callee, args, .. } => self.call(e.span, callee, args),
+            ExprKind::Range {
+                start,
+                end,
+                inclusive: _,
+            } => {
+                let ta = self.expr(start);
+                let tb = self.expr(end);
+                for (expr, ty, name) in [(start, &ta, "start"), (end, &tb, "end")] {
+                    if !ty.is_wild() && !matches!(ty, Type::Int | Type::Num) {
+                        let d = self.error(
+                            expr.span,
+                            format!("range {name} must be a whole number, found `{ty}`"),
+                        );
+                        self.report(d);
+                    }
+                    if !self.is_const(expr) {
+                        let d = self
+                            .error(
+                                expr.span,
+                                format!("range {name} must be known before audio starts"),
+                            )
+                            .with_help("use literals, built-in constants, size parameters and pure built-in functions");
+                        self.report(d);
+                    }
+                }
+                Type::Range
+            }
+            ExprKind::Call {
+                callee,
+                sizes,
+                args,
+                ..
+            } => self.call(e.span, callee, sizes, args),
             ExprKind::If { cond, then, els } => {
                 let tc = self.expr(cond);
                 if !coerces(&tc, &Type::Bool) {
@@ -1190,7 +1277,7 @@ impl Checker {
         }
     }
 
-    fn call(&mut self, span: Span, callee: &Ident, args: &[Arg]) -> Type {
+    fn call(&mut self, span: Span, callee: &Ident, sizes: &[SizeExpr], args: &[Arg]) -> Type {
         let name = callee.name.as_str();
 
         // A variable holding a function.
@@ -1281,6 +1368,7 @@ impl Checker {
             self.report(d);
             return Type::Error;
         };
+        let explicit_sizes = self.explicit_sizes(sizes, &sig);
 
         // Match arguments to parameters.
         let mut slots: Vec<Option<usize>> = vec![None; sig.params.len()];
@@ -1382,6 +1470,11 @@ impl Checker {
         // the extra layers (lifting); fns and built-ins never lift, except
         // the built-ins documented to take a frame in their first parameter.
         let mut subst = Subst::default();
+        if let Some(explicit_sizes) = explicit_sizes {
+            for (name, size) in sig.generics.iter().zip(explicit_sizes) {
+                subst.sizes.insert(name.clone(), size);
+            }
+        }
         let mut lift: Option<(Vec<Size>, Span)> = None;
         for (pi, (p, slot)) in sig.params.iter().zip(&slots).enumerate() {
             let Some(ai) = *slot else { continue };
@@ -1483,6 +1576,44 @@ impl Checker {
                 .rev()
                 .fold(ret, |t, n| Type::Frame(Box::new(t), n)),
         }
+    }
+
+    fn explicit_sizes(&mut self, sizes: &[SizeExpr], sig: &Signature) -> Option<Vec<Size>> {
+        if sizes.is_empty() {
+            return Some(Vec::new());
+        }
+        if sizes.len() != sig.generics.len() {
+            let d = self.error(
+                sizes.first().map_or(Span::new(0, 0), size_span),
+                format!(
+                    "`{}` takes {} size argument(s), but {} were given",
+                    sig.name,
+                    sig.generics.len(),
+                    sizes.len()
+                ),
+            );
+            self.report(d);
+            return None;
+        }
+        let generics = self.generics();
+        let mut out = Vec::new();
+        for size in sizes {
+            out.push(match size {
+                SizeExpr::Lit(n, _) => Size::Const(*n),
+                SizeExpr::Var(id) if generics.contains(&id.name) => {
+                    if let Some(var) = self.lookup(&id.name) {
+                        self.resolve(id.span, Resolution::Binding(var.id));
+                    }
+                    Size::Var(id.name.clone())
+                }
+                SizeExpr::Var(id) => {
+                    let e = self.error(id.span, format!("unknown size `{}`", id.name));
+                    self.report(e);
+                    Size::Const(0)
+                }
+            });
+        }
+        Some(out)
     }
 
     /// Check each argument with no expectation, so that errors inside them
@@ -1826,6 +1957,7 @@ impl Checker {
             | ExprKind::Block(_)
             | ExprKind::Index(..)
             | ExprKind::Field(..)
+            | ExprKind::Range { .. }
             | ExprKind::Fn { .. } => false,
         }
     }
@@ -1905,6 +2037,7 @@ fn var_word(kind: VarKind) -> &'static str {
         VarKind::Let => "value",
         VarKind::State => "state variable",
         VarKind::Size => "size",
+        VarKind::Loop => "loop variable",
         VarKind::EventParam => "event",
     }
 }
@@ -1997,7 +2130,21 @@ fn contains_param(t: &Type) -> bool {
 }
 
 fn mentions_size(t: &Type, name: &str) -> bool {
-    matches!(t, Type::Frame(_, Size::Var(v)) if v == name)
+    match t {
+        Type::Frame(elem, Size::Var(v)) => v == name || mentions_size(elem, name),
+        Type::Frame(elem, _) => mentions_size(elem, name),
+        Type::Fn(params, ret) => {
+            params.iter().any(|p| mentions_size(p, name)) || mentions_size(ret, name)
+        }
+        _ => false,
+    }
+}
+
+fn size_span(size: &SizeExpr) -> Span {
+    match size {
+        SizeExpr::Lit(_, span) => *span,
+        SizeExpr::Var(id) => id.span,
+    }
 }
 
 fn unify(param: &Type, arg: &Type, subst: &mut Subst, generics: &[String]) -> bool {
@@ -2168,6 +2315,12 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
         (BinOp::Add | BinOp::Sub, Type::Pitch, Type::Interval)
     ) {
         return Ok(Type::Pitch);
+    }
+    if matches!(
+        (op, a, b),
+        (BinOp::Add | BinOp::Sub, Type::Freq, Type::Interval)
+    ) {
+        return Ok(Type::Freq);
     }
     if matches!((op, a, b), (BinOp::Add, Type::Interval, Type::Pitch)) {
         return Err((

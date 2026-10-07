@@ -131,7 +131,7 @@ pub enum Stmt {
     Let {
         name: Ident,
         ty: Option<TypeExpr>,
-        value: Expr,
+        value: Option<Expr>,
         span: Span,
     },
     State {
@@ -141,7 +141,7 @@ pub enum Stmt {
         span: Span,
     },
     Assign {
-        target: Ident,
+        target: AssignTarget,
         value: Expr,
         span: Span,
     },
@@ -155,7 +155,39 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    For {
+        name: Ident,
+        iter: Expr,
+        body: Block,
+        span: Span,
+    },
     Expr(Expr),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AssignTarget {
+    Name(Ident),
+    Index {
+        base: Ident,
+        index: Expr,
+        span: Span,
+    },
+}
+
+impl AssignTarget {
+    pub fn span(&self) -> Span {
+        match self {
+            AssignTarget::Name(id) => id.span,
+            AssignTarget::Index { span, .. } => *span,
+        }
+    }
+
+    pub fn name(&self) -> &Ident {
+        match self {
+            AssignTarget::Name(id) => id,
+            AssignTarget::Index { base, .. } => base,
+        }
+    }
 }
 
 impl Stmt {
@@ -165,7 +197,8 @@ impl Stmt {
             | Stmt::State { span, .. }
             | Stmt::Assign { span, .. }
             | Stmt::Return { span, .. }
-            | Stmt::EventHandler { span, .. } => *span,
+            | Stmt::EventHandler { span, .. }
+            | Stmt::For { span, .. } => *span,
             Stmt::Expr(e) => e.span,
         }
     }
@@ -191,10 +224,16 @@ pub enum ExprKind {
     Name(String),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        inclusive: bool,
+    },
     /// `f(a, b: c)`. `x |> f(a)` is sugar for `f(x, a)` and parses to this
     /// with `piped` set.
     Call {
         callee: Ident,
+        sizes: Vec<SizeExpr>,
         args: Vec<Arg>,
         piped: bool,
     },

@@ -5,6 +5,10 @@
   inputs,
   ...
 }: {
+  imports = [
+    ./tree-sitter-rill/devenv.nix
+  ];
+
   # https://devenv.sh/packages/
   packages = with pkgs; [
     alejandra

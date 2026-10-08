@@ -298,7 +298,7 @@ pub fn compile_instance(
         });
     }
     let out = c.inline(def, sig, vals, HashMap::new())?;
-    Ok(Code {
+    let mut code = Code {
         instrs: c.code,
         post: c.post,
         regs: c.regs as usize,
@@ -310,7 +310,17 @@ pub fn compile_instance(
         seqs: defs.seqs.clone(),
         calls: c.calls,
         pools: c.pools,
-    })
+    };
+    super::opt::optimize(&mut code);
+    Ok(code)
+}
+
+/// The value of `o`, if it is a constant.
+fn const_of(o: Operand) -> Option<f32> {
+    match o {
+        Operand::Const(c) => Some(c),
+        Operand::Reg(_) => None,
+    }
 }
 
 /// Build every sequence's table: its settings and steps, all constants.
@@ -455,9 +465,24 @@ struct Compiler<'a> {
     /// Inside a handler: the first scope that belongs to it. Names bound
     /// from there on are the handler's own.
     handler_scope: Option<usize>,
+    /// Results already computed in the straight-line code being emitted, by
+    /// operation and operands, so the same calculation is not done twice.
+    /// Cleared wherever registers may change or paths join.
+    cse: HashMap<(u8, u8, u64, u64), u16>,
+    /// The result slot of the `if` whose `else if` is being compiled, so
+    /// the inner `if` writes its result straight into it.
+    slot_hint: Option<CVal>,
 }
 
 type CResult<T> = Result<T, Diagnostic>;
+
+/// An operand as a key for [`Compiler::cse`].
+fn key(o: Operand) -> u64 {
+    match o {
+        Operand::Reg(r) => u64::from(r),
+        Operand::Const(c) => (1 << 32) | u64::from(c.to_bits()),
+    }
+}
 
 fn internal(span: Span, what: &str) -> Diagnostic {
     Diagnostic::error(span, format!("internal compiler error: {what}"))
@@ -484,6 +509,8 @@ impl<'a> Compiler<'a> {
             pools: Vec::new(),
             voice: None,
             handler_scope: None,
+            cse: HashMap::new(),
+            slot_hint: None,
         }
     }
 
@@ -505,12 +532,22 @@ impl<'a> Compiler<'a> {
     }
 
     fn emit(&mut self, instr: Instr) -> usize {
+        // Only pure operations into fresh registers keep earlier results
+        // valid; anything else may overwrite a register or branch.
+        if !matches!(
+            instr,
+            Instr::Op1 { .. } | Instr::Op2 { .. } | Instr::Tune { .. }
+        ) {
+            self.cse.clear();
+        }
         self.code.push(instr);
         self.code.len() - 1
     }
 
     /// Point the jump at `at` to the next instruction.
     fn patch(&mut self, at: usize) {
+        // Paths join here.
+        self.cse.clear();
         let here = self.code.len() as u32;
         match &mut self.code[at] {
             Instr::Jump { target } | Instr::JumpUnless { target, .. } => *target = here,
@@ -522,8 +559,38 @@ impl<'a> Compiler<'a> {
         if let (Operand::Const(a), Operand::Const(b)) = (a, b) {
             return Ok(Operand::Const(op.apply(a, b)));
         }
+        let (ca, cb) = (const_of(a), const_of(b));
+        // Operations that leave a value as it is.
+        match (op, ca, cb) {
+            (Op2::Add, _, Some(0.0)) | (Op2::Sub, _, Some(0.0)) => return Ok(a),
+            (Op2::Mul | Op2::Div | Op2::Pow, _, Some(1.0)) => return Ok(a),
+            (Op2::Add, Some(0.0), _) | (Op2::Mul, Some(1.0), _) => return Ok(b),
+            _ => {}
+        }
+        // Multiplying is cheaper than dividing; the result can differ in the
+        // last bit when the reciprocal is not exact.
+        if let (Op2::Div, Some(c)) = (op, cb) {
+            let r = 1.0 / c;
+            if c != 0.0 && r.is_finite() {
+                return self.op2(Op2::Mul, a, Operand::Const(r));
+            }
+        }
+        let commutes = matches!(
+            op,
+            Op2::Add | Op2::Mul | Op2::Min | Op2::Max | Op2::Eq | Op2::Ne | Op2::And | Op2::Or
+        );
+        let (ka, kb) = (key(a), key(b));
+        let k = if commutes && kb < ka {
+            (2, op as u8, kb, ka)
+        } else {
+            (2, op as u8, ka, kb)
+        };
+        if let Some(&r) = self.cse.get(&k) {
+            return Ok(Operand::Reg(r));
+        }
         let dst = self.reg()?;
         self.emit(Instr::Op2 { op, dst, a, b });
+        self.cse.insert(k, dst);
         Ok(Operand::Reg(dst))
     }
 
@@ -552,8 +619,13 @@ impl<'a> Compiler<'a> {
         if let Operand::Const(x) = x {
             return Ok(Operand::Const(op.apply(x, self.sample_rate)));
         }
+        let k = (1, op as u8, key(x), 0);
+        if let Some(&r) = self.cse.get(&k) {
+            return Ok(Operand::Reg(r));
+        }
         let dst = self.reg()?;
         self.emit(Instr::Op1 { op, dst, x });
+        self.cse.insert(k, dst);
         Ok(Operand::Reg(dst))
     }
 
@@ -683,7 +755,10 @@ impl<'a> Compiler<'a> {
             let Operand::Reg(dst) = *d else {
                 unreachable!()
             };
-            self.emit(Instr::Copy { dst, src });
+            // Already there: the value was written into the slot directly.
+            if src != Operand::Reg(dst) {
+                self.emit(Instr::Copy { dst, src });
+            }
         }
         Ok(())
     }
@@ -1167,6 +1242,7 @@ impl<'a> Compiler<'a> {
         body: &Block,
     ) -> CResult<()> {
         let saved_code = std::mem::take(&mut self.code);
+        self.cse.clear();
         let saved_scopes = self.scopes.clone();
         self.scopes.push(HashMap::new());
         let saved_handler = self.handler_scope.replace(self.scopes.len() - 1);
@@ -1213,6 +1289,7 @@ impl<'a> Compiler<'a> {
             return Err(internal(name.span, "event handlers cannot return"));
         }
         let instrs = std::mem::take(&mut self.code);
+        self.cse.clear();
         self.scopes = saved_scopes;
         self.code = saved_code;
         self.handler_scope = saved_handler;
@@ -1319,8 +1396,10 @@ impl<'a> Compiler<'a> {
             } else if own.is_empty() {
                 // Only the rill's streams: one register for every instance.
                 let saved = std::mem::replace(&mut self.code, std::mem::take(&mut self.post));
+                self.cse.clear();
                 let v = self.expr(&a.value);
                 self.post = std::mem::replace(&mut self.code, saved);
+                self.cse.clear();
                 settings[index] = match v?.scalar() {
                     Operand::Reg(r) => Source::Follow(r),
                     c @ Operand::Const(_) => Source::Now(c),
@@ -1349,6 +1428,7 @@ impl<'a> Compiler<'a> {
             // Per instance slot: load its captured values, then compute the
             // settings that follow streams.
             let saved_code = std::mem::replace(&mut self.code, std::mem::take(&mut self.post));
+            self.cse.clear();
             let base = self.handler_scope.unwrap_or(self.scopes.len());
             let saved_scopes = self.scopes.clone();
             self.scopes.truncate(base);
@@ -1388,6 +1468,7 @@ impl<'a> Compiler<'a> {
             })();
             self.scopes = saved_scopes;
             self.post = std::mem::replace(&mut self.code, saved_code);
+            self.cse.clear();
             result?;
         }
         self.calls.push(InvokeCall {
@@ -1440,6 +1521,8 @@ impl<'a> Compiler<'a> {
         then: &Block,
         els: Option<&Expr>,
     ) -> CResult<CVal> {
+        // An `else if` writes its result into the slot of the `if` it ends.
+        let hint = self.slot_hint.take();
         let wants_value = !matches!(self.types[e.id as usize], Type::Unit | Type::Never);
         let c = self.expr(cond)?.scalar();
 
@@ -1459,7 +1542,7 @@ impl<'a> Compiler<'a> {
         }
 
         let skip_then = self.emit(Instr::JumpUnless { cond: c, target: 0 });
-        let mut result: Option<CVal> = None;
+        let mut result: Option<CVal> = hint.filter(|_| wants_value);
         let (v1, _) = self.branch(|s| s.block(then))?;
         if wants_value && let Some(v) = v1 {
             self.copy_into(&mut result, &v)?;
@@ -1468,7 +1551,12 @@ impl<'a> Compiler<'a> {
             Some(els) => {
                 let skip_else = self.emit(Instr::Jump { target: 0 });
                 self.patch(skip_then);
-                let v2 = self.branch(|s| s.expr(els))?;
+                if wants_value && matches!(els.kind, ExprKind::If { .. }) {
+                    self.slot_hint = result.clone();
+                }
+                let v2 = self.branch(|s| s.expr(els));
+                self.slot_hint = None;
+                let v2 = v2?;
                 if wants_value && self.types[els.id as usize] != Type::Never {
                     self.copy_into(&mut result, &v2)?;
                 }

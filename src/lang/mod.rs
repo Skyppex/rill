@@ -27,6 +27,7 @@ pub mod check;
 pub mod compile;
 pub mod diag;
 pub mod lexer;
+pub mod opt;
 pub mod parser;
 pub mod pretty;
 pub mod types;

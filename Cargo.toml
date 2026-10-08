@@ -18,3 +18,8 @@ cpal = { version = "0.18.2", optional = true }
 
 [dev-dependencies]
 hound = "3.5.1"
+
+# Audio code needs some optimisation to keep up in real time; without it a
+# debug build runs several times slower than release and stutters.
+[profile.dev]
+opt-level = 1

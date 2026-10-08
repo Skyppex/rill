@@ -47,7 +47,7 @@ fn pure_dst_mut(i: &mut Instr) -> Option<&mut u16> {
 }
 
 /// Every register an instruction writes.
-fn writes(i: &Instr, f: &mut impl FnMut(u16)) {
+pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(u16)) {
     match *i {
         Instr::Op1 { dst, .. }
         | Instr::Op2 { dst, .. }
@@ -65,7 +65,7 @@ fn writes(i: &Instr, f: &mut impl FnMut(u16)) {
 }
 
 /// Every register an instruction reads.
-fn reads(i: &Instr, f: &mut impl FnMut(u16)) {
+pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(u16)) {
     let mut op = |o: Operand| {
         if let Operand::Reg(r) = o {
             f(r)

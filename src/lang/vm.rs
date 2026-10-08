@@ -183,6 +183,199 @@ fn ratio_tuning(pitch: f32, root: f32, a4: f32, ratios: [f32; 12]) -> f32 {
     a4 * relative(pitch) / relative(69.0)
 }
 
+/// An instruction as the interpreter runs it. Programs are translated into
+/// these when loaded ([`lower`]): the most common operations get their own
+/// variant for each shape of operands (register or constant), so running
+/// one is a single dispatch with no operand checks, and every register has
+/// been checked to exist, so they are read without bounds checks.
+#[derive(Clone, Copy, Debug)]
+enum Fast {
+    AddRR {
+        d: u16,
+        a: u16,
+        b: u16,
+    },
+    AddRC {
+        d: u16,
+        a: u16,
+        c: f32,
+    },
+    SubRR {
+        d: u16,
+        a: u16,
+        b: u16,
+    },
+    SubRC {
+        d: u16,
+        a: u16,
+        c: f32,
+    },
+    SubCR {
+        d: u16,
+        c: f32,
+        b: u16,
+    },
+    MulRR {
+        d: u16,
+        a: u16,
+        b: u16,
+    },
+    MulRC {
+        d: u16,
+        a: u16,
+        c: f32,
+    },
+    DivRR {
+        d: u16,
+        a: u16,
+        b: u16,
+    },
+    DivCR {
+        d: u16,
+        c: f32,
+        b: u16,
+    },
+    LtRC {
+        d: u16,
+        a: u16,
+        c: f32,
+    },
+    GtRC {
+        d: u16,
+        a: u16,
+        c: f32,
+    },
+    Wrap {
+        d: u16,
+        x: u16,
+    },
+    CopyR {
+        d: u16,
+        s: u16,
+    },
+    CopyC {
+        d: u16,
+        c: f32,
+    },
+    Op2RR {
+        op: Op2,
+        d: u16,
+        a: u16,
+        b: u16,
+    },
+    Op2RC {
+        op: Op2,
+        d: u16,
+        a: u16,
+        c: f32,
+    },
+    Op2CR {
+        op: Op2,
+        d: u16,
+        c: f32,
+        b: u16,
+    },
+    Op1 {
+        op: Op1,
+        d: u16,
+        x: u16,
+    },
+    /// Skip ahead unless register `cond` is true.
+    JumpUnless {
+        cond: u16,
+        target: u32,
+    },
+    Jump {
+        target: u32,
+    },
+    /// Anything else: run instruction `index` of the original list.
+    Slow {
+        index: u32,
+    },
+}
+
+/// Translate `instrs` for the interpreter, checking every register is below
+/// `regs` and every jump goes forward within the list.
+fn lower(instrs: &[Instr], regs: usize) -> Vec<Fast> {
+    let reg = |r: u16| {
+        assert!((r as usize) < regs, "register r{r} out of range");
+        r
+    };
+    let check = |i: &Instr| {
+        super::opt::reads(i, &mut |r| {
+            reg(r);
+        });
+        super::opt::writes(i, &mut |r| {
+            reg(r);
+        });
+    };
+    let len = instrs.len();
+    instrs
+        .iter()
+        .enumerate()
+        .map(|(pc, i)| {
+            check(i);
+            use Operand::{Const as C, Reg as R};
+            match *i {
+                Instr::Op2 { op, dst: d, a, b } => match (op, a, b) {
+                    (Op2::Add, R(a), R(b)) => Fast::AddRR { d, a, b },
+                    (Op2::Add, R(a), C(c)) | (Op2::Add, C(c), R(a)) => Fast::AddRC { d, a, c },
+                    (Op2::Sub, R(a), R(b)) => Fast::SubRR { d, a, b },
+                    (Op2::Sub, R(a), C(c)) => Fast::SubRC { d, a, c },
+                    (Op2::Sub, C(c), R(b)) => Fast::SubCR { d, c, b },
+                    (Op2::Mul, R(a), R(b)) => Fast::MulRR { d, a, b },
+                    (Op2::Mul, R(a), C(c)) | (Op2::Mul, C(c), R(a)) => Fast::MulRC { d, a, c },
+                    (Op2::Div, R(a), R(b)) => Fast::DivRR { d, a, b },
+                    (Op2::Div, C(c), R(b)) => Fast::DivCR { d, c, b },
+                    (Op2::Lt, R(a), C(c)) => Fast::LtRC { d, a, c },
+                    (Op2::Gt, R(a), C(c)) => Fast::GtRC { d, a, c },
+                    (op, R(a), R(b)) => Fast::Op2RR { op, d, a, b },
+                    (op, R(a), C(c)) => Fast::Op2RC { op, d, a, c },
+                    (op, C(c), R(b)) => Fast::Op2CR { op, d, c, b },
+                    (op, C(a), C(b)) => Fast::CopyC {
+                        d,
+                        c: op.apply(a, b),
+                    },
+                },
+                Instr::Op1 {
+                    op: Op1::Wrap,
+                    dst: d,
+                    x: R(x),
+                } => Fast::Wrap { d, x },
+                Instr::Op1 {
+                    op,
+                    dst: d,
+                    x: R(x),
+                } => Fast::Op1 { op, d, x },
+                Instr::Copy { dst: d, src: R(s) } => Fast::CopyR { d, s },
+                Instr::Copy { dst: d, src: C(c) } => Fast::CopyC { d, c },
+                Instr::JumpUnless {
+                    cond: R(cond),
+                    target,
+                } => {
+                    assert!(
+                        target as usize > pc && target as usize <= len,
+                        "jump at {pc} to {target} is not forward"
+                    );
+                    Fast::JumpUnless { cond, target }
+                }
+                Instr::JumpUnless {
+                    cond: C(0.0),
+                    target,
+                } => Fast::Jump { target },
+                Instr::Jump { target } => {
+                    assert!(
+                        target as usize > pc && target as usize <= len,
+                        "jump at {pc} to {target} is not forward"
+                    );
+                    Fast::Jump { target }
+                }
+                _ => Fast::Slow { index: pc as u32 },
+            }
+        })
+        .collect()
+}
+
 /// One compiled instance, ready to be turned into a [`Program`] node.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Code {
@@ -480,23 +673,44 @@ struct Run {
 pub struct Program {
     code: Code,
     run: Run,
+    /// [`Code::instrs`], [`Code::post`] and each handler, lowered.
+    tick: Vec<Fast>,
+    post: Vec<Fast>,
+    handlers: Vec<Vec<Fast>>,
+    /// Whether any voice pool has `claim` handlers to keep track of.
+    claims: bool,
 }
 
 impl Program {
     pub fn new(code: Code) -> Program {
-        for list in std::iter::once(&code.instrs)
-            .chain(std::iter::once(&code.post))
-            .chain(code.events.iter().map(|e| &e.instrs))
+        let tick = lower(&code.instrs, code.regs);
+        let post = lower(&code.post, code.regs);
+        let handlers = code
+            .events
+            .iter()
+            .map(|e| lower(&e.instrs, code.regs))
+            .collect();
+        let check = |r: u16| assert!((r as usize) < code.regs, "register r{r} out of range");
+        for &r in code
+            .input_regs
+            .iter()
+            .chain(code.events.iter().flat_map(|e| &e.payload))
         {
-            for (pc, instr) in list.iter().enumerate() {
-                if let Instr::Jump { target } | Instr::JumpUnless { target, .. } = instr {
-                    assert!(
-                        *target as usize > pc && *target as usize <= list.len(),
-                        "jump at {pc} to {target} is not forward"
-                    );
-                }
+            check(r);
+        }
+        for o in code
+            .output
+            .iter()
+            .chain(code.pools.iter().flatten().flatten())
+        {
+            if let Operand::Reg(r) = *o {
+                check(r);
             }
         }
+        let claims = code
+            .events
+            .iter()
+            .any(|e| matches!(e.mode, Mode::Claim { .. }) && e.voice.is_some());
         let captures = |seq: usize| {
             code.calls
                 .iter()
@@ -551,6 +765,10 @@ impl Program {
                 delivery: 0,
             },
             code,
+            tick,
+            post,
+            handlers,
+            claims,
         };
         p.reset();
         p
@@ -618,7 +836,12 @@ impl Program {
                     self.run.regs[reg as usize] = value;
                 }
             }
-            exec(&handler.instrs, &self.code, &mut self.run);
+            exec(
+                &self.handlers[h],
+                &handler.instrs,
+                &self.code,
+                &mut self.run,
+            );
         }
     }
 
@@ -820,89 +1043,143 @@ fn halt(slot: &mut Slot, seq: usize, queue: &mut VecDeque<Pending>) {
     slot.active = false;
 }
 
-/// Run `instrs` to the end.
-fn exec(instrs: &[Instr], code: &Code, run: &mut Run) {
+/// Run `fast` (lowered from `instrs`) to the end.
+fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
     let rate = run.rate;
     let mut pc = 0;
-    while let Some(instr) = instrs.get(pc) {
+    while let Some(&f) = fast.get(pc) {
         pc += 1;
         let regs = &mut run.regs[..];
-        match *instr {
-            Instr::Op2 { op, dst, a, b } => {
-                regs[dst as usize] = op.apply(val(regs, a), val(regs, b));
+        // SAFETY: `lower` checked that every register in `fast` is below
+        // `code.regs`, the length of `regs`.
+        macro_rules! r {
+            ($i:expr) => {
+                *unsafe { regs.get_unchecked($i as usize) }
+            };
+        }
+        macro_rules! set {
+            ($i:expr, $v:expr) => {{
+                let v = $v;
+                *unsafe { regs.get_unchecked_mut($i as usize) } = v;
+            }};
+        }
+        match f {
+            Fast::AddRR { d, a, b } => set!(d, r!(a) + r!(b)),
+            Fast::AddRC { d, a, c } => set!(d, r!(a) + c),
+            Fast::SubRR { d, a, b } => set!(d, r!(a) - r!(b)),
+            Fast::SubRC { d, a, c } => set!(d, r!(a) - c),
+            Fast::SubCR { d, c, b } => set!(d, c - r!(b)),
+            Fast::MulRR { d, a, b } => set!(d, r!(a) * r!(b)),
+            Fast::MulRC { d, a, c } => set!(d, r!(a) * c),
+            Fast::DivRR { d, a, b } => set!(d, r!(a) / r!(b)),
+            Fast::DivCR { d, c, b } => set!(d, c / r!(b)),
+            Fast::LtRC { d, a, c } => set!(d, if r!(a) < c { 1.0 } else { 0.0 }),
+            Fast::GtRC { d, a, c } => set!(d, if r!(a) > c { 1.0 } else { 0.0 }),
+            Fast::Wrap { d, x } => {
+                let x = r!(x);
+                set!(d, x - x.floor())
             }
-            Instr::Op1 { op, dst, x } => {
-                regs[dst as usize] = op.apply(val(regs, x), rate);
-            }
-            Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
-            Instr::Tune {
-                tuning,
-                dst,
-                pitch,
-                setting,
-                a4,
-            } => {
-                regs[dst as usize] =
-                    tuning.frequency(val(regs, pitch), val(regs, setting), val(regs, a4));
-            }
-            Instr::Select { dst, cond, a, b } => {
-                regs[dst as usize] = if val(regs, cond) != 0.0 {
-                    val(regs, a)
-                } else {
-                    val(regs, b)
-                };
-            }
-            Instr::JumpUnless { cond, target } => {
-                if val(regs, cond) == 0.0 {
+            Fast::CopyR { d, s } => set!(d, r!(s)),
+            Fast::CopyC { d, c } => set!(d, c),
+            Fast::Op2RR { op, d, a, b } => set!(d, op.apply(r!(a), r!(b))),
+            Fast::Op2RC { op, d, a, c } => set!(d, op.apply(r!(a), c)),
+            Fast::Op2CR { op, d, c, b } => set!(d, op.apply(c, r!(b))),
+            Fast::Op1 { op, d, x } => set!(d, op.apply(r!(x), rate)),
+            Fast::JumpUnless { cond, target } => {
+                if r!(cond) == 0.0 {
                     pc = target as usize;
                 }
             }
-            Instr::Jump { target } => pc = target as usize,
-            Instr::InvokeSeq { call } => invoke(call, code, run),
-            Instr::InvokeEvent { event, values } => {
-                let kind = code.decls[usize::from(event.0)].kind;
-                let values = values.map(|v| val(regs, v));
-                let payload = Payload::from_values(kind, values);
-                run.queue
-                    .push_back(Pending::To(event, payload, Sender::Host(0)));
-            }
-            Instr::Halt { seq, id } => {
-                let id = id.map(|id| val(regs, id) as i32);
-                let seq = usize::from(seq);
-                for slot in &mut run.slots[seq] {
-                    if slot.active && id.is_none_or(|id| id == slot.id) {
-                        halt(slot, seq, &mut run.queue);
-                    }
-                }
-            }
-            Instr::LoadCapture {
-                dst,
-                seq,
-                slot,
-                index,
-            } => {
-                let slot = &run.slots[usize::from(seq)][usize::from(slot)];
-                regs[dst as usize] = slot
-                    .captures
-                    .get(usize::from(index))
-                    .copied()
-                    .unwrap_or(0.0);
-            }
-            Instr::SetSlot {
-                seq,
-                slot,
-                call,
-                setting,
-                value,
-            } => {
-                let v = val(regs, value);
-                let slot = &mut run.slots[usize::from(seq)][usize::from(slot)];
-                if slot.active && slot.call == call {
-                    slot.values[usize::from(setting)] = v;
+            Fast::Jump { target } => pc = target as usize,
+            Fast::Slow { index } => {
+                if let Some(target) = step(&instrs[index as usize], code, run) {
+                    pc = target;
                 }
             }
         }
     }
+}
+
+/// Run one instruction the general way; a jump's target if it jumps.
+fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
+    let rate = run.rate;
+    let regs = &mut run.regs[..];
+    match *instr {
+        Instr::Op2 { op, dst, a, b } => {
+            regs[dst as usize] = op.apply(val(regs, a), val(regs, b));
+        }
+        Instr::Op1 { op, dst, x } => {
+            regs[dst as usize] = op.apply(val(regs, x), rate);
+        }
+        Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
+        Instr::Tune {
+            tuning,
+            dst,
+            pitch,
+            setting,
+            a4,
+        } => {
+            regs[dst as usize] =
+                tuning.frequency(val(regs, pitch), val(regs, setting), val(regs, a4));
+        }
+        Instr::Select { dst, cond, a, b } => {
+            regs[dst as usize] = if val(regs, cond) != 0.0 {
+                val(regs, a)
+            } else {
+                val(regs, b)
+            };
+        }
+        Instr::JumpUnless { cond, target } => {
+            if val(regs, cond) == 0.0 {
+                return Some(target as usize);
+            }
+        }
+        Instr::Jump { target } => return Some(target as usize),
+        Instr::InvokeSeq { call } => invoke(call, code, run),
+        Instr::InvokeEvent { event, values } => {
+            let kind = code.decls[usize::from(event.0)].kind;
+            let values = values.map(|v| val(regs, v));
+            let payload = Payload::from_values(kind, values);
+            run.queue
+                .push_back(Pending::To(event, payload, Sender::Host(0)));
+        }
+        Instr::Halt { seq, id } => {
+            let id = id.map(|id| val(regs, id) as i32);
+            let seq = usize::from(seq);
+            for slot in &mut run.slots[seq] {
+                if slot.active && id.is_none_or(|id| id == slot.id) {
+                    halt(slot, seq, &mut run.queue);
+                }
+            }
+        }
+        Instr::LoadCapture {
+            dst,
+            seq,
+            slot,
+            index,
+        } => {
+            let slot = &run.slots[usize::from(seq)][usize::from(slot)];
+            regs[dst as usize] = slot
+                .captures
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or(0.0);
+        }
+        Instr::SetSlot {
+            seq,
+            slot,
+            call,
+            setting,
+            value,
+        } => {
+            let v = val(regs, value);
+            let slot = &mut run.slots[usize::from(seq)][usize::from(slot)];
+            if slot.active && slot.call == call {
+                slot.values[usize::from(setting)] = v;
+            }
+        }
+    }
+    None
 }
 
 /// `invoke` or `trigger`: start an instance, or leave a playing one alone.
@@ -1005,18 +1282,27 @@ impl Node for Program {
     fn process(&mut self, ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
         self.run.rate = ctx.sample_rate;
         self.ensure_started();
+        let sequences = !self.code.seqs.is_empty();
         for i in 0..ctx.frames {
-            self.fire_sequences();
+            if sequences {
+                self.fire_sequences();
+            }
             for (k, &r) in self.code.input_regs.iter().enumerate() {
                 self.run.regs[r as usize] = inputs.get(k).at(i);
             }
-            exec(&self.code.instrs, &self.code, &mut self.run);
-            exec(&self.code.post, &self.code, &mut self.run);
+            exec(&self.tick, &self.code.instrs, &self.code, &mut self.run);
+            if !self.post.is_empty() {
+                exec(&self.post, &self.code.post, &self.code, &mut self.run);
+            }
             for (c, &o) in self.code.output.iter().enumerate() {
                 out.set(c, i, val(&self.run.regs, o));
             }
-            self.track_voices();
-            self.advance_sequences();
+            if self.claims {
+                self.track_voices();
+            }
+            if !self.code.seqs.is_empty() {
+                self.advance_sequences();
+            }
             self.run.now += 1;
         }
     }

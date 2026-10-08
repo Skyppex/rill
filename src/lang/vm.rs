@@ -90,6 +90,65 @@ pub enum Instr {
         setting: u8,
         value: Operand,
     },
+    /// Run [`Code::vectors`]`[block]`: the copies of a voice pool, all at
+    /// once.
+    Vector {
+        block: u32,
+    },
+}
+
+/// The copies of a voice pool run together: each instruction does the same
+/// for every copy (a lane). A lane group is `lanes` registers in a row, one
+/// per copy.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VectorBlock {
+    pub lanes: u16,
+    pub instrs: Vec<VInstr>,
+}
+
+/// An operand of a [`VInstr`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VArg {
+    /// A lane group starting at this register: a value per copy.
+    Lanes(u16),
+    /// One register shared by every copy.
+    Scalar(u16),
+    Const(f32),
+}
+
+/// An instruction over every lane of a [`VectorBlock`]. `d` is the first
+/// register of the lane group it writes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VInstr {
+    Op2 {
+        op: Op2,
+        d: u16,
+        a: VArg,
+        b: VArg,
+    },
+    Op1 {
+        op: Op1,
+        d: u16,
+        x: VArg,
+    },
+    Copy {
+        d: u16,
+        s: VArg,
+    },
+    /// `d = if cond { a } else { b }`, per lane.
+    Select {
+        d: u16,
+        cond: VArg,
+        a: VArg,
+        b: VArg,
+    },
+    Tune {
+        tuning: Tuning,
+        d: u16,
+        pitch: VArg,
+        setting: VArg,
+        a4: VArg,
+    },
 }
 
 /// The built-in tunings, as run by [`Instr::Tune`].
@@ -288,6 +347,10 @@ enum Fast {
     Jump {
         target: u32,
     },
+    /// Run a [`VectorBlock`].
+    Vector {
+        block: u32,
+    },
     /// Anything else: run instruction `index` of the original list.
     Slow {
         index: u32,
@@ -370,6 +433,7 @@ fn lower(instrs: &[Instr], regs: usize) -> Vec<Fast> {
                     );
                     Fast::Jump { target }
                 }
+                Instr::Vector { block } => Fast::Vector { block },
                 _ => Fast::Slow { index: pc as u32 },
             }
         })
@@ -398,6 +462,13 @@ pub struct Code {
     pub calls: Vec<InvokeCall>,
     /// Voice pools: per pool, per copy, the operands of the copy's output.
     pub pools: Vec<Vec<Vec<Operand>>>,
+    /// Code that repeats with different values, which can run as lanes
+    /// together: per voice pool, then per `for` loop, the range of
+    /// [`Code::instrs`] each copy (or iteration) fills, when it is in the
+    /// tick's code.
+    pub lane_ranges: Vec<Option<Vec<(u32, u32)>>>,
+    /// Copies of pools that run together, by [`Instr::Vector`].
+    pub vectors: Vec<VectorBlock>,
 }
 
 /// What a handler handles.
@@ -579,6 +650,7 @@ fn list(s: &mut String, instrs: &[Instr]) {
                 "seq {seq} slot {slot} setting {setting} = {} if from call {call}",
                 op(value)
             ),
+            Instr::Vector { block } => format!("vector block {block}"),
         };
         let _ = writeln!(s, "{pc:4}: {line}");
     }
@@ -706,6 +778,9 @@ impl Program {
             if let Operand::Reg(r) = *o {
                 check(r);
             }
+        }
+        for block in &code.vectors {
+            check_vector(block, code.regs);
         }
         let claims = code
             .events
@@ -1091,9 +1166,212 @@ fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
                 }
             }
             Fast::Jump { target } => pc = target as usize,
+            Fast::Vector { block } => run_vector(&code.vectors[block as usize], regs, rate),
             Fast::Slow { index } => {
                 if let Some(target) = step(&instrs[index as usize], code, run) {
                     pc = target;
+                }
+            }
+        }
+    }
+}
+
+/// Check that every register a vector block uses exists.
+fn check_vector(block: &VectorBlock, regs: usize) {
+    let n = usize::from(block.lanes);
+    assert!(n > 0, "a vector block needs lanes");
+    let arg = |a: VArg| match a {
+        VArg::Lanes(b) => assert!(usize::from(b) + n <= regs, "lane group r{b} out of range"),
+        VArg::Scalar(r) => assert!(usize::from(r) < regs, "register r{r} out of range"),
+        VArg::Const(_) => {}
+    };
+    for i in &block.instrs {
+        let d = match *i {
+            VInstr::Op2 { d, a, b, .. } => {
+                arg(a);
+                arg(b);
+                d
+            }
+            VInstr::Op1 { d, x, .. } => {
+                arg(x);
+                d
+            }
+            VInstr::Copy { d, s } => {
+                arg(s);
+                d
+            }
+            VInstr::Select { d, cond, a, b } => {
+                arg(cond);
+                arg(a);
+                arg(b);
+                d
+            }
+            VInstr::Tune {
+                d,
+                pitch,
+                setting,
+                a4,
+                ..
+            } => {
+                arg(pitch);
+                arg(setting);
+                arg(a4);
+                d
+            }
+        };
+        arg(VArg::Lanes(d));
+    }
+}
+
+/// Where a vector operand's values come from, settled before a loop runs.
+#[derive(Clone, Copy)]
+enum Src {
+    /// One value per lane, starting here.
+    Lanes(*const f32),
+    /// The same value in every lane.
+    Splat(f32),
+}
+
+/// Run every instruction of `block` over all of its lanes.
+fn run_vector(block: &VectorBlock, regs: &mut [f32], rate: f32) {
+    let n = usize::from(block.lanes);
+    let p = regs.as_mut_ptr();
+    // SAFETY: `check_vector` made sure every lane group and register is
+    // inside `regs`. Lane groups never partly overlap: a write goes to the
+    // same lane it reads, or to a different group.
+    unsafe {
+        let src = |a: VArg| match a {
+            VArg::Lanes(b) => Src::Lanes(p.add(usize::from(b))),
+            VArg::Scalar(r) => Src::Splat(*p.add(usize::from(r))),
+            VArg::Const(c) => Src::Splat(c),
+        };
+        // Each loop has its operand shapes fixed and a single operation in
+        // its body, so the compiler can turn it into SIMD.
+        macro_rules! unary {
+            ($d:expr, $x:expr, $f:expr) => {{
+                let d = p.add(usize::from($d));
+                let f = $f;
+                match src($x) {
+                    Src::Lanes(x) => {
+                        for k in 0..n {
+                            *d.add(k) = f(*x.add(k));
+                        }
+                    }
+                    Src::Splat(x) => {
+                        let v = f(x);
+                        for k in 0..n {
+                            *d.add(k) = v;
+                        }
+                    }
+                }
+            }};
+        }
+        macro_rules! binary {
+            ($d:expr, $a:expr, $b:expr, $f:expr) => {{
+                let d = p.add(usize::from($d));
+                let f = $f;
+                match (src($a), src($b)) {
+                    (Src::Lanes(a), Src::Lanes(b)) => {
+                        for k in 0..n {
+                            *d.add(k) = f(*a.add(k), *b.add(k));
+                        }
+                    }
+                    (Src::Lanes(a), Src::Splat(y)) => {
+                        for k in 0..n {
+                            *d.add(k) = f(*a.add(k), y);
+                        }
+                    }
+                    (Src::Splat(x), Src::Lanes(b)) => {
+                        for k in 0..n {
+                            *d.add(k) = f(x, *b.add(k));
+                        }
+                    }
+                    (Src::Splat(x), Src::Splat(y)) => {
+                        let v = f(x, y);
+                        for k in 0..n {
+                            *d.add(k) = v;
+                        }
+                    }
+                }
+            }};
+        }
+        let truth = |b: bool| if b { 1.0f32 } else { 0.0 };
+        for i in &block.instrs {
+            match *i {
+                VInstr::Op2 { op, d, a, b } => match op {
+                    Op2::Add => binary!(d, a, b, |x: f32, y: f32| x + y),
+                    Op2::Sub => binary!(d, a, b, |x: f32, y: f32| x - y),
+                    Op2::Mul => binary!(d, a, b, |x: f32, y: f32| x * y),
+                    Op2::Div => binary!(d, a, b, |x: f32, y: f32| x / y),
+                    Op2::Min => binary!(d, a, b, |x: f32, y: f32| x.min(y)),
+                    Op2::Max => binary!(d, a, b, |x: f32, y: f32| x.max(y)),
+                    Op2::Lt => binary!(d, a, b, |x: f32, y: f32| truth(x < y)),
+                    Op2::Le => binary!(d, a, b, |x: f32, y: f32| truth(x <= y)),
+                    Op2::Gt => binary!(d, a, b, |x: f32, y: f32| truth(x > y)),
+                    Op2::Ge => binary!(d, a, b, |x: f32, y: f32| truth(x >= y)),
+                    Op2::Eq => binary!(d, a, b, |x: f32, y: f32| truth(x == y)),
+                    Op2::Ne => binary!(d, a, b, |x: f32, y: f32| truth(x != y)),
+                    Op2::And => binary!(d, a, b, |x: f32, y: f32| truth(x != 0.0 && y != 0.0)),
+                    Op2::Or => binary!(d, a, b, |x: f32, y: f32| truth(x != 0.0 || y != 0.0)),
+                    op => binary!(d, a, b, |x: f32, y: f32| op.apply(x, y)),
+                },
+                VInstr::Op1 { op, d, x } => match op {
+                    Op1::Wrap => unary!(d, x, |v: f32| v - crate::ops::floor(v)),
+                    Op1::Floor => unary!(d, x, crate::ops::floor),
+                    Op1::Neg => unary!(d, x, |v: f32| -v),
+                    Op1::Abs => unary!(d, x, f32::abs),
+                    Op1::Not => unary!(d, x, |v: f32| truth(v == 0.0)),
+                    op => unary!(d, x, |v: f32| op.apply(v, rate)),
+                },
+                VInstr::Copy { d, s } => unary!(d, s, |v: f32| v),
+                VInstr::Select { d, cond, a, b } => {
+                    let dp = p.add(usize::from(d));
+                    match (src(cond), src(a), src(b)) {
+                        (Src::Lanes(c), Src::Lanes(a), Src::Lanes(b)) => {
+                            for k in 0..n {
+                                let (x, y) = (*a.add(k), *b.add(k));
+                                *dp.add(k) = if *c.add(k) != 0.0 { x } else { y };
+                            }
+                        }
+                        (Src::Lanes(c), Src::Splat(x), Src::Lanes(b)) => {
+                            for k in 0..n {
+                                let y = *b.add(k);
+                                *dp.add(k) = if *c.add(k) != 0.0 { x } else { y };
+                            }
+                        }
+                        (Src::Lanes(c), Src::Lanes(a), Src::Splat(y)) => {
+                            for k in 0..n {
+                                let x = *a.add(k);
+                                *dp.add(k) = if *c.add(k) != 0.0 { x } else { y };
+                            }
+                        }
+                        (c, a, b) => {
+                            let at = |s: Src, k: usize| match s {
+                                Src::Lanes(q) => *q.add(k),
+                                Src::Splat(v) => v,
+                            };
+                            for k in 0..n {
+                                *dp.add(k) = if at(c, k) != 0.0 { at(a, k) } else { at(b, k) };
+                            }
+                        }
+                    }
+                }
+                VInstr::Tune {
+                    tuning,
+                    d,
+                    pitch,
+                    setting,
+                    a4,
+                } => {
+                    let dp = p.add(usize::from(d));
+                    let at = |s: Src, k: usize| match s {
+                        Src::Lanes(q) => *q.add(k),
+                        Src::Splat(v) => v,
+                    };
+                    let (pi, se, a) = (src(pitch), src(setting), src(a4));
+                    for k in 0..n {
+                        *dp.add(k) = tuning.frequency(at(pi, k), at(se, k), at(a, k));
+                    }
                 }
             }
         }
@@ -1135,6 +1413,7 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
             }
         }
         Instr::Jump { target } => return Some(target as usize),
+        Instr::Vector { block } => run_vector(&code.vectors[block as usize], regs, rate),
         Instr::InvokeSeq { call } => invoke(call, code, run),
         Instr::InvokeEvent { event, values } => {
             let kind = code.decls[usize::from(event.0)].kind;

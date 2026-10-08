@@ -53,6 +53,23 @@ pub enum Op1 {
     Decay,
 }
 
+/// `x.floor()`, written so it vectorizes on plain x86-64 (which has no SIMD
+/// floor instruction). It gives exactly the same result for every input,
+/// including `-0.0`, infinities and NaN.
+#[inline(always)]
+pub fn floor(x: f32) -> f32 {
+    // Beyond 2^23 every float is a whole number; this also passes on
+    // infinities and NaN.
+    if x.abs().partial_cmp(&8_388_608.0) != Some(std::cmp::Ordering::Less) {
+        return x;
+    }
+    // SAFETY: |x| < 2^23 here, so it fits an `i32`. An unchecked
+    // conversion, unlike `as`, needs no saturation and vectorizes.
+    let t = unsafe { x.to_int_unchecked::<i32>() } as f32;
+    let f = if t > x { t - 1.0 } else { t };
+    f.copysign(x)
+}
+
 fn truth(x: bool) -> f32 {
     if x { 1.0 } else { 0.0 }
 }
@@ -198,5 +215,45 @@ mod tests {
         assert_eq!(Op2::IDiv.apply(-7.0, 2.0), -3.0);
         assert_eq!(Op2::Rem.apply(-7.0, 2.0), -1.0);
         assert_eq!(Op1::Wrap.apply(-0.25, 1.0), 0.75);
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    #[test]
+    fn floor_matches_the_standard_one_bit_for_bit() {
+        let mut xs = vec![
+            0.0f32,
+            -0.0,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            2.5,
+            -2.5,
+            0.999_999_9,
+            -0.999_999_9,
+            8_388_607.5,
+            -8_388_607.5,
+            8_388_608.0,
+            1e20,
+            -1e20,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1e-45,
+            -1e-45,
+        ];
+        // And a sweep across many magnitudes.
+        let mut v = 1e-30f32;
+        while v < 1e30 {
+            xs.extend([v, -v, v * 1.37, -v * 1.37]);
+            v *= 1.7;
+        }
+        for x in xs {
+            assert_eq!(super::floor(x).to_bits(), x.floor().to_bits(), "{x}");
+        }
+        assert!(super::floor(f32::NAN).is_nan());
     }
 }

@@ -112,8 +112,34 @@ rill gain(x: Sample, gain: Gain) Sample {
     return x + gain
 }
 
+rill tremolo(
+    x: Sample,
+    speed: Freq,
+    offset: Float = 0,
+    depth: Float = 0.5,
+) Sample {
+    state phase: Float = 0
+    phase = wrap(phase + speed / RATE)
+    let lfo = sin(wrap(phase + offset) * TAU) * 0.5 + 0.5 // 0 to 1
+    return x * (1 - depth * lfo)
+}
+
 rill main(volume: Gain = -12dB) [Sample; 2] {
+    let chord = [C4, D#4, G4, A#4, D5]
+    let chord2 = [G2, D3, B3, F4, A#4]
+    let freqs = chord2 |> equal
+
     return (
-        (unison<32>(440Hz, 5cents) |> saw |> unison_pan |> sum) / 32 + volume
+        (
+            unison<32>(freqs, 5cents)
+                |> saw
+                |> sum
+                |> unison_pan
+                |> sum
+                |> tremolo(5Hz, depth: 0.4)
+        )
+            / 32
+        + volume
     )
+        |> lowpass(1000Hz)
 }

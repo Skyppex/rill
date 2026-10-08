@@ -31,6 +31,7 @@ pub mod opt;
 pub mod parser;
 pub mod pretty;
 pub mod types;
+pub mod vector;
 pub mod vm;
 
 pub use check::Checked;
@@ -50,8 +51,18 @@ pub fn load(
     config: &crate::Config,
     entry: &str,
 ) -> Result<(crate::Graph, Vec<Diagnostic>), Vec<Diagnostic>> {
+    load_with(src, config, entry, &build::Options::default())
+}
+
+/// [`load`] with build [`Options`](build::Options).
+pub fn load_with(
+    src: &str,
+    config: &crate::Config,
+    entry: &str,
+    options: &build::Options,
+) -> Result<(crate::Graph, Vec<Diagnostic>), Vec<Diagnostic>> {
     let (program, checked) = compile(src)?;
-    let graph = build::build(&program, &checked, config, entry)?;
+    let graph = build::build_with(&program, &checked, config, entry, options)?;
     Ok((graph, checked.warnings))
 }
 

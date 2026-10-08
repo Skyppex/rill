@@ -130,6 +130,9 @@ pub struct Defs<'a> {
     decls: Vec<Declared>,
     /// The program's sequences, filled in by [`seq_tables`].
     pub seqs: Vec<SeqTable>,
+    /// Run the copies of voice pools, loop iterations and frame elements
+    /// together where they line up (see [`super::vector`]).
+    pub vectorize: bool,
 }
 
 impl<'a> Defs<'a> {
@@ -157,6 +160,7 @@ impl<'a> Defs<'a> {
             events,
             decls: checked.events.iter().flatten().cloned().collect(),
             seqs: Vec::new(),
+            vectorize: true,
             map: defs
                 .zip(&checked.signatures)
                 .map(|(d, s)| (d.name.name.as_str(), (d, s)))
@@ -310,8 +314,17 @@ pub fn compile_instance(
         seqs: defs.seqs.clone(),
         calls: c.calls,
         pools: c.pools,
+        lane_ranges: c
+            .lane_ranges
+            .into_iter()
+            .chain(c.loop_ranges.into_iter().map(Some))
+            .collect(),
+        vectors: Vec::new(),
     };
     super::opt::optimize(&mut code);
+    if defs.vectorize {
+        super::vector::vectorize(&mut code);
+    }
     Ok(code)
 }
 
@@ -472,6 +485,17 @@ struct Compiler<'a> {
     /// The result slot of the `if` whose `else if` is being compiled, so
     /// the inner `if` writes its result straight into it.
     slot_hint: Option<CVal>,
+    /// Whether `code` is the tick's code (not a handler's).
+    main: bool,
+    /// Per pool, then per `for` loop: where each copy's code is in the
+    /// tick's code, if it is there. See [`Code::lane_ranges`].
+    lane_ranges: Vec<Option<Vec<(u32, u32)>>>,
+    /// How many pool copies or loop iterations are being compiled, nested.
+    /// Inside one, nothing may depend on the values that differ between
+    /// copies, so they keep the same instructions.
+    in_lanes: u32,
+    /// The loop ranges, kept apart until the pools are known.
+    loop_ranges: Vec<Vec<(u32, u32)>>,
 }
 
 type CResult<T> = Result<T, Diagnostic>;
@@ -511,6 +535,10 @@ impl<'a> Compiler<'a> {
             handler_scope: None,
             cse: HashMap::new(),
             slot_hint: None,
+            main: true,
+            lane_ranges: Vec::new(),
+            in_lanes: 0,
+            loop_ranges: Vec::new(),
         }
     }
 
@@ -560,8 +588,11 @@ impl<'a> Compiler<'a> {
             return Ok(Operand::Const(op.apply(a, b)));
         }
         let (ca, cb) = (const_of(a), const_of(b));
-        // Operations that leave a value as it is.
+        // Operations that leave a value as it is. Not in the copies of a
+        // pool: a constant can differ between copies, and they must keep the
+        // same instructions to run together.
         match (op, ca, cb) {
+            _ if self.in_lanes > 0 => {}
             (Op2::Add, _, Some(0.0)) | (Op2::Sub, _, Some(0.0)) => return Ok(a),
             (Op2::Mul | Op2::Div | Op2::Pow, _, Some(1.0)) => return Ok(a),
             (Op2::Add, Some(0.0), _) | (Op2::Mul, Some(1.0), _) => return Ok(b),
@@ -633,7 +664,7 @@ impl<'a> Compiler<'a> {
     /// with fewer layers applies to every element of the other, so it lines
     /// up with the outer layers.
     fn zip2(&mut self, op: Op2, a: &CVal, b: &CVal) -> CResult<CVal> {
-        match (a, b) {
+        let n = match (a, b) {
             (CVal::Frame(xs), CVal::Frame(ys)) => {
                 if xs.len() != ys.len() {
                     return Err(internal(
@@ -641,28 +672,34 @@ impl<'a> Compiler<'a> {
                         "frames of different sizes reached an operator",
                     ));
                 }
-                let mut out = Vec::with_capacity(xs.len());
-                for (x, y) in xs.iter().zip(ys) {
-                    out.push(self.zip2(op, x, y)?);
-                }
-                Ok(CVal::Frame(out))
+                xs.len()
             }
-            (CVal::Frame(xs), _) => {
-                let mut out = Vec::with_capacity(xs.len());
-                for x in xs {
-                    out.push(self.zip2(op, x, b)?);
-                }
-                Ok(CVal::Frame(out))
-            }
-            (_, CVal::Frame(ys)) => {
-                let mut out = Vec::with_capacity(ys.len());
-                for y in ys {
-                    out.push(self.zip2(op, a, y)?);
-                }
-                Ok(CVal::Frame(out))
-            }
-            _ => Ok(CVal::Scalar(self.op2(op, a.scalar(), b.scalar())?)),
+            (CVal::Frame(xs), _) => xs.len(),
+            (_, CVal::Frame(ys)) => ys.len(),
+            _ => return Ok(CVal::Scalar(self.op2(op, a.scalar(), b.scalar())?)),
+        };
+        let element = |v: &CVal, k: usize| match v {
+            CVal::Frame(xs) => xs[k].clone(),
+            v => v.clone(),
+        };
+        // The elements do the same thing to different values, so they can
+        // run as lanes.
+        let mut out = Vec::with_capacity(n);
+        let mut ranges = Vec::with_capacity(n);
+        for k in 0..n {
+            self.cse.clear();
+            self.in_lanes += 1;
+            let start = self.code.len() as u32;
+            let v = self.zip2(op, &element(a, k), &element(b, k));
+            self.in_lanes -= 1;
+            self.cse.clear();
+            out.push(v?);
+            ranges.push((start, self.code.len() as u32));
         }
+        if self.main && n >= 2 {
+            self.loop_ranges.push(ranges);
+        }
+        Ok(CVal::Frame(out))
     }
 
     fn map1(&mut self, op: Op1, x: &CVal) -> CResult<CVal> {
@@ -1050,15 +1087,27 @@ impl<'a> Compiler<'a> {
             } => {
                 let values = self.loop_values(iter)?;
                 let mut returned = false;
+                let mut ranges = Vec::with_capacity(values.len());
                 for value in values {
                     self.scopes.push(HashMap::new());
                     self.bind(&name.name, value, false);
-                    let (_, diverged) = self.branch(|s| s.block(body))?;
+                    // Iterations, like pool copies, can run as lanes.
+                    self.cse.clear();
+                    self.in_lanes += 1;
+                    let start = self.code.len() as u32;
+                    let block = self.branch(|s| s.block(body));
+                    self.in_lanes -= 1;
+                    self.cse.clear();
+                    let (_, diverged) = block?;
+                    ranges.push((start, self.code.len() as u32));
                     self.scopes.pop();
                     if diverged {
                         returned = true;
                         break;
                     }
+                }
+                if self.main && !returned && ranges.len() >= 2 {
+                    self.loop_ranges.push(ranges);
                 }
                 Ok((None, returned))
             }
@@ -1242,6 +1291,7 @@ impl<'a> Compiler<'a> {
         body: &Block,
     ) -> CResult<()> {
         let saved_code = std::mem::take(&mut self.code);
+        let saved_main = std::mem::replace(&mut self.main, false);
         self.cse.clear();
         let saved_scopes = self.scopes.clone();
         self.scopes.push(HashMap::new());
@@ -1290,6 +1340,7 @@ impl<'a> Compiler<'a> {
         }
         let instrs = std::mem::take(&mut self.code);
         self.cse.clear();
+        self.main = saved_main;
         self.scopes = saved_scopes;
         self.code = saved_code;
         self.handler_scope = saved_handler;
@@ -1305,19 +1356,46 @@ impl<'a> Compiler<'a> {
 
     /// `[x; n]`: `x` compiled `n` times, each copy a voice of a new pool.
     fn repeat(&mut self, x: &Expr, n: u32) -> CResult<CVal> {
-        let pool = self.pools.len() as u16;
-        self.pools.push(Vec::new());
+        let pool = self.start_pool();
         let saved = self.voice;
         let mut out = Vec::with_capacity(n as usize);
         for copy in 0..n {
-            self.voice = Some((pool, copy as u16));
+            let start = self.start_copy(pool, copy as u16);
             let v = self.expr(x);
             self.voice = saved;
             let v = v?;
-            self.pools[usize::from(pool)].push(v.operands());
+            self.end_copy(pool, start, &v);
             out.push(v);
         }
         Ok(CVal::Frame(out))
+    }
+
+    /// A new voice pool, whose copies come next.
+    fn start_pool(&mut self) -> u16 {
+        let pool = self.pools.len() as u16;
+        self.pools.push(Vec::new());
+        self.lane_ranges.push(self.main.then(Vec::new));
+        pool
+    }
+
+    /// Start compiling `copy` of `pool`; returns where its code starts.
+    fn start_copy(&mut self, pool: u16, copy: u16) -> u32 {
+        self.voice = Some((pool, copy));
+        // Each copy computes everything itself, so copies keep the same
+        // instructions.
+        self.cse.clear();
+        self.in_lanes += 1;
+        self.code.len() as u32
+    }
+
+    fn end_copy(&mut self, pool: u16, start: u32, v: &CVal) {
+        self.cse.clear();
+        self.in_lanes -= 1;
+        let end = self.code.len() as u32;
+        if let Some(ranges) = &mut self.lane_ranges[usize::from(pool)] {
+            ranges.push((start, end));
+        }
+        self.pools[usize::from(pool)].push(v.operands());
     }
 
     /// `invoke`, `trigger` or `halt` of a sequence, or `invoke` of an event.
@@ -1897,8 +1975,7 @@ impl<'a> Compiler<'a> {
         let inner: Vec<usize> = extra.iter().map(|&e| e.saturating_sub(1)).collect();
         let mut out = Vec::with_capacity(n);
         // The copies form a voice pool.
-        let pool = self.pools.len() as u16;
-        self.pools.push(Vec::new());
+        let pool = self.start_pool();
         let saved = self.voice;
         for c in 0..n {
             let per_element: Vec<CVal> = extra
@@ -1909,11 +1986,11 @@ impl<'a> Compiler<'a> {
                     _ => a.clone(),
                 })
                 .collect();
-            self.voice = Some((pool, c as u16));
+            let start = self.start_copy(pool, c as u16);
             let v = self.lift(&inner, &per_element, f);
             self.voice = saved;
             let v = v?;
-            self.pools[usize::from(pool)].push(v.operands());
+            self.end_copy(pool, start, &v);
             out.push(v);
         }
         Ok(CVal::Frame(out))

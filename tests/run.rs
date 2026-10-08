@@ -1472,3 +1472,197 @@ fn sequences_play_chords_over_voices() {
     ";
     assert_eq!(render_with(src, 3, 1, Blocks::Fixed(1)), [1.0, 5.0, 8.0]);
 }
+
+// ---- running repeated code together --------------------------------------
+
+/// Render `src` with and without running repeated code as lanes, sending
+/// `events` at the given frames, and check the two agree bit for bit.
+/// Returns how many instructions per sample each build has.
+fn same_either_way(
+    src: &str,
+    channels: usize,
+    frames: usize,
+    events: &[(usize, Event)],
+) -> (usize, usize) {
+    let run = |vectorize: bool| {
+        let options = lang::build::Options { vectorize };
+        let (graph, _) = lang::load_with(src, &config(channels), "main", &options)
+            .unwrap_or_else(|d| panic!("{d:#?}"));
+        let mut engine = Engine::new(graph, config(channels)).unwrap();
+        let size = engine.program_size().0;
+        let mut out = vec![0.0f32; frames * channels];
+        let mut done = 0;
+        for &(at, event) in events
+            .iter()
+            .chain(std::iter::once(&(frames, note_on(0, 0, 0.0))))
+        {
+            engine.render_interleaved(&mut out[done * channels..at * channels]);
+            if at < frames {
+                engine.send(&event);
+            }
+            done = at;
+        }
+        (out, size)
+    };
+    let (vector, vector_size) = run(true);
+    let (scalar, scalar_size) = run(false);
+    for (i, (v, s)) in vector.iter().zip(&scalar).enumerate() {
+        assert_eq!(
+            v.to_bits(),
+            s.to_bits(),
+            "sample {i}: {v} (lanes) vs {s} (scalar)"
+        );
+    }
+    (vector_size, scalar_size)
+}
+
+#[test]
+fn running_together_changes_nothing_in_the_examples() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "rill") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap();
+        // Examples being worked on may not build; they have their own test.
+        if lang::load(&src, &config(2), "main").is_err() {
+            continue;
+        }
+        same_either_way(&src, 2, 20_000, &[]);
+    }
+}
+
+#[test]
+fn running_together_with_branches_state_and_loops() {
+    let src = "
+        fn blep(t: Float, dt: Float) Float {
+            if t < dt {
+                let x = t / dt
+                x + x - x * x - 1
+            } else if t > 1 - dt {
+                let x = (t - 1) / dt
+                x * x + x + x + 1
+            } else {
+                0
+            }
+        }
+        rill saw(freq: Freq, offset: Float = 0) Sample {
+            state phase: Float = 0
+            phase = wrap(phase + freq / RATE)
+            let p = wrap(phase + offset)
+            return p * 2 - 1 - blep(p, freq / RATE)
+        }
+        // State changed only on some ticks, differently per copy.
+        rill gate(x: Sample, every: Int) Sample {
+            state n: Int = 0
+            state held: Sample = 0
+            n = n + 1
+            if n % every == 0 {
+                held = x
+            }
+            return held
+        }
+        rill main() [Sample; 2] {
+            let freqs = [C4, E4, G4, B4] |> equal
+            let voices: [Sample; 8]
+            for i in 0..8 {
+                voices[i] = saw(freqs[i % 4] * (1 + i as Float * 0.001), i as Float * 0.1)
+            }
+            let gated = gate(voices, [1, 2, 3, 4, 5, 6, 7, 8])
+            let scaled = gated * [1, 0.5, 0.25, 1, 2, 1, 0.75, 1]
+            return [sum(scaled), sum(voices)] * 0.1
+        }
+    ";
+    let (lanes, scalar) = same_either_way(src, 2, 30_000, &[]);
+    assert!(
+        lanes < scalar / 2,
+        "{lanes} vs {scalar}: the copies did not run together"
+    );
+}
+
+#[test]
+fn running_together_with_voices_and_events() {
+    let src = "
+        event keys_on note_on(sender: 1)
+        event keys_off note_off(sender: 1)
+        event knob control_change(sender: 1, channel: 7)
+        rill voice() Sample {
+            state phase: Float = 0
+            state pitch: Pitch = C4
+            state level: Float = 0
+            state gate: Float = 0
+            state bright: Float = 0.5
+            on keys_on(note) claim(tail: 2ms) { pitch = note.pitch; level = note.velocity; gate = 1 }
+            on keys_off release { gate = 0 }
+            on knob(v) { bright = v }
+            phase = wrap(phase + (pitch |> equal) / RATE)
+            level = if gate > 0 { level } else { level * 0.99 }
+            return (phase * 2 - 1) * level * bright
+        }
+        rill main() Sample {
+            return sum([voice(); 6])
+        }
+    ";
+    let key = |on: bool, pitch: f32| Event {
+        sender: 1,
+        channel: 0,
+        payload: if on {
+            Payload::NoteOn {
+                pitch,
+                velocity: 0.8,
+                instance: 0,
+            }
+        } else {
+            Payload::NoteOff {
+                pitch,
+                release: 0.0,
+                instance: 0,
+            }
+        },
+    };
+    let knob = Event {
+        sender: 1,
+        channel: 7,
+        payload: Payload::Control(0.9),
+    };
+    let events = [
+        (10, key(true, 60.0)),
+        (500, key(true, 64.0)),
+        (900, key(true, 67.0)),
+        (2_000, key(false, 64.0)),
+        (2_500, knob),
+        (3_000, key(true, 71.0)),
+        (6_000, key(false, 60.0)),
+        (6_100, key(false, 67.0)),
+        (9_000, key(true, 72.0)),
+    ];
+    let (lanes, scalar) = same_either_way(src, 1, 12_000, &events);
+    assert!(
+        lanes < scalar,
+        "{lanes} vs {scalar}: the voices did not run together"
+    );
+}
+
+#[test]
+fn running_together_with_sequences() {
+    let src = "
+        seq riff(step: 1/16, tempo: 140bpm, gate: 0.7) { C4, E4@0.5, [G4, B4], _, C5, A4@1 }
+        event on_ note_on(sender: riff)
+        event off_ note_off(sender: riff)
+        rill voice() Sample {
+            state phase: Float = 0
+            state pitch: Pitch = C4
+            state level: Float = 0
+            on on_(note) claim { pitch = note.pitch; level = note.velocity }
+            on off_ release { level = 0 }
+            phase = wrap(phase + (pitch |> equal) / RATE)
+            return sin(phase * TAU) * level
+        }
+        rill main() Sample {
+            on start { invoke riff(loop: true) }
+            return sum([voice(); 4]) * 0.25
+        }
+    ";
+    same_either_way(src, 1, 48_000, &[]);
+}

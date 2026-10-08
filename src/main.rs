@@ -45,6 +45,14 @@ impl SourceArgs {
     /// Build the graph for an engine with `config`, printing any
     /// diagnostics.
     fn graph(&self, config: &Config) -> Result<Graph, String> {
+        self.graph_with(config, &rill::lang::build::Options::default())
+    }
+
+    fn graph_with(
+        &self,
+        config: &Config,
+        options: &rill::lang::build::Options,
+    ) -> Result<Graph, String> {
         let Some(path) = &self.source else {
             let patch = self.patch.as_deref().expect("required by clap");
             return Ok(patches::by_name(patch, self.freq, self.gain).expect("validated by clap"));
@@ -52,7 +60,7 @@ impl SourceArgs {
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let name = path.display().to_string();
-        match rill::lang::load(&src, config, &self.entry) {
+        match rill::lang::load_with(&src, config, &self.entry, options) {
             Ok((graph, warnings)) => {
                 for w in &warnings {
                     eprint!("{}", w.render(&name, &src));
@@ -321,6 +329,10 @@ enum Command {
         /// Frames per simulated callback.
         #[arg(long, default_value_t = 256)]
         block: usize,
+        /// Run every copy of repeated code on its own instead of together,
+        /// to compare.
+        #[arg(long)]
+        scalar: bool,
     },
     /// Render a Rill file (or a built-in patch) to a WAV file through a
     /// simulated audio callback.
@@ -454,7 +466,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             rate,
             channels,
             block,
-        } => profile(&source, seconds, rate, channels, block)?,
+            scalar,
+        } => profile(&source, seconds, rate, channels, block, scalar)?,
         Command::Render {
             source,
             out,
@@ -599,6 +612,7 @@ fn profile(
     rate: u32,
     channels: u16,
     block: usize,
+    scalar: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{Duration, Instant};
     if block == 0 {
@@ -613,7 +627,8 @@ fn profile(
         out_channels: usize::from(channels),
     };
     let built = Instant::now();
-    let mut engine = Engine::new(source.graph(&config)?, config)?;
+    let options = rill::lang::build::Options { vectorize: !scalar };
+    let mut engine = Engine::new(source.graph_with(&config, &options)?, config)?;
     let build_time = built.elapsed();
 
     let frames = (seconds * rate as f32).round() as usize;
@@ -650,7 +665,8 @@ fn profile(
         "release"
     };
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-    println!("{} ({build} build)", source.name());
+    let how = if scalar { ", scalar" } else { "" };
+    println!("{} ({build} build{how})", source.name());
     println!(
         "  program:  {instructions} instructions per sample, {registers} registers, {} node(s); built in {:.1} ms",
         engine.node_count(),

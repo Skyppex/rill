@@ -60,7 +60,8 @@ pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(u16)) {
         | Instr::InvokeSeq { .. }
         | Instr::InvokeEvent { .. }
         | Instr::Halt { .. }
-        | Instr::SetSlot { .. } => {}
+        | Instr::SetSlot { .. }
+        | Instr::Vector { .. } => {}
     }
 }
 
@@ -94,18 +95,21 @@ pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(u16)) {
         Instr::InvokeEvent { values, .. } => values.into_iter().for_each(op),
         Instr::Halt { id, .. } => id.into_iter().for_each(op),
         Instr::SetSlot { value, .. } => op(value),
-        Instr::Jump { .. } | Instr::InvokeSeq { .. } | Instr::LoadCapture { .. } => {}
+        Instr::Jump { .. }
+        | Instr::InvokeSeq { .. }
+        | Instr::LoadCapture { .. }
+        | Instr::Vector { .. } => {}
     }
 }
 
 /// How each register is used across the whole program.
-struct Usage {
-    defs: Vec<u32>,
-    uses: Vec<u32>,
+pub(crate) struct Usage {
+    pub defs: Vec<u32>,
+    pub uses: Vec<u32>,
     /// Registers that something outside the instruction lists refers to:
     /// state, inputs, payloads, outputs, sequence calls. They keep their
     /// identity.
-    pinned: Vec<bool>,
+    pub pinned: Vec<bool>,
 }
 
 fn lists(code: &Code) -> impl Iterator<Item = &Vec<Instr>> {
@@ -114,7 +118,7 @@ fn lists(code: &Code) -> impl Iterator<Item = &Vec<Instr>> {
         .chain(code.events.iter().map(|e| &e.instrs))
 }
 
-fn usage(code: &Code) -> Usage {
+pub(crate) fn usage(code: &Code) -> Usage {
     let n = code.regs;
     let mut u = Usage {
         defs: vec![0; n],
@@ -197,10 +201,11 @@ fn jump_targets(list: &[Instr]) -> Vec<bool> {
 fn coalesce(code: &mut Code) -> bool {
     let u = usage(code);
     let mut changed = false;
+    let ranges = &mut code.lane_ranges;
     let lists = std::iter::once(&mut code.instrs)
         .chain(std::iter::once(&mut code.post))
         .chain(code.events.iter_mut().map(|e| &mut e.instrs));
-    for list in lists {
+    for (index, list) in lists.enumerate() {
         let targets = jump_targets(list);
         let mut remove = vec![false; list.len()];
         for c in 0..list.len() {
@@ -248,7 +253,10 @@ fn coalesce(code: &mut Code) -> bool {
             changed = true;
         }
         if remove.iter().any(|&r| r) {
-            retain(list, &remove);
+            let moved = retain(list, &remove);
+            if index == 0 {
+                remap_ranges(ranges, &moved);
+            }
         }
     }
     changed
@@ -258,10 +266,11 @@ fn coalesce(code: &mut Code) -> bool {
 fn remove_dead(code: &mut Code) -> bool {
     let u = usage(code);
     let mut changed = false;
+    let ranges = &mut code.lane_ranges;
     let lists = std::iter::once(&mut code.instrs)
         .chain(std::iter::once(&mut code.post))
         .chain(code.events.iter_mut().map(|e| &mut e.instrs));
-    for list in lists {
+    for (index, list) in lists.enumerate() {
         let remove: Vec<bool> = list
             .iter()
             .map(|i| match (i, pure_dst(i)) {
@@ -278,7 +287,10 @@ fn remove_dead(code: &mut Code) -> bool {
             })
             .collect();
         if remove.iter().any(|&r| r) {
-            retain(list, &remove);
+            let moved = retain(list, &remove);
+            if index == 0 {
+                remap_ranges(ranges, &moved);
+            }
             changed = true;
         }
     }
@@ -287,7 +299,7 @@ fn remove_dead(code: &mut Code) -> bool {
 
 /// Drop the instructions marked in `remove`, moving jumps to the
 /// instruction that now follows their old target.
-fn retain(list: &mut Vec<Instr>, remove: &[bool]) {
+fn retain(list: &mut Vec<Instr>, remove: &[bool]) -> Vec<u32> {
     // The new position of each old position (and of the end).
     let mut new_pos = Vec::with_capacity(list.len() + 1);
     let mut kept = 0u32;
@@ -308,6 +320,16 @@ fn retain(list: &mut Vec<Instr>, remove: &[bool]) {
         out.push(instr);
     }
     *list = out;
+    new_pos
+}
+
+/// Move the copy ranges of pools along after instructions of the tick were
+/// removed.
+fn remap_ranges(ranges: &mut [Option<Vec<(u32, u32)>>], new_pos: &[u32]) {
+    for (s, e) in ranges.iter_mut().flatten().flatten() {
+        *s = new_pos[*s as usize];
+        *e = new_pos[*e as usize];
+    }
 }
 
 #[cfg(test)]

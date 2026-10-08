@@ -18,6 +18,20 @@ use crate::graph::{Graph, Input};
 /// The entry rill used when none is named.
 pub const DEFAULT_ENTRY: &str = "main";
 
+/// How to build a program.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Run repeated code (voices, loop iterations, frame elements) as lanes
+    /// together. The result is the same either way; off is for comparing.
+    pub vectorize: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { vectorize: true }
+    }
+}
+
 /// Build the graph that runs `entry` on an engine with `config`.
 pub fn build(
     program: &Program,
@@ -25,8 +39,20 @@ pub fn build(
     config: &Config,
     entry: &str,
 ) -> Result<Graph, Vec<Diagnostic>> {
+    build_with(program, checked, config, entry, &Options::default())
+}
+
+/// [`build`] with [`Options`].
+pub fn build_with(
+    program: &Program,
+    checked: &Checked,
+    config: &Config,
+    entry: &str,
+    options: &Options,
+) -> Result<Graph, Vec<Diagnostic>> {
     check_entry(program, checked, entry)?;
     let mut defs = Defs::new(program, checked);
+    defs.vectorize = options.vectorize;
     defs.seqs = seq_tables(&defs, &checked.types, config.sample_rate as f32, program)
         .map_err(|d| vec![d])?;
     let (def, sig) = defs.get(entry).expect("checked by check_entry");

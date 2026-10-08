@@ -1021,6 +1021,13 @@ impl Node for Program {
         }
     }
 
+    fn program_size(&self) -> Option<(usize, usize)> {
+        Some((
+            self.code.instrs.len() + self.code.post.len(),
+            self.code.regs,
+        ))
+    }
+
     fn reset(&mut self) {
         let run = &mut self.run;
         run.regs.fill(0.0);

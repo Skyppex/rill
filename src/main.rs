@@ -304,6 +304,24 @@ enum Command {
     Devices,
     /// Parse and type-check a Rill source file.
     Check(CheckArgs),
+    /// Measure how fast a program runs: render it as fast as possible,
+    /// with no audio device, and report the load it would put on the audio
+    /// thread. Works the same in debug and release builds, though debug
+    /// builds run much slower.
+    Profile {
+        #[command(flatten)]
+        source: SourceArgs,
+        /// Seconds of audio to render.
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f32,
+        #[arg(long, default_value_t = 48_000)]
+        rate: u32,
+        #[arg(long, default_value_t = 2)]
+        channels: u16,
+        /// Frames per simulated callback.
+        #[arg(long, default_value_t = 256)]
+        block: usize,
+    },
     /// Render a Rill file (or a built-in patch) to a WAV file through a
     /// simulated audio callback.
     Render {
@@ -430,6 +448,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
+        Command::Profile {
+            source,
+            seconds,
+            rate,
+            channels,
+            block,
+        } => profile(&source, seconds, rate, channels, block)?,
         Command::Render {
             source,
             out,
@@ -565,6 +590,89 @@ fn render_with_events(
         done = block_end;
     }
     Ok(out)
+}
+
+/// `rill profile`: render as fast as possible and report the load.
+fn profile(
+    source: &SourceArgs,
+    seconds: f32,
+    rate: u32,
+    channels: u16,
+    block: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::{Duration, Instant};
+    if block == 0 {
+        return Err("--block must be > 0".into());
+    }
+    if !(seconds.is_finite() && seconds > 0.0) {
+        return Err("--seconds must be a positive number".into());
+    }
+    let config = Config {
+        sample_rate: rate,
+        max_frames: block,
+        out_channels: usize::from(channels),
+    };
+    let built = Instant::now();
+    let mut engine = Engine::new(source.graph(&config)?, config)?;
+    let build_time = built.elapsed();
+
+    let frames = (seconds * rate as f32).round() as usize;
+    let mut out = vec![0.0f32; block * usize::from(channels)];
+    // Warm up caches and branch predictors, then start from the beginning.
+    for _ in 0..(rate as usize / 10).div_ceil(block) {
+        engine.render_interleaved(&mut out);
+    }
+    engine.reset();
+
+    let mut worst = Duration::ZERO;
+    let mut late = 0usize;
+    let budget = Duration::from_secs_f64(block as f64 / f64::from(rate));
+    let started = Instant::now();
+    let mut done = 0;
+    while done < frames {
+        let n = block.min(frames - done);
+        let t = Instant::now();
+        engine.render_interleaved(&mut out[..n * usize::from(channels)]);
+        let took = t.elapsed();
+        worst = worst.max(took);
+        late += usize::from(took > budget);
+        done += n;
+    }
+    let total = started.elapsed();
+    std::hint::black_box(&out);
+
+    let audio = frames as f64 / f64::from(rate);
+    let load = total.as_secs_f64() / audio;
+    let (instructions, registers) = engine.program_size();
+    let build = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    println!("{} ({build} build)", source.name());
+    println!(
+        "  program:  {instructions} instructions per sample, {registers} registers, {} node(s); built in {:.1} ms",
+        engine.node_count(),
+        ms(build_time)
+    );
+    println!(
+        "  rendered: {audio:.2} s of audio in {:.3} s, {:.0} ns per sample",
+        total.as_secs_f64(),
+        total.as_secs_f64() * 1e9 / frames as f64
+    );
+    println!(
+        "  load:     {:.1}% of one core ({:.1}x faster than real time)",
+        load * 100.0,
+        1.0 / load
+    );
+    println!(
+        "  blocks:   worst {:.3} ms of a {:.3} ms budget ({block} frames); {late} of {} over budget",
+        ms(worst),
+        ms(budget),
+        frames.div_ceil(block)
+    );
+    Ok(())
 }
 
 /// Parse and check `file`, with `entry` as the rill it starts at, printing

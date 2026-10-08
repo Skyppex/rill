@@ -296,6 +296,14 @@ impl Engine {
         self.nodes[*node].set_control_value(value, self.config.sample_rate as f32)
     }
 
+    /// Instructions per tick and registers, summed over compiled programs.
+    pub fn program_size(&self) -> (usize, usize) {
+        self.nodes
+            .iter()
+            .filter_map(|n| n.program_size())
+            .fold((0, 0), |(i, r), (ni, nr)| (i + ni, r + nr))
+    }
+
     /// The program's declared events, indexed by [`EventId`].
     pub fn events(&self) -> &[EventDecl] {
         &self.events

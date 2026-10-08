@@ -132,6 +132,12 @@ pub trait Node: Send {
     /// Return to the state the node had when it was built.
     fn reset(&mut self) {}
 
+    /// For compiled programs: instructions run per tick and registers used,
+    /// for profiling.
+    fn program_size(&self) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Update a live control value. Nodes that are not controls ignore it.
     fn set_control_value(&mut self, _value: f32, _sample_rate: f32) -> bool {
         false

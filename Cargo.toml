@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["device"]
+default = ["device", "pulseaudio"]
 # Real-time output through the system audio device (cpal). Without it the
 # crate still builds the engine and the offline WAV renderer.
 device = ["dep:cpal", "dep:anyhow"]

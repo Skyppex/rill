@@ -2,10 +2,12 @@
 // runs once per note. A stereo voice turns three notes into three stereo
 // frames, and `sum` mixes them down to one.
 
-rill sine(freq: Freq) Sample {
+// `offset` starts the wave part of a cycle later (0 to 1), so copies at the
+// same frequency need not move in step.
+rill sine(freq: Freq, offset: Float = 0) Sample {
     state phase: Float = 0
     phase = wrap(phase + freq / RATE)
-    return sin(phase * TAU)
+    return sin(wrap(phase + offset) * TAU)
 }
 
 // The correction a jump at phase 0 needs, to remove most of its aliasing
@@ -22,10 +24,10 @@ fn blep(t: Float, dt: Float) Float {
     }
 }
 
-rill saw(freq: Freq, phase_offset: Float = 0) Sample {
+rill saw(freq: Freq, offset: Float = 0) Sample {
     state phase: Float = 0
     phase = wrap(phase + freq / RATE)
-    let p = wrap(phase + phase_offset)
+    let p = wrap(phase + offset)
     // One jump per cycle: down from 1 to -1 where `p` wraps.
     return p * 2 - 1 - blep(p, freq / RATE)
 }
@@ -36,13 +38,14 @@ rill saw_no_blep(freq: Freq, phase_offset: Float = 0) Sample {
     return wrap(phase + phase_offset) * 2 - 1
 }
 
-rill square(freq: Freq) Sample {
+rill square(freq: Freq, offset: Float = 0) Sample {
     state phase: Float = 0
     phase = wrap(phase + freq / RATE)
+    let p = wrap(phase + offset)
     let dt = freq / RATE
-    let naive = if phase < 0.5 { 1.0 } else { -1.0 }
+    let naive = if p < 0.5 { 1.0 } else { -1.0 }
     // Two jumps per cycle: up at phase 0, down at phase 0.5.
-    return naive + blep(phase, dt) - blep(wrap(phase + 0.5), dt)
+    return naive + blep(p, dt) - blep(wrap(p + 0.5), dt)
 }
 
 rill bright(freq: Freq, phase_offset: Float = 0) Sample {
@@ -125,20 +128,20 @@ rill tremolo(
 }
 
 rill main(volume: Gain = -12dB) [Sample; 2] {
-    let chord = [C4, D#4, G4, A#4, D5]
+    let chord1 = [C4, D#4, G4, A#4, D5]
     let chord2 = [G2, D3, B3, F4, A#4]
-    let freqs = chord2 |> equal
+    let freqs = chord1 |> equal
 
     return (
         (
-            unison<32>(freqs, 5cents)
+            unison<64>(freqs, 10cents)
                 |> saw
                 |> sum
                 |> unison_pan
                 |> sum
                 |> tremolo(5Hz, depth: 0.4)
         )
-            / 32
+            / 64
         + volume
     )
         |> lowpass(1000Hz)

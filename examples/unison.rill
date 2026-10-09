@@ -127,7 +127,7 @@ rill tremolo(
     return x * (1 - depth * lfo)
 }
 
-rill main(volume: Gain = -12dB) [Sample; 2] {
+rill main(volume: Gain = 0dB) [Sample; 2] {
     let chord1 = [C4, D#4, G4, A#4, D5]
     let chord2 = [G2, D3, B3, F4, A#4]
     let freqs = chord1 |> equal
@@ -135,7 +135,7 @@ rill main(volume: Gain = -12dB) [Sample; 2] {
     return (
         (
             unison<64>(freqs, 10cents)
-                |> saw
+                |> saw(offset: each random())
                 |> sum
                 |> unison_pan
                 |> sum

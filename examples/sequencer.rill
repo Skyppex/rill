@@ -6,9 +6,7 @@ seq riff(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.6, velocity: 0.7) {
 }
 
 // A slower bass line in 3/4, a step per beat.
-seq bass(meter: 3/4, step: 1/4, tempo: 90bpm, gate: 0.9) {
-    C2, G2@0.5, G2@0.5,
-}
+seq bass(meter: 3/4, step: 1/4, tempo: 90bpm, gate: 0.9) { C2, G2@0.5, G2@0.5 }
 
 // A sequence is a sender: these hear only its notes.
 event lead_on note_on(sender: riff)
@@ -30,8 +28,17 @@ rill lead() Sample {
     state pitch: Pitch = C4
     state level: Float = 0
     state gate: Float = 0
-    on lead_on(note) claim { pitch = note.pitch; level = note.velocity; gate = 1 }
-    on lead_off release { gate = 0 }
+
+    on lead_on(note) claim {
+        pitch = note.pitch
+        level = note.velocity
+        gate = 1
+    }
+
+    on lead_off release {
+        gate = 0
+    }
+
     level = if gate > 0 { level } else { level * 0.9995 }
     return (pitch |> equal |> sine) * level
 }
@@ -39,8 +46,16 @@ rill lead() Sample {
 rill low() Sample {
     state pitch: Pitch = C2
     state level: Float = 0
-    on low_on(note) { pitch = note.pitch; level = note.velocity }
-    on low_off { level = 0 }
+
+    on low_on(note) {
+        pitch = note.pitch
+        level = note.velocity
+    }
+
+    on low_off {
+        level = 0
+    }
+
     return (pitch |> equal |> sine) * level
 }
 
@@ -51,6 +66,7 @@ rill main(speed: Freq = 120bpm, volume: Gain = -12dB) [Sample; 2] {
         current = invoke riff(tempo: speed, loop: true)
         invoke bass(loop: true)
     }
+
     on pad {
         trigger 5 current riff
     }

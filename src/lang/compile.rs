@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::ast::*;
-use super::check::{Checked, operand_alignment};
+use super::check::{Checked, Resolution, operand_alignment};
 use super::diag::{Diagnostic, Span};
 use super::types::{Align, Signature, Size, Type, align, frame_shape};
 use super::vm::{
@@ -34,7 +34,9 @@ pub enum CVal {
 /// A function value, known at build time.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FnVal {
-    /// A user fn or built-in, by name.
+    /// A user fn, by index into the program's items.
+    Def(usize),
+    /// A built-in, by name.
     Named(String),
     /// An anonymous fn (by expression id) and the scopes it captured.
     Lambda {
@@ -123,10 +125,15 @@ fn type_depth(t: &Type) -> usize {
 
 /// Every fn and rill by name, and every anonymous fn by expression id.
 pub struct Defs<'a> {
-    map: HashMap<&'a str, (&'a Def, &'a Signature)>,
+    /// Every fn and rill, by index into the program's items.
+    list: Vec<(&'a Def, &'a Signature)>,
     lambdas: HashMap<u32, &'a Expr>,
-    /// Declared events by name: their id and kind.
-    events: HashMap<&'a str, (EventId, EventKind)>,
+    /// What every name refers to, as the checker found: names are looked
+    /// up by where they are, as the same name can mean different things in
+    /// different files.
+    resolved: HashMap<Span, &'a Resolution>,
+    /// The kind of every event, by id.
+    events: Vec<Option<EventKind>>,
     decls: Vec<Declared>,
     /// The program's sequences, filled in by [`seq_tables`].
     pub seqs: Vec<SeqTable>,
@@ -139,7 +146,7 @@ pub struct Defs<'a> {
     /// expressions, by expression id.
     const_values: &'a HashMap<u32, f64>,
     /// The top-level `const`s, filled in by [`const_table`].
-    consts: HashMap<&'a str, CVal>,
+    consts: Vec<Option<CVal>>,
 }
 
 /// The numbers `random()` picks while a program is built: SplitMix64 from a
@@ -183,30 +190,62 @@ impl<'a> Defs<'a> {
         let events = checked
             .events
             .iter()
-            .enumerate()
-            .filter_map(|(i, d)| {
-                d.as_ref()
-                    .map(|d| (d.name.as_str(), (EventId(i as u16), d.kind)))
-            })
+            .map(|d| d.as_ref().map(|d| d.kind))
             .collect();
         Defs {
             events,
+            resolved: checked.resolutions.iter().map(|(s, r)| (*s, r)).collect(),
             decls: checked.events.iter().flatten().cloned().collect(),
             seqs: Vec::new(),
             vectorize: true,
             random: Random::default(),
             const_values: &checked.const_values,
-            consts: HashMap::new(),
-            map: defs
-                .zip(&checked.signatures)
-                .map(|(d, s)| (d.name.name.as_str(), (d, s)))
-                .collect(),
+            consts: vec![None; program.consts.len()],
+            list: defs.zip(&checked.signatures).collect(),
             lambdas,
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<(&'a Def, &'a Signature)> {
-        self.map.get(name).copied()
+    /// The fn or rill at `index` in the program's items.
+    pub fn def(&self, index: usize) -> (&'a Def, &'a Signature) {
+        self.list[index]
+    }
+
+    /// What the name at `span` refers to.
+    fn resolution(&self, span: Span) -> Option<&'a Resolution> {
+        self.resolved.get(&span).copied()
+    }
+
+    /// The fn or rill the name at `span` refers to.
+    fn def_at(&self, span: Span) -> Option<(&'a Def, &'a Signature)> {
+        match self.resolution(span)? {
+            Resolution::Def(i) => Some(self.list[*i]),
+            _ => None,
+        }
+    }
+
+    /// The event the name at `span` refers to: its id and kind.
+    fn event_at(&self, span: Span) -> Option<(EventId, EventKind)> {
+        match self.resolution(span)? {
+            Resolution::Event(i) => Some((EventId(*i as u16), self.events.get(*i).copied()??)),
+            _ => None,
+        }
+    }
+
+    /// The sequence the name at `span` refers to.
+    fn seq_at(&self, span: Span) -> Option<usize> {
+        match self.resolution(span)? {
+            Resolution::Seq(j) => Some(*j),
+            _ => None,
+        }
+    }
+
+    /// The value of the top-level `const` the name at `span` refers to.
+    fn const_at(&self, span: Span) -> Option<&CVal> {
+        match self.resolution(span)? {
+            Resolution::Const(i) => self.consts.get(*i)?.as_ref(),
+            _ => None,
+        }
     }
 
     fn lambda(&self, id: u32) -> Option<&'a Expr> {
@@ -390,7 +429,7 @@ pub fn const_table<'a>(
         if value.operands().iter().any(|o| const_of(*o).is_none()) {
             return Err(internal(decl.value.span, "a `const` that is not constant"));
         }
-        defs.consts.insert(decl.name.name.as_str(), value);
+        defs.consts[i] = Some(value);
     }
     Ok(())
 }
@@ -936,8 +975,7 @@ impl<'a> Compiler<'a> {
                     Some(binding) => &binding.val,
                     None => self
                         .defs
-                        .consts
-                        .get(id.name.as_str())
+                        .const_at(id.span)
                         .ok_or_else(|| internal(id.span, "unknown frame size"))?,
                 };
                 let Operand::Const(n) = val.scalar() else {
@@ -993,7 +1031,11 @@ impl<'a> Compiler<'a> {
         args: Vec<CVal>,
         sizes: HashMap<String, CVal>,
     ) -> CResult<CVal> {
-        self.enter(&def.name.name, def.name.span)?;
+        // By position too: two files can each have their own fn by a name.
+        self.enter(
+            &format!("{}@{}", def.name.name, def.span.start),
+            def.name.span,
+        )?;
         let result = self.inline_body(def, sig, args, sizes);
         self.inlining.pop();
         result
@@ -1244,7 +1286,7 @@ impl<'a> Compiler<'a> {
                 if let Some(b) = self.lookup(name) {
                     return Ok(b.val.clone());
                 }
-                if let Some(v) = self.defs.consts.get(name.as_str()) {
+                if let Some(v) = self.defs.const_at(e.span) {
                     return Ok(v.clone());
                 }
                 if let Some(p) = super::check::pitch_literal(name) {
@@ -1253,7 +1295,10 @@ impl<'a> Compiler<'a> {
                 if let Some(c) = constant(name, self.sample_rate) {
                     return Ok(CVal::Scalar(Operand::Const(c)));
                 }
-                if self.defs.get(name).is_some() || !super::builtins::lookup(name).is_empty() {
+                if let Some(Resolution::Def(i)) = self.defs.resolution(e.span) {
+                    return Ok(CVal::Fn(FnVal::Def(*i)));
+                }
+                if !super::builtins::lookup(name).is_empty() {
                     return Ok(CVal::Fn(FnVal::Named(name.clone())));
                 }
                 Err(internal(e.span, &format!("unknown name `{name}`")))
@@ -1370,9 +1415,7 @@ impl<'a> Compiler<'a> {
             ExprKind::Halt { id, target } => {
                 let seq = self
                     .defs
-                    .seqs
-                    .iter()
-                    .position(|t| t.name == target.name)
+                    .seq_at(target.span)
                     .ok_or_else(|| internal(target.span, "unknown sequence"))?;
                 let id = match id {
                     Some(id) => Some(self.expr(id)?.scalar()),
@@ -1419,10 +1462,9 @@ impl<'a> Compiler<'a> {
         let (handles, kind) = if name.name == "start" {
             (Handles::Start, None)
         } else {
-            let &(event, kind) = self
+            let (event, kind) = self
                 .defs
-                .events
-                .get(name.name.as_str())
+                .event_at(name.span)
                 .ok_or_else(|| internal(name.span, "handler of an undeclared event"))?;
             (Handles::Event(event), Some(kind))
         };
@@ -1527,7 +1569,7 @@ impl<'a> Compiler<'a> {
         target: &Ident,
         args: &[Arg],
     ) -> CResult<CVal> {
-        if let Some(&(event, kind)) = self.defs.events.get(target.name.as_str()) {
+        if let Some((event, kind)) = self.defs.event_at(target.span) {
             let mut values = [Operand::Const(0.0); 3];
             for a in args {
                 let Some(name) = &a.name else { continue };
@@ -1541,9 +1583,7 @@ impl<'a> Compiler<'a> {
         }
         let seq = self
             .defs
-            .seqs
-            .iter()
-            .position(|t| t.name == target.name)
+            .seq_at(target.span)
             .ok_or_else(|| internal(target.span, "unknown sequence"))?;
         let instances = self.defs.seqs[seq].instances;
         let id = match id {
@@ -1865,7 +1905,7 @@ impl<'a> Compiler<'a> {
             return self.call_value(&f, vals, e.span);
         }
         // User definitions shadow built-ins.
-        if let Some((def, sig)) = self.defs.get(name) {
+        if let Some((def, sig)) = self.defs.def_at(callee.span) {
             if sig.rate != (1, 1) {
                 return Err(rate_unsupported(callee.span, name));
             }
@@ -1965,13 +2005,14 @@ impl<'a> Compiler<'a> {
     /// arguments take the function's defaults.
     fn call_value(&mut self, f: &FnVal, vals: Vec<CVal>, span: Span) -> CResult<CVal> {
         match f {
+            FnVal::Def(i) => {
+                let (def, sig) = self.defs.def(*i);
+                let mut slots: Vec<Option<CVal>> = vals.into_iter().map(Some).collect();
+                slots.resize(sig.params.len(), None);
+                let filled = self.fill_defaults(def, sig, slots, span)?;
+                self.inline(def, sig, filled, HashMap::new())
+            }
             FnVal::Named(name) => {
-                if let Some((def, sig)) = self.defs.get(name) {
-                    let mut slots: Vec<Option<CVal>> = vals.into_iter().map(Some).collect();
-                    slots.resize(sig.params.len(), None);
-                    let filled = self.fill_defaults(def, sig, slots, span)?;
-                    return self.inline(def, sig, filled, HashMap::new());
-                }
                 let sigs = super::builtins::lookup(name);
                 let mut vals = vals;
                 if let [sig] = sigs.as_slice() {

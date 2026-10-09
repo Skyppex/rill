@@ -17,6 +17,14 @@ impl Span {
         }
     }
 
+    /// The same span `by` bytes further on.
+    pub fn shifted(self, by: u32) -> Span {
+        Span {
+            start: self.start + by,
+            end: self.end + by,
+        }
+    }
+
     /// Smallest span covering both.
     pub fn to(self, other: Span) -> Span {
         Span {

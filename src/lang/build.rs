@@ -79,7 +79,12 @@ pub fn build_with(
     .map_err(|d| vec![d])?;
     defs.seqs = seq_tables(&defs, &checked.types, config.sample_rate as f32, program)
         .map_err(|d| vec![d])?;
-    let (def, sig) = defs.get(entry).expect("checked by check_entry");
+    let index = checked
+        .scopes
+        .first()
+        .and_then(|scope| scope.def(entry))
+        .expect("checked by check_entry");
+    let (def, sig) = defs.def(index);
 
     let mut args = Vec::with_capacity(sig.params.len());
     let mut defaults = Vec::with_capacity(sig.params.len());

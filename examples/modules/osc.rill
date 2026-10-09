@@ -1,0 +1,35 @@
+// Oscillators. Only what is exported can be used by files that import
+// this one; `blep` is a helper that stays in here.
+
+// The correction a jump at phase 0 needs, to remove most of its aliasing
+// (PolyBLEP). `dt` is how far the phase moves in one sample.
+fn blep(t: Float, dt: Float) Float {
+    if t < dt {
+        let x = t / dt
+        x + x - x * x - 1
+    } else if t > 1 - dt {
+        let x = (t - 1) / dt
+        x * x + x + x + 1
+    } else {
+        0
+    }
+}
+
+export rill saw(freq: Freq) Sample {
+    state phase: Float = 0
+    phase = wrap(phase + freq / RATE)
+    return phase * 2 - 1 - blep(phase, freq / RATE)
+}
+
+export rill sine(freq: Freq) Sample {
+    state phase: Float = 0
+    phase = wrap(phase + freq / RATE)
+    return sin(phase * TAU)
+}
+
+// A file can have its own `main` to try it out on its own:
+// `rill play examples/modules/osc.rill`. It is private, so it never
+// clashes with the `main` of a file importing this one.
+rill main() Sample {
+    return saw(110Hz) * 0.2
+}

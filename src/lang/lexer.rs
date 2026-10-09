@@ -75,12 +75,17 @@ pub enum TokenKind {
         /// Written without a fraction or exponent.
         integral: bool,
     },
+    /// `"lib/osc"`: text in double quotes, on one line, with no escapes.
+    /// Only module paths are strings.
+    Str,
     // Keywords.
     Fn,
     Rill,
     State,
     Let,
     Const,
+    Import,
+    Export,
     For,
     In,
     Return,
@@ -130,12 +135,15 @@ impl TokenKind {
         use TokenKind::*;
         match self {
             Ident => "a name",
+            Str => "a string",
             Number { .. } => "a number",
             Fn => "`fn`",
             Rill => "`rill`",
             State => "`state`",
             Let => "`let`",
             Const => "`const`",
+            Import => "`import`",
+            Export => "`export`",
             For => "`for`",
             In => "`in`",
             Return => "`return`",
@@ -189,8 +197,53 @@ pub struct Token {
     pub newline_before: bool,
 }
 
+/// Whether `word` is always a keyword, never a name.
+pub fn is_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "fn" | "rill"
+            | "state"
+            | "let"
+            | "const"
+            | "import"
+            | "export"
+            | "for"
+            | "in"
+            | "return"
+            | "if"
+            | "else"
+            | "as"
+            | "true"
+            | "false"
+    )
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
     Lexer::new(src, false).run()
+}
+
+/// [`lex`] for a file whose spans start at `base` in a program made of
+/// several files (see [`super::module`]).
+pub fn lex_at(src: &str, base: u32) -> Result<Vec<Token>, Diagnostic> {
+    let mut tokens = lex(src).map_err(|d| shift(d, base))?;
+    for t in &mut tokens {
+        t.span = t.span.shifted(base);
+    }
+    Ok(tokens)
+}
+
+/// [`lex_partial`] with spans starting at `base`.
+pub fn lex_partial_at(src: &str, base: u32) -> (Vec<Token>, Vec<Diagnostic>) {
+    let (mut tokens, errors) = lex_partial(src);
+    for t in &mut tokens {
+        t.span = t.span.shifted(base);
+    }
+    (tokens, errors.into_iter().map(|d| shift(d, base)).collect())
+}
+
+fn shift(mut d: Diagnostic, base: u32) -> Diagnostic {
+    d.span = d.span.shifted(base);
+    d
 }
 
 /// Lex all of `src`, reporting every error instead of stopping at the
@@ -269,6 +322,24 @@ impl<'a> Lexer<'a> {
                 self.push(kind, start);
                 continue;
             }
+            if c == b'"' {
+                self.pos += 1;
+                while !matches!(self.peek(0), b'"' | b'\n' | 0) {
+                    self.pos += 1;
+                }
+                if self.peek(0) == b'"' {
+                    self.pos += 1;
+                } else {
+                    let d = Diagnostic::error(
+                        Span::new(start, self.pos),
+                        "this string is never closed",
+                    )
+                    .with_help("end it with `\"` on the same line");
+                    self.fail(d)?;
+                }
+                self.push(TokenKind::Str, start);
+                continue;
+            }
             if c.is_ascii_alphabetic() || c == b'_' {
                 // `#` is a sharp, so it is only part of a name right after a
                 // note letter, as in `F#4`.
@@ -284,6 +355,8 @@ impl<'a> Lexer<'a> {
                     "state" => TokenKind::State,
                     "let" => TokenKind::Let,
                     "const" => TokenKind::Const,
+                    "import" => TokenKind::Import,
+                    "export" => TokenKind::Export,
                     "for" => TokenKind::For,
                     "in" => TokenKind::In,
                     "return" => TokenKind::Return,

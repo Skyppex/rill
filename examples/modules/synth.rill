@@ -1,0 +1,15 @@
+// A pad voice, built from the other files.
+
+// `export import` passes on everything `osc` exports: a file importing
+// `synth` gets `saw` and `sine` too. `synth` can use them itself as well.
+export import "osc"
+
+// A plain import: only this file sees `lowpass`.
+import "fx"
+
+export const VOICES = 4
+
+export rill pad(pitch: Freq) Sample {
+    let detuned = saw(pitch) + saw(pitch * 1.003)
+    return detuned * 0.5 |> lowpass()
+}

@@ -1,0 +1,31 @@
+// A song made of several files: `rill play examples/modules/song.rill`.
+// The program is every file reachable from this one through its imports.
+
+import "synth"
+import "tune"
+
+rill voice() Sample {
+    state pitch: Pitch = C4
+    state level: Float = 0
+
+    on riff_note_on(note) claim {
+        pitch = note.pitch
+        level = note.velocity
+    }
+
+    on riff_note_off release {
+        level = 0
+    }
+
+    return pad(pitch |> equal) * level
+}
+
+rill main() Sample {
+    on start {
+        invoke riff(loop: true)
+    }
+
+    // `VOICES` comes from `synth`, `sine` from `osc` through `synth`, and
+    // `riff` with its events from `tune`.
+    return sum([voice(); VOICES]) * 0.2 + sine(C3 |> equal) * 0.05
+}

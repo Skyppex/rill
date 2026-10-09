@@ -12,6 +12,12 @@ pub struct Program {
     pub seqs: Vec<SeqDecl>,
     /// Top-level constants, in source order.
     pub consts: Vec<ConstDecl>,
+    /// `import "osc"` lines, in source order.
+    pub imports: Vec<Import>,
+    /// The files a program is made of and where each declaration comes
+    /// from. Empty for a program parsed from one string: everything is in
+    /// module 0.
+    pub modules: Modules,
     /// Number of expressions; every [`Expr::id`] is below this.
     pub expr_count: u32,
 }
@@ -30,12 +36,101 @@ impl Item {
             Item::Fn(d) | Item::Rill(d) => d,
         }
     }
+
+    pub fn def_mut(&mut self) -> &mut Def {
+        match self {
+            Item::Fn(d) | Item::Rill(d) => d,
+        }
+    }
+}
+
+/// `import "lib/osc"`, or `export import "lib/osc"` to pass on everything
+/// it exports.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Import {
+    /// `export` before it.
+    pub export: Option<Span>,
+    /// The path as written, without the quotes.
+    pub path: String,
+    /// The path with its quotes.
+    pub path_span: Span,
+    pub span: Span,
+    /// The module it names, once loaded (see [`super::module`]).
+    pub module: Option<u32>,
+}
+
+/// One file of a program.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModuleInfo {
+    /// How the file is imported: its path from the root file's folder,
+    /// without `.rill`. For the root file, its own name.
+    pub name: String,
+    /// The file, if it was read from one.
+    pub path: Option<std::path::PathBuf>,
+    /// The modules whose exports this one sees: what it imports, and what
+    /// those pass on with `export import`.
+    pub sees: Vec<u32>,
+}
+
+/// Which module each top-level declaration of a [`Program`] is written in,
+/// by index into the program's lists. An empty list means module 0.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Modules {
+    pub files: Vec<ModuleInfo>,
+    pub items: Vec<u32>,
+    pub events: Vec<u32>,
+    pub seqs: Vec<u32>,
+    pub consts: Vec<u32>,
+    pub imports: Vec<u32>,
+}
+
+impl Modules {
+    /// How many modules there are: at least one.
+    pub fn count(&self) -> usize {
+        self.files.len().max(1)
+    }
+
+    pub fn item(&self, i: usize) -> usize {
+        at(&self.items, i)
+    }
+
+    pub fn event(&self, i: usize) -> usize {
+        at(&self.events, i)
+    }
+
+    pub fn seq(&self, i: usize) -> usize {
+        at(&self.seqs, i)
+    }
+
+    pub fn konst(&self, i: usize) -> usize {
+        at(&self.consts, i)
+    }
+
+    pub fn import(&self, i: usize) -> usize {
+        at(&self.imports, i)
+    }
+
+    /// The name of module `m`, for messages: `"lib/osc"`.
+    pub fn name(&self, m: usize) -> &str {
+        self.files.get(m).map_or("", |f| f.name.as_str())
+    }
+
+    /// The modules whose exports module `m` sees.
+    pub fn sees(&self, m: usize) -> &[u32] {
+        self.files.get(m).map_or(&[], |f| f.sees.as_slice())
+    }
+}
+
+fn at(list: &[u32], i: usize) -> usize {
+    list.get(i).map_or(0, |&m| m as usize)
 }
 
 /// `const VOICES: Int = 8`: a value worked out while building, at the top
 /// level or in a block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConstDecl {
+    /// `export` before it; only at the top level.
+    pub export: Option<Span>,
     pub name: Ident,
     pub ty: Option<TypeExpr>,
     pub value: Expr,
@@ -46,6 +141,7 @@ pub struct ConstDecl {
 /// optional filters. The kind is checked by the checker.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventDecl {
+    pub export: Option<Span>,
     pub name: Ident,
     pub kind: Ident,
     pub filters: Vec<Filter>,
@@ -63,6 +159,7 @@ pub struct Filter {
 /// `seq riff(step: 1/8) { C4, _, E4@0.5, [G4, B4] }`
 #[derive(Clone, Debug, PartialEq)]
 pub struct SeqDecl {
+    pub export: Option<Span>,
     pub name: Ident,
     pub settings: Vec<Filter>,
     pub steps: Vec<Step>,
@@ -99,6 +196,8 @@ pub struct Ident {
 /// A `fn` or `rill` definition. Which one is recorded by the [`Item`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Def {
+    /// `export` before it.
+    pub export: Option<Span>,
     pub name: Ident,
     /// Compile-time size parameters, as in `mix_down<N>`.
     pub generics: Vec<Ident>,

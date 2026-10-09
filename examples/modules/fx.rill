@@ -1,0 +1,10 @@
+// Effects.
+
+export const CUTOFF = 1.5kHz
+
+// A one-pole lowpass.
+export rill lowpass(x: Sample, cutoff: Freq = CUTOFF) Sample {
+    state y = 0.0
+    y += (1.0 - exp(-TAU * cutoff / RATE)) * (x - y)
+    return y
+}

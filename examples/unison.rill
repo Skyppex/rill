@@ -132,16 +132,18 @@ rill main(volume: Gain = 0dB) [Sample; 2] {
     let chord2 = [G2, D3, B3, F4, A#4]
     let freqs = chord1 |> equal
 
+    const UNISON = 128
+
     return (
         (
-            unison<64>(freqs, 10cents)
+            unison<UNISON>(freqs, 50cents)
                 |> saw(offset: each random())
                 |> sum
                 |> unison_pan
                 |> sum
                 |> tremolo(5Hz, depth: 0.4)
         )
-            / 64
+            / UNISON
         + volume
     )
         |> lowpass(1000Hz)

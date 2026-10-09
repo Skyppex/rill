@@ -64,6 +64,51 @@ pub struct Checked {
     /// it uses, by index into [`Checked::consts`]. A `const` in a cycle is
     /// left out.
     pub const_order: Vec<usize>,
+    /// Per module, the top-level names it can use (one, for a program from
+    /// one string).
+    pub scopes: Vec<Scope>,
+}
+
+/// What a top-level name stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Global {
+    /// A fn or rill, by index into [`Checked::signatures`].
+    Def(usize),
+    /// An event, by index into [`Checked::events`].
+    Event(usize),
+    /// A sequence, by index into the program's sequences.
+    Seq(usize),
+    /// A top-level `const`, by index into [`Checked::consts`].
+    Const(usize),
+}
+
+/// The top-level names one module can use.
+#[derive(Clone, Debug, Default)]
+pub struct Scope {
+    /// What each name stands for: the module's own declarations by that
+    /// name if it has any, otherwise what its imports export.
+    pub names: HashMap<String, Vec<Global>>,
+    /// The names that come from imports. One of these standing for more
+    /// than one thing is ambiguous, and an error where it is used.
+    pub imported: HashSet<String>,
+}
+
+impl Scope {
+    /// What `name` stands for, unless it is unknown or ambiguous.
+    pub fn get(&self, name: &str) -> &[Global] {
+        match self.names.get(name) {
+            Some(gs) if !(gs.len() > 1 && self.imported.contains(name)) => gs,
+            _ => &[],
+        }
+    }
+
+    /// The fn or rill `name` stands for.
+    pub fn def(&self, name: &str) -> Option<usize> {
+        self.get(name).iter().find_map(|g| match g {
+            Global::Def(i) => Some(*i),
+            _ => None,
+        })
+    }
 }
 
 /// What the checker found out about a top-level `const`.
@@ -161,8 +206,14 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
 /// such as editors. Where something is wrong, types are
 /// [`Type::Error`]. The list holds the errors and warnings, by position.
 pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
+    let (own, module_scopes, exported) = build_scopes(program);
     let mut c = Checker {
-        defs: HashMap::new(),
+        own,
+        module_scopes,
+        exported,
+        modules: program.modules.clone(),
+        module: 0,
+        used_from: HashSet::new(),
         signatures: Vec::new(),
         types: vec![Type::Error; program.expr_count as usize],
         diags: Vec::new(),
@@ -174,7 +225,6 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         lambda_floor: None,
         tail_expect: None,
         calls: HashMap::new(),
-        def_order: Vec::new(),
         bindings: Vec::new(),
         resolutions: Vec::new(),
         def_bindings: Vec::new(),
@@ -191,7 +241,6 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         seq_used: vec![false; program.seqs.len()],
         handler: None,
         invokes: Vec::new(),
-        const_names: HashMap::new(),
         const_types: vec![Type::Error; program.consts.len()],
         const_vals: vec![Err(None); program.consts.len()],
         local_const_vals: HashMap::new(),
@@ -200,6 +249,7 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
 
     c.declare_events(&program.events, &program.seqs);
     c.generate_seq_events(program);
+    c.check_imports(program);
     // Facts first, as `const`s can use them; `instances` can use a `const`
     // in turn, so it is worked out again once they are known.
     c.seq_facts = program.seqs.iter().map(|s| SeqFacts::of(s, None)).collect();
@@ -212,7 +262,8 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
             .and_then(|s| c.const_value(&s.value).ok());
         c.seq_facts[j] = SeqFacts::of(seq, instances);
     }
-    for item in &program.items {
+    for (i, item) in program.items.iter().enumerate() {
+        c.module = program.modules.item(i);
         match item {
             Item::Fn(d) => c.declare(d, DefKind::Fn),
             Item::Rill(d) => c.declare(d, DefKind::Rill),
@@ -221,7 +272,8 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
     c.const_clashes(program);
     c.check_seqs(&program.seqs, &program.events);
     for (i, decl) in program.events.iter().enumerate() {
-        if c.events[i].is_some() && c.defs.contains_key(&decl.name.name) {
+        let m = program.modules.event(i);
+        if c.events[i].is_some() && c.own_has(m, &decl.name.name, |g| matches!(g, Global::Def(_))) {
             let e = c.error(
                 decl.name.span,
                 format!("`{}` is already the name of a fn or rill", decl.name.name),
@@ -234,8 +286,10 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
             .as_ref()
             .map(|d| d.name.clone())
             .unwrap_or_default();
-        if c.defs.contains_key(&name) {
-            let j = (i - c.written_events) / EventKind::SEQ.len();
+        let j = (i - c.written_events) / EventKind::SEQ.len();
+        if c.own_has(program.modules.seq(j), &name, |g| {
+            matches!(g, Global::Def(_))
+        }) {
             let e = c
                 .error(
                     program.seqs[j].name.span,
@@ -249,13 +303,16 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         }
     }
     for (index, item) in program.items.iter().enumerate() {
+        c.module = program.modules.item(index);
         c.check_def(item.def(), index);
     }
 
     c.check_recursion();
     c.check_invoke_loops(program);
+    c.unused_imports(program);
     for (seq, used) in program.seqs.iter().zip(c.seq_used.clone()) {
-        if !used {
+        // What a file exports is for others to use.
+        if !used && seq.export.is_none() {
             c.report(Diagnostic::warning(
                 seq.name.span,
                 format!("sequence `{}` is never invoked", seq.name.name),
@@ -263,7 +320,7 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         }
     }
     for (decl, used) in program.events.iter().zip(c.event_used.clone()) {
-        if !used {
+        if !used && decl.export.is_none() {
             c.report(Diagnostic::warning(
                 decl.name.span,
                 format!("event `{}` is declared but never handled", decl.name.name),
@@ -297,6 +354,7 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
             })
             .collect(),
         const_order: c.const_order,
+        scopes: c.module_scopes,
     };
     (checked, errors)
 }
@@ -341,8 +399,18 @@ pub(crate) type OpError = (String, Option<String>);
 type ConstVal = Result<f64, Option<String>>;
 
 struct Checker {
-    /// Name -> index into `signatures` (first definition wins).
-    defs: HashMap<String, usize>,
+    /// Per module, its own top-level declarations by name, for spotting
+    /// names declared twice.
+    own: Vec<OwnNames>,
+    /// Per module, the top-level names it can use.
+    module_scopes: Vec<Scope>,
+    /// The declarations other modules can import.
+    exported: HashSet<Global>,
+    modules: Modules,
+    /// The module being checked.
+    module: usize,
+    /// (user, declarer): a module uses something another module declares.
+    used_from: HashSet<(usize, usize)>,
     signatures: Vec<Signature>,
     types: Vec<Type>,
     diags: Vec<Diagnostic>,
@@ -358,10 +426,9 @@ struct Checker {
     /// next block checked (the body itself) so an anonymous fn there can
     /// take its types from it.
     tail_expect: Option<Type>,
-    /// Caller -> (callee, call site), user definitions only.
-    /// Mentioning a fn as a value counts as a call.
-    calls: HashMap<String, Vec<(String, Span)>>,
-    def_order: Vec<String>,
+    /// Caller -> (callee, call site), by index into `signatures`, user
+    /// definitions only. Mentioning a fn as a value counts as a call.
+    calls: HashMap<usize, Vec<(usize, Span)>>,
     bindings: Vec<Binding>,
     resolutions: Vec<(Span, Resolution)>,
     /// Per definition: the bindings of its size parameters and parameters.
@@ -388,8 +455,7 @@ struct Checker {
     /// Every `invoke` and `trigger`: from the handler it is in, to what it
     /// starts, for the loop check.
     invokes: Vec<(Node, Node, Span)>,
-    /// Top-level `const`s: by name, their types and values.
-    const_names: HashMap<String, usize>,
+    /// Top-level `const`s: their types and values.
     const_types: Vec<Type>,
     const_vals: Vec<ConstVal>,
     /// The values of `const`s in blocks, by binding.
@@ -416,6 +482,19 @@ enum Node {
 
 impl Checker {
     fn resolve(&mut self, span: Span, r: Resolution) {
+        let g = match r {
+            Resolution::Def(i) => Some(Global::Def(i)),
+            Resolution::Event(i) => Some(Global::Event(i)),
+            Resolution::Seq(j) => Some(Global::Seq(j)),
+            Resolution::Const(i) => Some(Global::Const(i)),
+            _ => None,
+        };
+        if let Some(g) = g {
+            let from = self.module_of(g);
+            if from != self.module {
+                self.used_from.insert((self.module, from));
+            }
+        }
         self.resolutions.push((span, r));
     }
 
@@ -438,6 +517,197 @@ impl Checker {
         self.bindings.len() - 1
     }
 
+    // ---- names across modules ------------------------------------------
+
+    /// What `name` stands for in the module being checked, unless it is
+    /// unknown or ambiguous.
+    fn scope_get(&self, name: &str) -> &[Global] {
+        self.module_scopes[self.module].get(name)
+    }
+
+    fn def_named(&self, name: &str) -> Option<usize> {
+        self.module_scopes[self.module].def(name)
+    }
+
+    fn event_named(&self, name: &str) -> Option<usize> {
+        self.scope_get(name).iter().find_map(|g| match g {
+            Global::Event(i) => Some(*i),
+            _ => None,
+        })
+    }
+
+    fn seq_named(&self, name: &str) -> Option<usize> {
+        self.scope_get(name).iter().find_map(|g| match g {
+            Global::Seq(j) => Some(*j),
+            _ => None,
+        })
+    }
+
+    fn const_named(&self, name: &str) -> Option<usize> {
+        self.scope_get(name).iter().find_map(|g| match g {
+            Global::Const(i) => Some(*i),
+            _ => None,
+        })
+    }
+
+    /// The first of module `m`'s own declarations named `name` that `is`
+    /// accepts.
+    fn own_first(&self, m: usize, name: &str, is: impl Fn(&Global) -> bool) -> Option<Global> {
+        self.own[m].get(name)?.iter().copied().find(|g| is(g))
+    }
+
+    fn own_has(&self, m: usize, name: &str, is: impl Fn(&Global) -> bool) -> bool {
+        self.own_first(m, name, is).is_some()
+    }
+
+    /// The names the module being checked can use, of the kinds `is`
+    /// accepts, for suggestions.
+    fn visible(&self, is: impl Fn(&Global) -> bool) -> Vec<&str> {
+        let scope = &self.module_scopes[self.module];
+        let mut names: Vec<&str> = scope
+            .names
+            .iter()
+            .filter(|(n, gs)| gs.iter().any(&is) && !scope.get(n).is_empty())
+            .map(|(n, _)| n.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Why `name` is not usable here when another file has it: two imports
+    /// both export it, it is private to its file, or its file is not
+    /// imported. `None` if no file has it.
+    fn why_missing(&self, name: &str, span: Span) -> Option<Diagnostic> {
+        let scope = &self.module_scopes[self.module];
+        let module_name = |g: &Global| self.modules.name(self.module_of(*g)).to_owned();
+        if let Some(gs) = scope.names.get(name)
+            && gs.len() > 1
+            && scope.imported.contains(name)
+        {
+            let mut from: Vec<String> = gs
+                .iter()
+                .map(|g| format!("\"{}\"", module_name(g)))
+                .collect();
+            from.dedup();
+            let from = match from.split_last() {
+                Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+                _ => from.concat(),
+            };
+            let both = if gs.len() == 2 { "both " } else { "" };
+            return Some(
+                Diagnostic::error(span, format!("`{name}` is exported by {both}{from}"))
+                .with_help(format!("they are different things; import only one of these files here, or define `{name}` in this file")),
+            );
+        }
+        if self.modules.count() < 2 {
+            return None;
+        }
+        let sees = self.modules.sees(self.module);
+        let (m, g) = (0..self.own.len())
+            .filter(|&m| m != self.module)
+            .find_map(|m| {
+                self.own[m]
+                    .get(name)
+                    .and_then(|gs| gs.first())
+                    .map(|g| (m, *g))
+            })?;
+        let there = self.modules.name(m);
+        let seen = sees.contains(&(m as u32));
+        let exported = self.exported.contains(&g);
+        let path = relative_import(self.modules.name(self.module), there);
+        Some(match (seen, exported) {
+            (true, _) => Diagnostic::error(span, format!("`{name}` is private to \"{there}\""))
+                .with_help(format!(
+                    "put `export` before it in \"{there}\" to use it in other files"
+                )),
+            (false, true) => Diagnostic::error(
+                span,
+                format!("`{name}` is in \"{there}\", which this file does not import"),
+            )
+            .with_help(format!("add `import \"{path}\"` at the top of this file")),
+            (false, false) => Diagnostic::error(
+                span,
+                format!("`{name}` is private to \"{there}\", which this file does not import"),
+            )
+            .with_help(format!(
+                "put `export` before it in \"{there}\", and add `import \"{path}\"` here"
+            )),
+        })
+    }
+
+    /// The module a declaration is written in.
+    fn module_of(&self, g: Global) -> usize {
+        global_module(&self.modules, self.written_events, g)
+    }
+
+    /// Plain imports that nothing in the file uses. (`export import` is
+    /// there to pass things on, so it counts as used.)
+    fn unused_imports(&mut self, program: &Program) {
+        // What each module passes on, itself included.
+        let n = program.modules.count();
+        let mut gives: Vec<HashSet<usize>> = (0..n).map(|m| HashSet::from([m])).collect();
+        loop {
+            let mut changed = false;
+            for (k, import) in program.imports.iter().enumerate() {
+                let (Some(t), true) = (import.module, import.export.is_some()) else {
+                    continue;
+                };
+                let from = program.modules.import(k);
+                let more: Vec<usize> = gives[t as usize].iter().copied().collect();
+                for x in more {
+                    changed |= gives[from].insert(x);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (k, import) in program.imports.iter().enumerate() {
+            let Some(t) = import.module else { continue };
+            let m = program.modules.import(k);
+            let used = gives[t as usize]
+                .iter()
+                .any(|&x| self.used_from.contains(&(m, x)));
+            // One that exports nothing is reported as that instead.
+            let exports = self
+                .exported
+                .iter()
+                .any(|&g| gives[t as usize].contains(&self.module_of(g)));
+            if import.export.is_none() && !used && exports {
+                self.report(
+                    Diagnostic::warning(
+                        import.path_span,
+                        format!("nothing from \"{}\" is used here", import.path),
+                    )
+                    .with_help("remove this import"),
+                );
+            }
+        }
+    }
+
+    /// Imports that bring nothing: the file exports nothing and passes
+    /// nothing on.
+    fn check_imports(&mut self, program: &Program) {
+        for import in &program.imports {
+            let Some(target) = import.module.map(|t| t as usize) else {
+                continue;
+            };
+            let exports = self.exported.iter().any(|&g| self.module_of(g) == target);
+            let passes_on = program.imports.iter().enumerate().any(|(j, i)| {
+                program.modules.import(j) == target && i.export.is_some() && i.module.is_some()
+            });
+            if !exports && !passes_on {
+                self.report(
+                    Diagnostic::warning(
+                        import.path_span,
+                        format!("\"{}\" exports nothing", import.path),
+                    )
+                    .with_help("put `export` before what it should share, or remove this import"),
+                );
+            }
+        }
+    }
+
     fn error(&mut self, span: Span, message: impl Into<String>) -> Diagnostic {
         Diagnostic::error(span, message)
     }
@@ -450,7 +720,11 @@ impl Checker {
 
     fn declare_events(&mut self, decls: &[EventDecl], seqs: &[SeqDecl]) {
         for (i, d) in decls.iter().enumerate() {
-            if decls[..i].iter().any(|p| p.name.name == d.name.name) {
+            self.module = self.modules.event(i);
+            let m = self.module;
+            let first = self.own_first(m, &d.name.name, |g| matches!(g, Global::Event(_)));
+            let _ = seqs;
+            if first != Some(Global::Event(i)) {
                 let e = self.error(
                     d.name.span,
                     format!("event `{}` is declared more than once", d.name.name),
@@ -463,7 +737,7 @@ impl Checker {
                         "handle it with `on start { ... }`; it runs once, before the first sample",
                     );
                 self.report(e);
-            } else if seqs.iter().any(|s| s.name.name == d.name.name) {
+            } else if self.own_has(m, &d.name.name, |g| matches!(g, Global::Seq(_))) {
                 let e = self.error(
                     d.name.span,
                     format!("`{}` is already the name of a sequence", d.name.name),
@@ -496,21 +770,18 @@ impl Checker {
                     "sender" => {
                         let value = match (&f.value.kind, number) {
                             (_, Some(n)) => Sender::Host(n),
-                            (ExprKind::Name(n), _) => {
-                                match self.seq_names.iter().position(|s| s == n) {
-                                    Some(j) => {
-                                        self.resolve(f.value.span, Resolution::Seq(j));
-                                        Sender::Seq(j as u16)
-                                    }
-                                    None => {
-                                        let e = self
-                                            .error(f.value.span, format!("unknown sequence `{n}`"))
-                                            .with_help("a sender is a whole number from the host, or a sequence's name");
-                                        self.report(e);
-                                        continue;
-                                    }
+                            (ExprKind::Name(n), _) => match self.seq_named(n) {
+                                Some(j) => {
+                                    self.resolve(f.value.span, Resolution::Seq(j));
+                                    Sender::Seq(j as u16)
                                 }
-                            }
+                                None => {
+                                    let e = self.why_missing(n, f.value.span).unwrap_or_else(|| Diagnostic::error(f.value.span, format!("unknown sequence `{n}`"))
+                                            .with_help("a sender is a whole number from the host, or a sequence's name"));
+                                    self.report(e);
+                                    continue;
+                                }
+                            },
                             _ => {
                                 let e = self
                                     .error(f.value.span, "a sender is a whole number ≥ 0 or a sequence's name")
@@ -568,7 +839,18 @@ impl Checker {
         for (j, seq) in program.seqs.iter().enumerate() {
             for kind in EventKind::SEQ {
                 let name = format!("{}_{}", seq.name.name, kind.suffix());
-                if let Some(d) = program.events.iter().find(|d| d.name.name == name) {
+                let m = program.modules.seq(j);
+                let clash = self
+                    .own_first(
+                        m,
+                        &name,
+                        |g| matches!(g, Global::Event(i) if *i < program.events.len()),
+                    )
+                    .and_then(|g| match g {
+                        Global::Event(i) => program.events.get(i),
+                        _ => None,
+                    });
+                if let Some(d) = clash {
                     let e = self
                         .error(
                             d.name.span,
@@ -623,8 +905,11 @@ impl Checker {
     }
 
     fn unknown_seq(&mut self, target: &Ident) -> Diagnostic {
+        if let Some(d) = self.why_missing(&target.name, target.span) {
+            return d;
+        }
         let near =
-            suggest(&target.name, self.seq_names.iter().map(String::as_str)).map(str::to_owned);
+            suggest(&target.name, self.visible(|g| matches!(g, Global::Seq(_)))).map(str::to_owned);
         let e = self.error(target.span, format!("unknown sequence `{}`", target.name));
         match near {
             Some(n) => e.with_help(format!("did you mean `{n}`?")),
@@ -646,7 +931,7 @@ impl Checker {
         let word = if step.is_some() { "trigger" } else { "invoke" };
         self.in_handler_only(span, word);
         self.no_each(args, &format!("`{word}` runs once"));
-        if let Some(j) = self.seq_names.iter().position(|n| *n == target.name) {
+        if let Some(j) = self.seq_named(&target.name) {
             self.resolve(target.span, Resolution::Seq(j));
             self.seq_used[j] = true;
             if let Some(from) = self.handler {
@@ -739,9 +1024,8 @@ impl Checker {
             return Type::Int;
         }
         let event = self
-            .events
-            .iter()
-            .position(|d| d.as_ref().is_some_and(|d| d.name == target.name));
+            .event_named(&target.name)
+            .filter(|&i| self.events[i].is_some());
         let Some(i) = event else {
             let e = if target.name == "start" {
                 self.error(target.span, "`start` cannot be invoked")
@@ -932,13 +1216,15 @@ impl Checker {
         self.scopes.push(HashMap::new());
         for (i, seq) in seqs.iter().enumerate() {
             let name = &seq.name.name;
-            if seqs[..i].iter().any(|p| p.name.name == *name) {
+            self.module = self.modules.seq(i);
+            let m = self.module;
+            if self.own_first(m, name, |g| matches!(g, Global::Seq(_))) != Some(Global::Seq(i)) {
                 let e = self.error(
                     seq.name.span,
                     format!("sequence `{name}` is declared more than once"),
                 );
                 self.report(e);
-            } else if self.defs.contains_key(name) {
+            } else if self.own_has(m, name, |g| matches!(g, Global::Def(_))) {
                 let e = self.error(
                     seq.name.span,
                     format!("`{name}` is already the name of a fn or rill"),
@@ -1091,9 +1377,8 @@ impl Checker {
     /// problem otherwise.
     fn handled_event(&mut self, name: &Ident) -> Option<usize> {
         let found = self
-            .events
-            .iter()
-            .position(|d| d.as_ref().is_some_and(|d| d.name == name.name));
+            .event_named(&name.name)
+            .filter(|&i| self.events[i].is_some());
         if let Some(i) = found {
             self.event_used[i] = true;
             self.resolve(name.span, Resolution::Event(i));
@@ -1102,6 +1387,10 @@ impl Checker {
         // A declaration with an unknown kind is already reported.
         let broken = self.events.iter().any(Option::is_none);
         if broken {
+            return None;
+        }
+        if let Some(d) = self.why_missing(&name.name, name.span) {
+            self.report(d);
             return None;
         }
         let e = if EventKind::from_name(&name.name).is_some() {
@@ -1114,11 +1403,8 @@ impl Checker {
                 name.name
             ))
         } else {
-            let near = suggest(
-                &name.name,
-                self.events.iter().flatten().map(|d| d.name.as_str()),
-            )
-            .map(str::to_owned);
+            let near = suggest(&name.name, self.visible(|g| matches!(g, Global::Event(_))))
+                .map(str::to_owned);
             let e = self.error(name.span, format!("unknown event `{}`", name.name));
             match near {
                 Some(n) => e.with_help(format!("did you mean `{n}`?")),
@@ -1134,7 +1420,9 @@ impl Checker {
 
     fn declare(&mut self, d: &Def, kind: DefKind) {
         let name = &d.name.name;
-        if self.defs.contains_key(name) {
+        let index = self.signatures.len();
+        let m = self.module;
+        if self.own_first(m, name, |g| matches!(g, Global::Def(_))) != Some(Global::Def(index)) {
             let e = self.error(d.name.span, format!("`{name}` is defined more than once"));
             self.report(e);
         } else if builtins::constant(name).is_some() {
@@ -1153,7 +1441,6 @@ impl Checker {
             }
             generics.push(g.name.clone());
         }
-        let index = self.signatures.len();
         let generic_ids: Vec<BindingId> = d
             .generics
             .iter()
@@ -1231,10 +1518,6 @@ impl Checker {
             ret,
             rate,
         };
-        if !self.defs.contains_key(name) {
-            self.defs.insert(name.clone(), self.signatures.len());
-            self.def_order.push(name.clone());
-        }
         self.signatures.push(sig);
     }
 
@@ -1599,8 +1882,8 @@ impl Checker {
                             .with_help("use `let` for a value that changes, or `state` for one kept between ticks");
                         self.report(e);
                     }
-                    None if self.const_names.contains_key(&name.name) => {
-                        let i = self.const_names[&name.name];
+                    None if self.const_named(&name.name).is_some() => {
+                        let i = self.const_named(&name.name).expect("checked");
                         self.resolve(name.span, Resolution::Const(i));
                         let e = self
                             .error(name.span, format!("`{}` is a `const`, so it cannot change", name.name))
@@ -1791,7 +2074,7 @@ impl Checker {
                     self.resolve(e.span, Resolution::Binding(var.id));
                     return var.ty;
                 }
-                if let Some(&i) = self.const_names.get(name) {
+                if let Some(i) = self.const_named(name) {
                     self.resolve(e.span, Resolution::Const(i));
                     return self.const_types[i].clone();
                 }
@@ -1803,7 +2086,7 @@ impl Checker {
                     self.resolve(e.span, Resolution::Constant(name.clone()));
                     return t.clone();
                 }
-                if self.defs.contains_key(name) || !builtins::lookup(name).is_empty() {
+                if self.def_named(name).is_some() || !builtins::lookup(name).is_empty() {
                     return self.fn_value(name, e.span, None);
                 }
                 let d = self.unknown_name(name, e.span);
@@ -2040,7 +2323,7 @@ impl Checker {
                 if let Some(id) = id {
                     self.instance_id(id);
                 }
-                match self.seq_names.iter().position(|n| *n == target.name) {
+                match self.seq_named(&target.name) {
                     Some(j) => {
                         self.resolve(target.span, Resolution::Seq(j));
                         if let Some(from) = self.handler {
@@ -2123,13 +2406,16 @@ impl Checker {
     }
 
     fn unknown_name(&self, name: &str, span: Span) -> Diagnostic {
+        if let Some(d) = self.why_missing(name, span) {
+            return d;
+        }
         let mut candidates: Vec<&str> = self
             .scopes
             .iter()
             .flat_map(|s| s.keys().map(String::as_str))
             .collect();
         candidates.extend(builtins::CONSTANTS.iter().map(|(n, _)| *n));
-        candidates.extend(self.const_names.keys().map(String::as_str));
+        candidates.extend(self.visible(|g| matches!(g, Global::Const(_))));
         let d = Diagnostic::error(span, format!("unknown name `{name}`"));
         match suggest(name, candidates) {
             Some(s) => d.with_help(format!("did you mean `{s}`?")),
@@ -2159,21 +2445,24 @@ impl Checker {
             return Type::Error;
         }
 
-        let sigs = match self.defs.get(name) {
-            Some(&i) => vec![self.signatures[i].clone()],
+        let sigs = match self.def_named(name) {
+            Some(i) => vec![self.signatures[i].clone()],
             None => builtins::lookup(name),
         };
         if sigs.is_empty() {
             self.exprs(args);
+            if let Some(d) = self.why_missing(name, callee.span) {
+                self.report(d);
+                return Type::Error;
+            }
             let mut d = self.error(callee.span, format!("unknown fn or rill `{name}`"));
             if let Some(help) = renamed_conversion(name) {
                 self.report(d.with_help(help));
                 return Type::Error;
             }
             let candidates = self
-                .def_order
-                .iter()
-                .map(String::as_str)
+                .visible(|g| matches!(g, Global::Def(_)))
+                .into_iter()
                 .chain(builtins::FUNCTIONS.iter().copied());
             if let Some(s) = suggest(name, candidates) {
                 d = d.with_help(format!("did you mean `{s}`?"));
@@ -2182,7 +2471,7 @@ impl Checker {
             return Type::Error;
         }
 
-        let def = self.defs.get(name).copied();
+        let def = self.def_named(name);
         self.resolve(
             callee.span,
             match def {
@@ -2525,12 +2814,12 @@ impl Checker {
             SizeExpr::Var(id) => {
                 if !generics.contains(&id.name) {
                     let local = self.lookup(&id.name).map(|v| (v.id, v.kind));
-                    let value = match (local, self.const_names.get(&id.name)) {
+                    let value = match (local, self.const_named(&id.name)) {
                         (Some((b, VarKind::Const)), _) => {
                             self.resolve(id.span, Resolution::Binding(b));
                             Some(self.local_const_vals.get(&b).cloned().unwrap_or(Err(None)))
                         }
-                        (None, Some(&i)) => {
+                        (None, Some(i)) => {
                             self.resolve(id.span, Resolution::Const(i));
                             match self.const_types[i].is_wild() {
                                 true => return None,
@@ -2621,25 +2910,26 @@ impl Checker {
     /// Check the top-level `const`s, each after the ones it uses.
     fn check_consts(&mut self, consts: &[ConstDecl], defs: &[Item]) {
         for (i, c) in consts.iter().enumerate() {
-            if self.const_names.contains_key(&c.name.name) {
+            let m = self.modules.konst(i);
+            if self.own_first(m, &c.name.name, |g| matches!(g, Global::Const(_)))
+                != Some(Global::Const(i))
+            {
                 let e = self.error(
                     c.name.span,
                     format!("`{}` is already a `const`", c.name.name),
                 );
                 self.report(e);
-            } else {
-                self.const_names.insert(c.name.name.clone(), i);
             }
         }
         let deps: Vec<Vec<usize>> = consts
             .iter()
-            .map(|c| {
+            .enumerate()
+            .map(|(i, c)| {
+                self.module = self.modules.konst(i);
                 let mut names = Vec::new();
                 const_names_in(&c.value, &mut names);
-                let mut deps: Vec<usize> = names
-                    .iter()
-                    .filter_map(|n| self.const_names.get(n).copied())
-                    .collect();
+                let mut deps: Vec<usize> =
+                    names.iter().filter_map(|n| self.const_named(n)).collect();
                 deps.dedup();
                 deps
             })
@@ -2716,9 +3006,10 @@ impl Checker {
             self.report(e);
         }
 
-        let def_names: HashSet<&str> = defs.iter().map(|d| d.def().name.name.as_str()).collect();
+        let _ = defs;
         for &i in &order {
             let c = &consts[i];
+            self.module = self.modules.konst(i);
             self.scopes = vec![HashMap::new()];
             self.scope_spans = vec![c.span];
             self.place = Place::Fn;
@@ -2726,7 +3017,7 @@ impl Checker {
             self.sizes.clear();
             let mut names = Vec::new();
             const_names_in(&c.value, &mut names);
-            if let Some(n) = names.iter().find(|n| def_names.contains(n.as_str())) {
+            if let Some(n) = names.iter().find(|n| self.def_named(n).is_some()) {
                 let e = self
                     .error(c.value.span, format!("`{n}` cannot be used in a `const`"))
                     .with_help("a `const` is worked out before any fn or rill runs: from numbers, pitches, other `const`s and built-in functions of them");
@@ -2800,13 +3091,14 @@ impl Checker {
 
     /// Top-level `const`s whose names are taken by something else.
     fn const_clashes(&mut self, program: &Program) {
-        for c in &program.consts {
+        for (i, c) in program.consts.iter().enumerate() {
             let n = c.name.name.as_str();
-            let what = if self.defs.contains_key(n) {
+            let m = program.modules.konst(i);
+            let what = if self.own_has(m, n, |g| matches!(g, Global::Def(_))) {
                 "a fn or rill"
-            } else if program.seqs.iter().any(|s| s.name.name == n) {
+            } else if self.own_has(m, n, |g| matches!(g, Global::Seq(_))) {
                 "a sequence"
-            } else if self.events.iter().flatten().any(|d| d.name == n) {
+            } else if self.own_has(m, n, |g| matches!(g, Global::Event(_))) {
                 "an event"
             } else if builtins::constant(n).is_some() {
                 "a built-in constant"
@@ -2867,8 +3159,8 @@ impl Checker {
                     .cloned()
                     .unwrap_or(Err(None)),
                 Some(_) => Err(None),
-                None => match self.const_names.get(n) {
-                    Some(&i) => self.const_vals[i].clone(),
+                None => match self.const_named(n) {
+                    Some(i) => self.const_vals[i].clone(),
                     None => Err(None),
                 },
             },
@@ -2879,9 +3171,7 @@ impl Checker {
     /// The sequence `e` names, if it is a name that is not shadowed.
     fn seq_of(&self, e: &Expr) -> Option<usize> {
         match &e.kind {
-            ExprKind::Name(n) if self.lookup(n).is_none() => {
-                self.seq_names.iter().position(|s| s == n)
-            }
+            ExprKind::Name(n) if self.lookup(n).is_none() => self.seq_named(n),
             _ => None,
         }
     }
@@ -2911,11 +3201,13 @@ impl Checker {
     /// Record that the current definition uses `name`, for the recursion
     /// check.
     fn note_use(&mut self, name: &str, at: Span) {
-        if let Some(me) = &self.current {
+        if self.current.is_some()
+            && let Some(callee) = self.def_named(name)
+        {
             self.calls
-                .entry(me.clone())
+                .entry(self.current_def)
                 .or_default()
-                .push((name.to_owned(), at));
+                .push((callee, at));
         }
     }
 
@@ -2992,7 +3284,7 @@ impl Checker {
             }
             (ExprKind::Name(name), Some(exp))
                 if self.lookup(name).is_none()
-                    && (self.defs.contains_key(name) || !builtins::lookup(name).is_empty()) =>
+                    && (self.def_named(name).is_some() || !builtins::lookup(name).is_empty()) =>
             {
                 self.fn_value(name, e.span, Some(exp))
             }
@@ -3005,12 +3297,12 @@ impl Checker {
     /// The type of `name` (a fn or built-in, not a variable) used as a
     /// value, fitted to `expected` if given.
     fn fn_value(&mut self, name: &str, span: Span, expected: Option<&Type>) -> Type {
-        let sigs = match self.defs.get(name) {
-            Some(&i) => vec![self.signatures[i].clone()],
+        let sigs = match self.def_named(name) {
+            Some(i) => vec![self.signatures[i].clone()],
             None => builtins::lookup(name),
         };
-        let r = match self.defs.get(name) {
-            Some(&i) => Resolution::Def(i),
+        let r = match self.def_named(name) {
+            Some(i) => Resolution::Def(i),
             None => Resolution::Builtin(name.to_owned()),
         };
         self.resolve(span, r);
@@ -3227,18 +3519,18 @@ impl Checker {
             ExprKind::Name(n) => match self.lookup(n) {
                 Some(v) => matches!(v.kind, VarKind::Size | VarKind::Const),
                 None => {
-                    self.const_names.contains_key(n)
+                    self.const_named(n).is_some()
                         || builtins::constant(n).is_some()
                         || pitch_literal(n).is_some()
                         // A named fn is a fixed value.
-                        || self.defs.get(n).is_some_and(|&i| self.signatures[i].kind == DefKind::Fn)
+                        || self.def_named(n).is_some_and(|i| self.signatures[i].kind == DefKind::Fn)
                         || !builtins::lookup(n).is_empty()
                 }
             },
             ExprKind::Call { callee, args, .. } => {
                 let name = callee.name.as_str();
                 self.lookup(name).is_none()
-                    && !self.defs.contains_key(name)
+                    && self.def_named(name).is_none()
                     && !builtins::lookup(name).is_empty()
                     && args.iter().all(|a| self.is_const(&a.value))
             }
@@ -3254,12 +3546,12 @@ impl Checker {
     }
 
     fn check_recursion(&mut self) {
-        let mut reported: HashSet<Vec<String>> = HashSet::new();
-        for start in self.def_order.clone() {
+        let mut reported: HashSet<Vec<usize>> = HashSet::new();
+        for start in 0..self.signatures.len() {
             // Depth-first search for a path back to `start`.
-            let mut stack: Vec<(String, usize)> = vec![(start.clone(), 0)];
-            let mut on_path: Vec<String> = vec![start.clone()];
-            let mut visited: HashSet<String> = HashSet::new();
+            let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+            let mut on_path: Vec<usize> = vec![start];
+            let mut visited: HashSet<usize> = HashSet::new();
             while let Some((node, next)) = stack.last().cloned() {
                 let edges = self.calls.get(&node).cloned().unwrap_or_default();
                 if next >= edges.len() {
@@ -3274,10 +3566,10 @@ impl Checker {
                     key.sort();
                     if reported.insert(key) {
                         let mut path = on_path.clone();
-                        path.push(start.clone());
+                        path.push(start);
                         let chain = path
                             .iter()
-                            .map(|n| format!("`{n}`"))
+                            .map(|&n| format!("`{}`", self.signatures[n].name))
                             .collect::<Vec<_>>()
                             .join(" -> ");
                         let d = Diagnostic::error(*at, format!("recursion is not allowed: {chain}"))
@@ -3286,9 +3578,9 @@ impl Checker {
                     }
                     continue;
                 }
-                if visited.insert(callee.clone()) {
-                    stack.push((callee.clone(), 0));
-                    on_path.push(callee.clone());
+                if visited.insert(*callee) {
+                    stack.push((*callee, 0));
+                    on_path.push(*callee);
                 }
             }
         }
@@ -3438,6 +3730,96 @@ fn mentions_size(t: &Type, name: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// The module declaration `g` is written in. Events from `written` on are
+/// made by sequences, twelve each.
+fn global_module(modules: &Modules, written: usize, g: Global) -> usize {
+    match g {
+        Global::Def(i) => modules.item(i),
+        Global::Event(i) if i < written => modules.event(i),
+        Global::Event(i) => modules.seq((i - written) / EventKind::SEQ.len()),
+        Global::Seq(j) => modules.seq(j),
+        Global::Const(i) => modules.konst(i),
+    }
+}
+
+/// One module's own top-level declarations, by name.
+type OwnNames = HashMap<String, Vec<Global>>;
+
+/// Per module: its own declarations by name, the names it can use, and the
+/// declarations that are exported.
+fn build_scopes(program: &Program) -> (Vec<OwnNames>, Vec<Scope>, HashSet<Global>) {
+    let modules = &program.modules;
+    let n = modules.count();
+    let written = program.events.len();
+    let mut own: Vec<OwnNames> = vec![HashMap::new(); n];
+    let mut exported = HashSet::new();
+    let mut add = |name: &str, g: Global, export: bool| {
+        let m = global_module(modules, written, g);
+        own[m].entry(name.to_owned()).or_default().push(g);
+        if export {
+            exported.insert(g);
+        }
+    };
+    for (i, item) in program.items.iter().enumerate() {
+        let d = item.def();
+        add(&d.name.name, Global::Def(i), d.export.is_some());
+    }
+    for (i, e) in program.events.iter().enumerate() {
+        add(&e.name.name, Global::Event(i), e.export.is_some());
+    }
+    for (j, seq) in program.seqs.iter().enumerate() {
+        add(&seq.name.name, Global::Seq(j), seq.export.is_some());
+        for (k, kind) in EventKind::SEQ.iter().enumerate() {
+            let name = format!("{}_{}", seq.name.name, kind.suffix());
+            let i = written + j * EventKind::SEQ.len() + k;
+            add(&name, Global::Event(i), seq.export.is_some());
+        }
+    }
+    for (i, c) in program.consts.iter().enumerate() {
+        add(&c.name.name, Global::Const(i), c.export.is_some());
+    }
+
+    let scopes = (0..n)
+        .map(|m| {
+            let mut scope = Scope {
+                names: own[m].clone(),
+                imported: HashSet::new(),
+            };
+            for &t in modules.sees(m) {
+                let t = t as usize;
+                let mut names: Vec<(&String, &Vec<Global>)> = own[t].iter().collect();
+                names.sort_by_key(|(n, _)| n.as_str());
+                for (name, gs) in names {
+                    if own[m].contains_key(name) {
+                        continue;
+                    }
+                    for g in gs.iter().filter(|g| exported.contains(g)) {
+                        let entry = scope.names.entry(name.clone()).or_default();
+                        if !entry.contains(g) {
+                            entry.push(*g);
+                        }
+                        scope.imported.insert(name.clone());
+                    }
+                }
+            }
+            scope
+        })
+        .collect();
+    (own, scopes, exported)
+}
+
+/// The path module `from` imports module `to` by: both are paths from the
+/// root file's folder.
+fn relative_import(from: &str, to: &str) -> String {
+    let from_dir: Vec<&str> = from.split('/').collect::<Vec<_>>();
+    let from_dir = &from_dir[..from_dir.len().saturating_sub(1)];
+    let to: Vec<&str> = to.split('/').collect();
+    let common = from_dir.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<&str> = vec![".."; from_dir.len() - common];
+    parts.extend(&to[common..]);
+    parts.join("/")
 }
 
 /// The names a `const`'s value uses, for working out the order to check
@@ -3988,18 +4370,26 @@ pub fn check_entry(
     checked: &Checked,
     entry: &str,
 ) -> Result<(), Vec<Diagnostic>> {
-    let found = program
-        .items
-        .iter()
-        .zip(&checked.signatures)
-        .find(|(item, _)| item.def().name.name == entry);
-    let Some((item, sig)) = found else {
-        let rills: Vec<&str> = program
+    // The entry is looked up in the root file, along with what it imports.
+    let found = match checked.scopes.first() {
+        Some(scope) => scope.def(entry),
+        None => program
             .items
             .iter()
-            .filter(|i| matches!(i, Item::Rill(_)))
-            .map(|i| i.def().name.name.as_str())
+            .position(|i| i.def().name.name == entry),
+    }
+    .map(|i| (&program.items[i], &checked.signatures[i]));
+    let Some((item, sig)) = found else {
+        // The rills the root file can run: its own, then imported ones.
+        let usable = |i: usize| match checked.scopes.first() {
+            Some(scope) => scope.def(&program.items[i].def().name.name) == Some(i),
+            None => true,
+        };
+        let mut rills: Vec<&str> = (0..program.items.len())
+            .filter(|&i| matches!(program.items[i], Item::Rill(_)) && usable(i))
+            .map(|i| program.items[i].def().name.name.as_str())
             .collect();
+        rills.dedup();
         let d = Diagnostic::error(
             Span::default(),
             format!("there is no rill named `{entry}` to run"),

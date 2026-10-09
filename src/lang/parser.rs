@@ -4,7 +4,9 @@
 //!
 //! ```text
 //! program := item*
-//! item    := "fn" def | "rill" def | event | const
+//! program := ("export"? (item | import))*
+//! import  := "import" STRING
+//! item    := "fn" def | "rill" def | event | seq | const
 //! const   := "const" NAME (":" type)? "=" expr
 //! event   := "event" NAME NAME ("(" (NAME ":" expr),* ")")?
 //! seq     := "seq" NAME ("(" (NAME ":" expr),* ")")? "{" (step ","?)* "}"
@@ -56,7 +58,7 @@ use super::diag::{Diagnostic, Span};
 use super::lexer::{Token, TokenKind};
 
 pub fn parse(src: &str, tokens: Vec<Token>) -> Result<Program, Vec<Diagnostic>> {
-    let (program, errors) = Parser::new(src, tokens, false).program();
+    let (program, errors) = Parser::new(src, tokens, false, 0, 0).program();
     if errors.is_empty() {
         Ok(program)
     } else {
@@ -70,7 +72,20 @@ pub fn parse(src: &str, tokens: Vec<Token>) -> Result<Program, Vec<Diagnostic>> 
 /// where the next definition starts) is closed there. The program always
 /// comes back, along with every error found.
 pub fn parse_partial(src: &str, tokens: Vec<Token>) -> (Program, Vec<Diagnostic>) {
-    Parser::new(src, tokens, true).program()
+    Parser::new(src, tokens, true, 0, 0).program()
+}
+
+/// Parse one file of a program made of several (see [`super::module`]):
+/// its tokens' spans start at `base`, and its expression ids at
+/// `first_id`. With `recover`, as [`parse_partial`].
+pub fn parse_file(
+    src: &str,
+    tokens: Vec<Token>,
+    base: u32,
+    first_id: u32,
+    recover: bool,
+) -> (Program, Vec<Diagnostic>) {
+    Parser::new(src, tokens, recover, base, first_id).program()
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -85,18 +100,27 @@ struct Parser<'a> {
     errors: Vec<Diagnostic>,
     /// Recover inside blocks too; see [`parse_partial`].
     recover: bool,
+    /// Where the file's text starts in the program's spans.
+    base: u32,
 }
 
 impl<'a> Parser<'a> {
-    fn new(src: &'a str, tokens: Vec<Token>, recover: bool) -> Parser<'a> {
+    fn new(
+        src: &'a str,
+        tokens: Vec<Token>,
+        recover: bool,
+        base: u32,
+        first_id: u32,
+    ) -> Parser<'a> {
         Parser {
             src,
             tokens,
             pos: 0,
             nest: 0,
-            next_id: 0,
+            next_id: first_id,
             errors: Vec::new(),
             recover,
+            base,
         }
     }
 
@@ -105,7 +129,29 @@ impl<'a> Parser<'a> {
         let mut events = Vec::new();
         let mut seqs = Vec::new();
         let mut consts = Vec::new();
+        let mut imports = Vec::new();
         while !self.at(TokenKind::Eof) {
+            let export = self.eat(TokenKind::Export).map(|t| t.span);
+            if export.is_some() && !self.at_exportable() {
+                let err = self
+                    .unexpected("`fn`, `rill`, `const`, `event`, `seq` or `import` after `export`")
+                    .with_help("`export` makes a top-level definition usable by files that import this one");
+                self.errors.push(err);
+                self.recover();
+                continue;
+            }
+            // Spans of what is exported start at `export`.
+            let with_export = |span: Span| export.map_or(span, |e| e.to(span));
+            if self.at(TokenKind::Import) {
+                match self.import(export) {
+                    Ok(i) => imports.push(i),
+                    Err(err) => {
+                        self.errors.push(err);
+                        self.recover();
+                    }
+                }
+                continue;
+            }
             if self.at(TokenKind::Const) {
                 let decl = self.const_decl().and_then(|c| {
                     if self.eat(TokenKind::Semi).is_none()
@@ -117,7 +163,11 @@ impl<'a> Parser<'a> {
                     Ok(c)
                 });
                 match decl {
-                    Ok(c) => consts.push(c),
+                    Ok(mut c) => {
+                        c.export = export;
+                        c.span = with_export(c.span);
+                        consts.push(c)
+                    }
                     Err(err) => {
                         self.errors.push(err);
                         self.recover();
@@ -127,7 +177,11 @@ impl<'a> Parser<'a> {
             }
             if self.at_ident("seq") && self.peek_at(1).kind == TokenKind::Ident {
                 match self.seq_decl() {
-                    Ok(s) => seqs.push(s),
+                    Ok(mut s) => {
+                        s.export = export;
+                        s.span = with_export(s.span);
+                        seqs.push(s)
+                    }
                     Err(err) => {
                         self.errors.push(err);
                         self.recover();
@@ -137,7 +191,11 @@ impl<'a> Parser<'a> {
             }
             if self.at_ident("event") {
                 match self.event_decl() {
-                    Ok(e) => events.push(e),
+                    Ok(mut e) => {
+                        e.export = export;
+                        e.span = with_export(e.span);
+                        events.push(e)
+                    }
                     Err(err) => {
                         self.errors.push(err);
                         self.recover();
@@ -146,7 +204,12 @@ impl<'a> Parser<'a> {
                 continue;
             }
             match self.item() {
-                Ok(item) => items.push(item),
+                Ok(mut item) => {
+                    let d = item.def_mut();
+                    d.export = export;
+                    d.span = with_export(d.span);
+                    items.push(item)
+                }
                 Err(err) => {
                     self.errors.push(err);
                     self.recover();
@@ -158,6 +221,8 @@ impl<'a> Parser<'a> {
             events,
             seqs,
             consts,
+            imports,
+            modules: Modules::default(),
             expr_count: self.next_id,
         };
         (program, self.errors)
@@ -207,7 +272,7 @@ impl Parser<'_> {
     }
 
     fn text(&self, t: Token) -> &str {
-        &self.src[t.span.start as usize..t.span.end as usize]
+        &self.src[(t.span.start - self.base) as usize..(t.span.end - self.base) as usize]
     }
 
     /// Return types follow the parameters directly; `->` is a leftover
@@ -256,6 +321,8 @@ impl Parser<'_> {
                 && (self.at(TokenKind::Fn)
                     || self.at(TokenKind::Rill)
                     || self.at(TokenKind::Const)
+                    || self.at(TokenKind::Import)
+                    || self.at(TokenKind::Export)
                     || self.at_ident("event")
                     || self.at_ident("seq")))
         {
@@ -348,6 +415,7 @@ impl Parser<'_> {
 
         let body = self.block()?;
         Ok(Def {
+            export: None,
             name,
             generics,
             params,
@@ -484,6 +552,16 @@ impl Parser<'_> {
                 }
             }
             TokenKind::Const => Stmt::Const(self.const_decl()?),
+            TokenKind::Import | TokenKind::Export => {
+                let word = if self.at(TokenKind::Import) {
+                    "import"
+                } else {
+                    "export"
+                };
+                return Err(self.unexpected("a statement").with_help(format!(
+                    "`{word}` only works at the top level of a file, outside any definition"
+                )));
+            }
             TokenKind::Return => {
                 self.bump();
                 let value = self.expr()?;
@@ -600,8 +678,45 @@ impl Parser<'_> {
 
     /// At `fn name` or `rill name`: a definition, not an anonymous fn.
     fn at_def_start(&self) -> bool {
-        (self.at(TokenKind::Fn) || self.at(TokenKind::Rill))
-            && self.peek_at(1).kind == TokenKind::Ident
+        ((self.at(TokenKind::Fn) || self.at(TokenKind::Rill))
+            && self.peek_at(1).kind == TokenKind::Ident)
+            || self.at(TokenKind::Import)
+            || self.at(TokenKind::Export)
+    }
+
+    /// At something `export` can go before.
+    fn at_exportable(&self) -> bool {
+        self.at(TokenKind::Fn)
+            || self.at(TokenKind::Rill)
+            || self.at(TokenKind::Const)
+            || self.at(TokenKind::Import)
+            || self.at_ident("event")
+            || (self.at_ident("seq") && self.peek_at(1).kind == TokenKind::Ident)
+    }
+
+    /// `import "path"`, after any `export`.
+    fn import(&mut self, export: Option<Span>) -> PResult<Import> {
+        let start = self.expect(TokenKind::Import, "")?.span;
+        let Some(t) = self.eat(TokenKind::Str) else {
+            return Err(self
+                .unexpected("the module's path in quotes")
+                .with_help("as in `import \"osc\"` for `osc.rill` next to this file"));
+        };
+        let text = self.text(t);
+        let path = text[1..text.len().saturating_sub(1).max(1)].to_owned();
+        if self.eat(TokenKind::Semi).is_none()
+            && !self.at(TokenKind::Eof)
+            && !self.peek().newline_before
+        {
+            return Err(self.unexpected("a line break or `;` after the import"));
+        }
+        Ok(Import {
+            export,
+            path,
+            path_span: t.span,
+            span: export.map_or(start, |e| e.to(start)).to(t.span),
+            module: None,
+        })
     }
 
     /// After the statement starting at token `stmt_start` failed to parse:
@@ -711,6 +826,7 @@ impl Parser<'_> {
         self.expect(TokenKind::Assign, "and a value: a `const` always has one")?;
         let value = self.expr()?;
         Ok(ConstDecl {
+            export: None,
             name,
             ty,
             value,
@@ -750,6 +866,7 @@ impl Parser<'_> {
         self.expect(TokenKind::RBrace, "or `,` between steps")?;
         self.nest -= 1;
         Ok(SeqDecl {
+            export: None,
             name,
             settings,
             steps,
@@ -782,6 +899,7 @@ impl Parser<'_> {
             return Err(self.unexpected("a line break or `;` after the event declaration"));
         }
         Ok(EventDecl {
+            export: None,
             name,
             kind,
             filters,

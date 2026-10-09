@@ -21,6 +21,7 @@
 use super::ast::*;
 use super::check::Checked;
 use super::diag::Span;
+use super::module::SourceMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Style {
@@ -138,8 +139,8 @@ impl Node {
 
 /// Render `program` as a tree annotated with the types in `checked`, with
 /// ANSI colours if `color` is set.
-pub fn tree(src: &str, program: &Program, checked: &Checked, color: bool) -> String {
-    let p = Printer { src, checked };
+pub fn tree(sources: &SourceMap, program: &Program, checked: &Checked, color: bool) -> String {
+    let p = Printer { sources, checked };
     // Definitions and declarations, in source order.
     let mut nodes: Vec<(u32, Node)> = program
         .items
@@ -187,7 +188,7 @@ fn render(node: &Node, first: &str, rest: &str, color: bool, out: &mut String) {
 }
 
 struct Printer<'a> {
-    src: &'a str,
+    sources: &'a SourceMap,
     checked: &'a Checked,
 }
 
@@ -197,7 +198,7 @@ fn size_span(size: &SizeExpr) -> Span {
 
 impl Printer<'_> {
     fn text(&self, span: Span) -> &str {
-        &self.src[span.start as usize..span.end as usize]
+        self.sources.slice(span)
     }
 
     /// `event keys note_on(sender: 5, channel: 1)`
@@ -618,7 +619,10 @@ rill main Sample
          ├─ y : [Sample; 2]
          └─ 0 : number
 ";
-        assert_eq!(tree(SRC, &program, &checked, false), expected);
+        assert_eq!(
+            tree(&SourceMap::single("t", SRC), &program, &checked, false),
+            expected
+        );
     }
 
     #[test]
@@ -631,7 +635,7 @@ rill main() Sample {
 }
 ";
         let (program, checked) = crate::lang::compile(src).unwrap();
-        let out = tree(src, &program, &checked, false);
+        let out = tree(&SourceMap::single("t", src), &program, &checked, false);
         let expected = "\
    ├─ let f: fn(Pitch) Freq
    │  └─ fn : fn(Pitch) Freq

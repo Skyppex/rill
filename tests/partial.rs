@@ -48,6 +48,9 @@ fn resolution_at(checked: &Checked, span: Span) -> &Resolution {
 fn strict_and_partial_agree_on_valid_programs() {
     for entry in std::fs::read_dir("examples").unwrap() {
         let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "rill") {
+            continue;
+        }
         let src = std::fs::read_to_string(&path).unwrap();
         let strict = rill::lang::parse(&src).unwrap();
         let (program, checked, errors) = analyze(&src);

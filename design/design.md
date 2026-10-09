@@ -404,6 +404,35 @@ Rules:
 - Recursion is still not allowed, including through function values.
 - At build time every call of a function value is replaced by the function's body, so function values cost nothing while playing. A function chosen while playing becomes a branch between the candidates; only the chosen one runs.
 
+## Modules
+
+A file is a module. A file names the files it uses with `import`, and sees only what they `export`.
+
+```rill
+// osc.rill
+fn blep(t: Float, dt: Float) Float { ... }      // private: only osc.rill sees it
+export rill saw(freq: Freq) Sample { ... }
+
+// synth.rill
+export import "osc"                             // importers of synth get saw too
+import "fx"                                     // only synth sees fx's exports
+export const VOICES = 4
+export rill pad(pitch: Freq) Sample { return saw(pitch) |> lowpass() }
+
+// song.rill
+import "synth"
+rill main() Sample { return pad(110Hz) + saw(55Hz) * 0.1 }
+```
+
+- **Exports.** `export` goes before `fn`, `rill`, `const`, `event`, `seq` or `import`. Everything else is private to its file. Exporting a sequence exports the events it makes and its fields.
+- **Re-exports.** `export import "b"` passes on everything `b` exports, including what `b` passes on; `b` is imported in the file as well. Importing that file gives both.
+- **Paths** are relative to the importing file, with `/` between folders and `..` for the folder above: `import "lib/osc"` reads `lib/osc.rill`. The extension is never written; `import "osc.rill"` is an error, and any other extension is not a Rill file. Every part of a path is a name as in code (a letter or `_`, then letters, digits or `_`, and not a keyword), so `my-osc.rill` cannot be imported: the `-` would read as minus. A file named that way can still be run.
+- **Names.** Imported names are used as they are: `saw`, not `osc.saw`. A file's own declaration wins over an imported one with the same name. Two imports exporting different things by one name is an error only where the name is used; one thing reached by two routes is not a clash.
+- **One program.** The program is every file reachable from the one being run, each loaded once. A file reached by two routes is one file: its sequences and `const`s exist once.
+- **Cycles** are allowed: files can import each other, and re-export each other. Recursion across files is still recursion.
+- **The entry** is looked up in the file being run, including what it imports. Every file can have its own private `main` to try it out alone. A file that exports something is a library, and `rill check` does not need it to have a `main`.
+- `import` and `export` are keywords, and only work at the top level of a file.
+
 ## Execution model
 
 A Rill program runs in two stages: a build stage that may do anything, and a run stage that only executes a frozen graph inside the audio callback.

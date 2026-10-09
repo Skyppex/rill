@@ -1,0 +1,6 @@
+// The notes. Exporting a sequence exports the events it makes, such as
+// `riff_note_on` and `riff_step`, and its fields, such as `riff.step_count`.
+
+export seq riff(step: 1/8, tempo: 100bpm) {
+    C4, E4, G4, _, [C4, E4]@0.6, _, B3, _,
+}

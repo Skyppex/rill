@@ -64,9 +64,6 @@ impl SourceArgs {
             let patch = self.patch.as_deref().expect("required by clap");
             return Ok(patches::by_name(patch, self.freq, self.gain).expect("validated by clap"));
         };
-        let src = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let name = path.display().to_string();
         let seed = self
             .seed
             .unwrap_or_else(|| *PICKED_SEED.get_or_init(rill::lang::build::new_seed));
@@ -74,15 +71,12 @@ impl SourceArgs {
             seed: Some(seed),
             ..options.clone()
         };
-        let built = rill::lang::compile(&src).and_then(|(program, checked)| {
-            let graph =
-                rill::lang::build::build_with(&program, &checked, config, &self.entry, &options)?;
-            Ok((graph, checked))
-        });
+        let (sources, built) =
+            rill::lang::load_file(path, &rill::lang::Disk, config, &self.entry, &options);
         match built {
             Ok((graph, checked)) => {
                 for w in &checked.warnings {
-                    eprint!("{}", w.render(&name, &src));
+                    eprint!("{}", sources.render(w));
                 }
                 if self.seed.is_none() && checked.uses_builtin("random") {
                     static SHOWN: std::sync::Once = std::sync::Once::new();
@@ -94,10 +88,10 @@ impl SourceArgs {
             }
             Err(diags) => {
                 for d in &diags {
-                    eprint!("{}", d.render(&name, &src));
+                    eprint!("{}", sources.render(d));
                 }
                 let errors = diags.iter().filter(|d| d.is_error()).count();
-                Err(format!("{name}: {errors} error(s)"))
+                Err(format!("{}: {errors} error(s)", path.display()))
             }
         }
     }
@@ -464,21 +458,25 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Check(args) => match args.view {
             Some(CheckView::Ast { file, entry, color }) => {
-                let (src, program, checked) = check_file(&file, &entry)?;
-                let tree = rill::lang::pretty::tree(&src, &program, &checked, color.enabled());
+                let (sources, program, checked) = check_file(&file, &entry)?;
+                let tree = rill::lang::pretty::tree(&sources, &program, &checked, color.enabled());
                 print!("{tree}");
             }
             None => {
                 let file = args.file.expect("required by clap");
-                let (_, _, checked) = check_file(&file, &args.entry)?;
+                let (sources, _, checked) = check_file(&file, &args.entry)?;
                 if args.signatures {
                     for sig in &checked.signatures {
                         println!("{sig}");
                     }
                 }
                 let count = |k| checked.signatures.iter().filter(|s| s.kind == k).count();
+                let files = match sources.files.len() {
+                    1 => String::new(),
+                    n => format!("{n} files, "),
+                };
                 println!(
-                    "{}: ok ({} fn, {} rill)",
+                    "{}: ok ({files}{} fn, {} rill)",
                     file.display(),
                     count(rill::lang::types::DefKind::Fn),
                     count(rill::lang::types::DefKind::Rill)
@@ -719,28 +717,56 @@ fn profile(
     Ok(())
 }
 
+/// Whether the root file of `program` exports anything.
+fn is_library(program: &rill::lang::ast::Program) -> bool {
+    let root = |m: usize| m == 0;
+    let m = &program.modules;
+    (0..program.items.len()).any(|i| root(m.item(i)) && program.items[i].def().export.is_some())
+        || (0..program.seqs.len()).any(|i| root(m.seq(i)) && program.seqs[i].export.is_some())
+        || (0..program.events.len()).any(|i| root(m.event(i)) && program.events[i].export.is_some())
+        || (0..program.consts.len()).any(|i| root(m.konst(i)) && program.consts[i].export.is_some())
+        || (0..program.imports.len())
+            .any(|i| root(m.import(i)) && program.imports[i].export.is_some())
+}
+
 /// Parse and check `file`, with `entry` as the rill it starts at, printing
 /// diagnostics to stderr. Fails if there were any errors.
 fn check_file(
     file: &std::path::Path,
     entry: &str,
-) -> Result<(String, rill::lang::ast::Program, rill::lang::Checked), Box<dyn std::error::Error>> {
-    let src = std::fs::read_to_string(file)
-        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-    let name = file.display().to_string();
-    match rill::lang::compile_entry(&src, entry) {
+) -> Result<
+    (
+        rill::lang::SourceMap,
+        rill::lang::ast::Program,
+        rill::lang::Checked,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    // A file that exports something is a library: it need not run on its
+    // own, unless asked to with `--entry`.
+    let (sources, result) = match rill::lang::compile_file(file, &rill::lang::Disk) {
+        (sources, Ok((program, checked)))
+            if entry == rill::lang::build::DEFAULT_ENTRY
+                && is_library(&program)
+                && checked.scopes.first().and_then(|s| s.def(entry)).is_none() =>
+        {
+            (sources, Ok((program, checked)))
+        }
+        _ => rill::lang::compile_file_entry(file, entry, &rill::lang::Disk),
+    };
+    match result {
         Ok((program, checked)) => {
             for w in &checked.warnings {
-                eprint!("{}", w.render(&name, &src));
+                eprint!("{}", sources.render(w));
             }
-            Ok((src, program, checked))
+            Ok((sources, program, checked))
         }
         Err(diags) => {
             for d in &diags {
-                eprint!("{}", d.render(&name, &src));
+                eprint!("{}", sources.render(d));
             }
             let errors = diags.iter().filter(|d| d.is_error()).count();
-            Err(format!("{name}: {errors} error(s)").into())
+            Err(format!("{}: {errors} error(s)", file.display()).into())
         }
     }
 }

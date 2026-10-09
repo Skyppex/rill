@@ -136,6 +136,33 @@ fn examples_are_block_size_invariant() {
     }
 }
 
+#[test]
+fn the_example_made_of_several_files_runs() {
+    let path = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/modules/song.rill"
+    ));
+    let options = lang::build::Options {
+        seed: Some(0),
+        ..Default::default()
+    };
+    let render = |blocks: Blocks| {
+        let (map, result) = lang::load_file(path, &lang::Disk, &config(2), "main", &options);
+        let graph = match result {
+            Ok((graph, _)) => graph,
+            Err(diags) => panic!(
+                "{}",
+                diags.iter().map(|d| map.render(d)).collect::<String>()
+            ),
+        };
+        let mut engine = Engine::new(graph, config(2)).unwrap();
+        offline::render(&mut engine, 10_000, &blocks)
+    };
+    let reference = render(Blocks::Fixed(256));
+    assert!(reference.iter().any(|&x| x != 0.0));
+    assert!(render(Blocks::Fixed(1)) == reference);
+}
+
 // ---- the build stage ----------------------------------------------------
 
 #[test]

@@ -9,32 +9,110 @@
 
 use std::fmt;
 
-/// The kinds of event a program can declare.
+/// The kinds of event. The first three can be declared and sent by hosts;
+/// the rest are made by sequences only (see [`EventKind::SEQ`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EventKind {
     NoteOn,
     NoteOff,
     ControlChange,
+    /// An instance starts playing.
+    Start,
+    /// An instance's last pass is over.
+    Finished,
+    /// An instance is stopped early, by `halt` or a restarting `trigger`.
+    Halted,
+    /// An instance is stopped to make room for a new one.
+    Replaced,
+    /// An instance stops, for any of the three reasons above.
+    End,
+    /// An instance goes back to step 1 for another pass.
+    Repeated,
+    Step,
+    /// A step with no notes.
+    Rest,
+    Beat,
+    Bar,
 }
 
 impl EventKind {
+    /// The kinds a program can declare, as in `event keys note_on`.
     pub const ALL: [EventKind; 3] = [
         EventKind::NoteOn,
         EventKind::NoteOff,
         EventKind::ControlChange,
     ];
 
-    /// The keyword used in declarations, as in `event keys note_on`.
+    /// The events every sequence makes, named after it: `riff_note_on`,
+    /// `riff_start` and so on (see [`EventKind::suffix`]).
+    pub const SEQ: [EventKind; 12] = [
+        EventKind::NoteOn,
+        EventKind::NoteOff,
+        EventKind::Start,
+        EventKind::Finished,
+        EventKind::Halted,
+        EventKind::Replaced,
+        EventKind::End,
+        EventKind::Repeated,
+        EventKind::Step,
+        EventKind::Rest,
+        EventKind::Beat,
+        EventKind::Bar,
+    ];
+
+    /// The keyword used in declarations, as in `event keys note_on`; for
+    /// the kinds only sequences make, `seq_` and their suffix.
     pub fn name(self) -> &'static str {
         match self {
             EventKind::NoteOn => "note_on",
             EventKind::NoteOff => "note_off",
             EventKind::ControlChange => "control_change",
+            EventKind::Start => "seq_start",
+            EventKind::Finished => "seq_finished",
+            EventKind::Halted => "seq_halted",
+            EventKind::Replaced => "seq_replaced",
+            EventKind::End => "seq_end",
+            EventKind::Repeated => "seq_repeated",
+            EventKind::Step => "seq_step",
+            EventKind::Rest => "seq_rest",
+            EventKind::Beat => "seq_beat",
+            EventKind::Bar => "seq_bar",
         }
     }
 
+    /// What follows a sequence's name in the event it makes of this kind:
+    /// `riff_` + `step`.
+    pub fn suffix(self) -> &'static str {
+        self.name().strip_prefix("seq_").unwrap_or(self.name())
+    }
+
+    /// The type a handler's parameter has, as in `on keys(note: NoteOn)`.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            EventKind::NoteOn => "NoteOn",
+            EventKind::NoteOff => "NoteOff",
+            EventKind::ControlChange => "Float",
+            EventKind::Start => "SeqStart",
+            EventKind::Finished => "SeqFinished",
+            EventKind::Halted => "SeqHalted",
+            EventKind::Replaced => "SeqReplaced",
+            EventKind::End => "SeqEnd",
+            EventKind::Repeated => "SeqRepeated",
+            EventKind::Step => "SeqStep",
+            EventKind::Rest => "SeqRest",
+            EventKind::Beat => "SeqBeat",
+            EventKind::Bar => "SeqBar",
+        }
+    }
+
+    /// A kind a program can declare, by its keyword.
     pub fn from_name(name: &str) -> Option<EventKind> {
         EventKind::ALL.into_iter().find(|k| k.name() == name)
+    }
+
+    /// Made by sequences only.
+    pub fn is_seq_only(self) -> bool {
+        !EventKind::ALL.contains(&self)
     }
 
     /// Names of the payload's values, in the order a handler receives them.
@@ -43,6 +121,15 @@ impl EventKind {
             EventKind::NoteOn => &["pitch", "velocity", "instance"],
             EventKind::NoteOff => &["pitch", "release", "instance"],
             EventKind::ControlChange => &["value"],
+            EventKind::Start
+            | EventKind::Finished
+            | EventKind::Halted
+            | EventKind::Replaced
+            | EventKind::End => &["instance", "step"],
+            EventKind::Repeated => &["instance", "pass"],
+            EventKind::Step | EventKind::Rest => &["instance", "step", "pass"],
+            EventKind::Beat => &["instance", "beat", "bar", "pass"],
+            EventKind::Bar => &["instance", "bar", "pass"],
         }
     }
 }
@@ -53,10 +140,15 @@ impl fmt::Display for EventKind {
     }
 }
 
+/// The most values a payload has.
+pub const MAX_FIELDS: usize = 4;
+
 /// What happened. Pitches are Rill `Pitch` values, which count semitones
 /// like MIDI note numbers (A4 is 69); velocities and releases are 0–1.
 /// `instance` is the id of the sequence instance that played a note, and 0
 /// for notes from the host. A control change's value is passed on as it is.
+/// The events only sequences make carry whole numbers, in
+/// [`EventKind::fields`] order.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Payload {
     NoteOn {
@@ -70,6 +162,10 @@ pub enum Payload {
         instance: i32,
     },
     Control(f32),
+    Seq {
+        kind: EventKind,
+        values: [i32; MAX_FIELDS],
+    },
 }
 
 impl Payload {
@@ -78,29 +174,31 @@ impl Payload {
             Payload::NoteOn { .. } => EventKind::NoteOn,
             Payload::NoteOff { .. } => EventKind::NoteOff,
             Payload::Control(_) => EventKind::ControlChange,
+            Payload::Seq { kind, .. } => *kind,
         }
     }
 
     /// The values in [`EventKind::fields`] order.
-    pub fn values(&self) -> [f32; 3] {
+    pub fn values(&self) -> [f32; MAX_FIELDS] {
         match *self {
             Payload::NoteOn {
                 pitch,
                 velocity,
                 instance,
-            } => [pitch, velocity, instance as f32],
+            } => [pitch, velocity, instance as f32, 0.0],
             Payload::NoteOff {
                 pitch,
                 release,
                 instance,
-            } => [pitch, release, instance as f32],
-            Payload::Control(value) => [value, 0.0, 0.0],
+            } => [pitch, release, instance as f32, 0.0],
+            Payload::Control(value) => [value, 0.0, 0.0, 0.0],
+            Payload::Seq { values, .. } => values.map(|v| v as f32),
         }
     }
 
     /// The payload of kind `kind` with `values` in [`EventKind::fields`]
     /// order.
-    pub fn from_values(kind: EventKind, values: [f32; 3]) -> Payload {
+    pub fn from_values(kind: EventKind, values: [f32; MAX_FIELDS]) -> Payload {
         match kind {
             EventKind::NoteOn => Payload::NoteOn {
                 pitch: values[0],
@@ -113,6 +211,10 @@ impl Payload {
                 instance: values[2] as i32,
             },
             EventKind::ControlChange => Payload::Control(values[0]),
+            kind => Payload::Seq {
+                kind,
+                values: values.map(|v| v as i32),
+            },
         }
     }
 
@@ -125,7 +227,7 @@ impl Payload {
             | Payload::NoteOff {
                 pitch, instance, ..
             } => Some((pitch, instance)),
-            Payload::Control(_) => None,
+            Payload::Control(_) | Payload::Seq { .. } => None,
         }
     }
 }
@@ -212,7 +314,7 @@ pub fn parse_dispatch(
             }
         },
     };
-    let mut values = [0.0f32; 3];
+    let mut values = [0.0f32; MAX_FIELDS];
     let (mut sender, mut channel) = (0u32, 0u32);
     for (name, value) in fields {
         let whole = |what: &str| {

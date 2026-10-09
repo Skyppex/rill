@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 
-use crate::event::{EventDecl, EventId, Payload, Sender};
+use crate::event::{EventDecl, EventId, EventKind, Payload, Sender};
 use crate::node::{Context, Inputs, Node, Outputs};
 use crate::ops::{Op1, Op2};
 
@@ -516,6 +516,8 @@ pub struct SeqTable {
     pub repeat: u32,
     pub looping: bool,
     pub instances: u16,
+    /// The top of the meter: beats in a bar.
+    pub beats_per_bar: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -689,6 +691,18 @@ struct Slot {
     captures: Vec<f32>,
     /// Notes sounding: pitch, and the position their note-off is due.
     held: Vec<(f32, f64)>,
+    /// The pass it is on, from 1.
+    pass: u32,
+    /// The step it is on (the last one started), from 0.
+    current: usize,
+    /// The next beat to mark, counted from the start of the pass.
+    beat: u32,
+    /// What has been sent for the bar, beat or step about to happen.
+    bar_sent: bool,
+    step_sent: bool,
+    rest_sent: bool,
+    /// `finished` has been sent; `end` comes next.
+    finishing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -716,8 +730,8 @@ enum Pending {
     Start,
     /// A declared event, from `from`.
     To(EventId, Payload, Sender),
-    /// A note from a sequence: every declaration that accepts it.
-    Note(Sender, Payload),
+    /// Something a sequence did: every declaration that accepts it.
+    Seq(Sender, Payload),
 }
 
 /// Everything that changes while a [`Program`] runs.
@@ -739,6 +753,19 @@ struct Run {
     /// delivery that was.
     picks: Vec<(u64, Option<u16>)>,
     delivery: u64,
+    /// Per sequence, a bit per [`EventKind`] that some handler hears from
+    /// it; the others are not delivered at all.
+    wanted: Vec<u16>,
+}
+
+impl Run {
+    /// Queue `payload` from sequence `seq`, if anything handles it.
+    fn send(&mut self, seq: usize, payload: Payload) {
+        if self.wanted[seq] & (1 << payload.kind() as u16) != 0 {
+            self.queue
+                .push_back(Pending::Seq(Sender::Seq(seq as u16), payload));
+        }
+    }
 }
 
 /// Runs a compiled program as an engine node.
@@ -822,9 +849,36 @@ impl Program {
             tail: 0,
         };
         let voices = code.pools.iter().map(|p| vec![voice; p.len()]).collect();
-        // Every handler can queue a few events; this is a generous bound,
-        // so the queue does not grow while playing.
-        let queue = 64 + 8 * code.events.len() + 4 * code.seqs.len();
+        // Every handler can queue a few events, and stopping every instance
+        // of a sequence at once queues their note-offs, `halted` and `end`;
+        // this is a generous bound, so the queue does not grow while playing.
+        let stops: usize = code
+            .seqs
+            .iter()
+            .map(|t| {
+                let chord = t.steps.iter().map(|s| s.pitches.len()).max().unwrap_or(0);
+                usize::from(t.instances) * (2 * chord + 4)
+            })
+            .sum();
+        let queue = 64 + 8 * code.events.len() + 4 * code.seqs.len() + stops;
+        let wanted = (0..code.seqs.len())
+            .map(|j| {
+                let from = Sender::Seq(j as u16);
+                let mut bits = 0u16;
+                for (i, d) in code.decls.iter().enumerate() {
+                    let handled = code
+                        .events
+                        .iter()
+                        .any(|h| h.handles == Handles::Event(EventId(i as u16)));
+                    for kind in EventKind::SEQ {
+                        if handled && d.accepts(from, 0, kind) {
+                            bits |= 1 << kind as u16;
+                        }
+                    }
+                }
+                bits
+            })
+            .collect();
         let mut p = Program {
             run: Run {
                 regs: vec![0.0; code.regs].into_boxed_slice(),
@@ -838,6 +892,7 @@ impl Program {
                 rate: 48_000.0,
                 picks: vec![(0, None); code.pools.len()],
                 delivery: 0,
+                wanted,
             },
             code,
             tick,
@@ -863,7 +918,7 @@ impl Program {
                 Pending::To(id, payload, from) => {
                     self.run_handlers(Handles::Event(id), Some(payload), from)
                 }
-                Pending::Note(from, payload) => {
+                Pending::Seq(from, payload) => {
                     for i in 0..self.code.decls.len() {
                         if self.code.decls[i].accepts(from, 0, payload.kind()) {
                             let id = EventId(i as u16);
@@ -989,14 +1044,32 @@ impl Program {
         pick
     }
 
-    /// Notes of every playing sequence that are due now.
+    /// Everything every playing sequence does now. Handlers can start
+    /// instances, which then make their first step in the same sample, so
+    /// this goes round again until nothing more happens (a few times at
+    /// most; the checker rejects anything that could go on forever).
     fn fire_sequences(&mut self) {
-        for j in 0..self.code.seqs.len() {
-            for k in 0..self.run.slots[j].len() {
-                while let Some(p) = next_note(&self.code.seqs[j], j, &mut self.run.slots[j][k]) {
-                    self.deliver(p);
+        for _ in 0..16 {
+            let mut any = false;
+            for j in 0..self.code.seqs.len() {
+                for k in 0..self.run.slots[j].len() {
+                    while let Some(p) = next_event(&self.code.seqs[j], &mut self.run.slots[j][k]) {
+                        any = true;
+                        self.run.send(j, p);
+                        self.deliver_queued();
+                    }
                 }
             }
+            if !any {
+                break;
+            }
+        }
+    }
+
+    /// Run what is queued, unless a delivery is already running.
+    fn deliver_queued(&mut self) {
+        if let Some(p) = self.run.queue.pop_front() {
+            self.deliver(p);
         }
     }
 
@@ -1041,10 +1114,11 @@ fn val(regs: &[f32], o: Operand) -> f32 {
     }
 }
 
-/// The next due note of `slot` (an instance of sequence `seq`), moving it
-/// on; `None` when nothing more is due this tick.
-fn next_note(table: &SeqTable, seq: usize, slot: &mut Slot) -> Option<Pending> {
-    let from = Sender::Seq(seq as u16);
+/// The next thing `slot` (an instance of a sequence with `table`) does
+/// now, moving it on; `None` when nothing more is due this tick. At the same
+/// moment, in order: note-offs; finishing (`finished`, `end`) or going round
+/// (`repeated`); `bar`; `beat`; `step`; `rest`; note-ons.
+fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
     let sb = table.step_beats;
     let len = table.steps.len();
     let total = len as f64 * sb;
@@ -1052,70 +1126,137 @@ fn next_note(table: &SeqTable, seq: usize, slot: &mut Slot) -> Option<Pending> {
         if !slot.active {
             return None;
         }
-        if let Some(h) = slot.held.iter().position(|&(_, off)| off <= slot.pos + EPS) {
+        let (id, pos, pass) = (slot.id, slot.pos, slot.pass as i32);
+        let seq = |kind, values| Some(Payload::Seq { kind, values });
+        if let Some(h) = slot.held.iter().position(|&(_, off)| off <= pos + EPS) {
             let (pitch, _) = slot.held.swap_remove(h);
-            return Some(Pending::Note(
-                from,
-                Payload::NoteOff {
-                    pitch,
-                    release: SEQ_RELEASE,
-                    instance: slot.id,
-                },
-            ));
+            return Some(Payload::NoteOff {
+                pitch,
+                release: SEQ_RELEASE,
+                instance: id,
+            });
         }
-        if slot.next < len && slot.next as f64 * sb <= slot.pos + EPS {
-            let step = &table.steps[slot.next];
-            if let Some(&pitch) = step.pitches.get(slot.chord) {
-                slot.chord += 1;
-                let gate = f64::from(slot.values[GATE].clamp(1e-6, 1.0));
-                slot.held.push((pitch, slot.next as f64 * sb + gate * sb));
-                return Some(Pending::Note(
-                    from,
-                    Payload::NoteOn {
-                        pitch,
-                        velocity: step.velocity.unwrap_or(slot.values[VELOCITY]),
-                        instance: slot.id,
-                    },
-                ));
+        let beat_at = f64::from(slot.beat);
+        let beats_left = beat_at < total - EPS;
+        let step_at = slot.next as f64 * sb;
+        let steps_left = slot.next < len;
+        if !beats_left && !steps_left {
+            // The pass is over once its last step is.
+            if pos + EPS < total {
+                return None;
             }
-            slot.next += 1;
-            slot.chord = 0;
-            continue;
-        }
-        if slot.next >= len && slot.pos + EPS >= total {
             if slot.looping || slot.repeats > 1 {
                 if !slot.looping {
                     slot.repeats -= 1;
                 }
+                slot.pass += 1;
                 slot.pos -= total;
                 for h in &mut slot.held {
                     h.1 -= total;
                 }
                 slot.next = 0;
                 slot.chord = 0;
-                continue;
+                slot.beat = 0;
+                return seq(EventKind::Repeated, [id, slot.pass as i32, 0, 0]);
             }
-            if slot.held.is_empty() {
-                slot.active = false;
+            if let Some((pitch, _)) = slot.held.pop() {
+                return Some(Payload::NoteOff {
+                    pitch,
+                    release: SEQ_RELEASE,
+                    instance: id,
+                });
             }
+            let step = slot.current as i32 + 1;
+            if !slot.finishing {
+                slot.finishing = true;
+                return seq(EventKind::Finished, [id, step, 0, 0]);
+            }
+            slot.active = false;
+            return seq(EventKind::End, [id, step, 0, 0]);
         }
-        return None;
+        // A beat comes before a step starting at the same moment.
+        if beats_left && (!steps_left || beat_at <= step_at + EPS) {
+            if beat_at > pos + EPS {
+                return None;
+            }
+            let per_bar = table.beats_per_bar.max(1);
+            let (bar, beat) = (
+                (slot.beat / per_bar + 1) as i32,
+                (slot.beat % per_bar + 1) as i32,
+            );
+            if beat == 1 && !slot.bar_sent {
+                slot.bar_sent = true;
+                return seq(EventKind::Bar, [id, bar, pass, 0]);
+            }
+            slot.bar_sent = false;
+            slot.beat += 1;
+            return seq(EventKind::Beat, [id, beat, bar, pass]);
+        }
+        if step_at > pos + EPS {
+            return None;
+        }
+        let step = &table.steps[slot.next];
+        let number = slot.next as i32 + 1;
+        if !slot.step_sent {
+            slot.step_sent = true;
+            slot.current = slot.next;
+            return seq(EventKind::Step, [id, number, pass, 0]);
+        }
+        if step.pitches.is_empty() && !slot.rest_sent {
+            slot.rest_sent = true;
+            return seq(EventKind::Rest, [id, number, pass, 0]);
+        }
+        if let Some(&pitch) = step.pitches.get(slot.chord) {
+            slot.chord += 1;
+            let gate = f64::from(slot.values[GATE].clamp(1e-6, 1.0));
+            slot.held.push((pitch, step_at + gate * sb));
+            return Some(Payload::NoteOn {
+                pitch,
+                velocity: step.velocity.unwrap_or(slot.values[VELOCITY]),
+                instance: id,
+            });
+        }
+        slot.next += 1;
+        slot.chord = 0;
+        slot.step_sent = false;
+        slot.rest_sent = false;
     }
 }
 
-/// Stop `slot`, queueing a note-off for every note it holds.
-fn halt(slot: &mut Slot, seq: usize, queue: &mut VecDeque<Pending>) {
-    for (pitch, _) in slot.held.drain(..) {
-        queue.push_back(Pending::Note(
-            Sender::Seq(seq as u16),
+/// Stop `slot` (an instance of sequence `seq`) for `reason` (`halted` or
+/// `replaced`): a note-off for every note it holds, then `reason`, then
+/// `end`.
+fn stop(run: &mut Run, seq: usize, k: usize, reason: EventKind) {
+    let slot = &mut run.slots[seq][k];
+    let (id, step) = (slot.id, slot.current as i32 + 1);
+    slot.active = false;
+    let held = slot.held.len();
+    for h in 0..held {
+        let pitch = run.slots[seq][k].held[h].0;
+        run.send(
+            seq,
             Payload::NoteOff {
                 pitch,
                 release: SEQ_RELEASE,
-                instance: slot.id,
+                instance: id,
             },
-        ));
+        );
     }
-    slot.active = false;
+    run.slots[seq][k].held.clear();
+    run.send(
+        seq,
+        Payload::Seq {
+            kind: reason,
+            values: [id, step, 0, 0],
+        },
+    );
+    run.send(
+        seq,
+        Payload::Seq {
+            kind: EventKind::End,
+            values: [id, step, 0, 0],
+        },
+    );
 }
 
 /// Run `fast` (lowered from `instrs`) to the end.
@@ -1417,17 +1558,18 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
         Instr::InvokeSeq { call } => invoke(call, code, run),
         Instr::InvokeEvent { event, values } => {
             let kind = code.decls[usize::from(event.0)].kind;
-            let values = values.map(|v| val(regs, v));
-            let payload = Payload::from_values(kind, values);
+            let [a, b, c] = values.map(|v| val(regs, v));
+            let payload = Payload::from_values(kind, [a, b, c, 0.0]);
             run.queue
                 .push_back(Pending::To(event, payload, Sender::Host(0)));
         }
         Instr::Halt { seq, id } => {
             let id = id.map(|id| val(regs, id) as i32);
             let seq = usize::from(seq);
-            for slot in &mut run.slots[seq] {
+            for k in 0..run.slots[seq].len() {
+                let slot = &run.slots[seq][k];
                 if slot.active && id.is_none_or(|id| id == slot.id) {
-                    halt(slot, seq, &mut run.queue);
+                    stop(run, seq, k, EventKind::Halted);
                 }
             }
         }
@@ -1505,28 +1647,34 @@ fn invoke(call_index: u16, code: &Code, run: &mut Run) {
         return;
     }
 
-    let slots = &mut run.slots[seq];
+    let slots = &run.slots[seq];
     let existing = slots
         .iter()
         .position(|s| s.active && s.id == id && call.id.is_some());
     let k = match existing {
         Some(_) if start.is_none() => return,
         Some(k) => {
-            halt(&mut slots[k], seq, &mut run.queue);
+            stop(run, seq, k, EventKind::Halted);
             k
         }
         None => match slots.iter().position(|s| !s.active) {
             Some(k) => k,
             None => {
-                let k = (0..slots.len())
+                // Never one started in this sample: replacing those could
+                // go round forever, each start replacing the last.
+                let now = run.now;
+                let Some(k) = (0..slots.len())
+                    .filter(|&k| slots[k].started < now)
                     .min_by_key(|&k| slots[k].started)
-                    .unwrap_or(0);
-                halt(&mut slots[k], seq, &mut run.queue);
+                else {
+                    return;
+                };
+                stop(run, seq, k, EventKind::Replaced);
                 k
             }
         },
     };
-    let slot = &mut slots[k];
+    let slot = &mut run.slots[seq][k];
     let step = start.unwrap_or(0);
     slot.active = true;
     slot.id = id;
@@ -1543,6 +1691,21 @@ fn invoke(call_index: u16, code: &Code, run: &mut Run) {
         *c = captured.get(i).copied().unwrap_or(0.0);
     }
     slot.held.clear();
+    slot.pass = 1;
+    slot.current = step;
+    // After `trigger N`, the first beat is the next one in the pattern.
+    slot.beat = (slot.pos - EPS).ceil().max(0.0) as u32;
+    slot.bar_sent = false;
+    slot.step_sent = false;
+    slot.rest_sent = false;
+    slot.finishing = false;
+    run.send(
+        seq,
+        Payload::Seq {
+            kind: EventKind::Start,
+            values: [id, step as i32 + 1, 0, 0],
+        },
+    );
 }
 
 impl Node for Program {

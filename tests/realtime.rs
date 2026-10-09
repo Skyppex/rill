@@ -179,3 +179,66 @@ fn playing_sequences_does_not_allocate() {
     assert_eq!(count, 0);
     assert!(out.iter().any(|&x| x != 0.0));
 }
+
+#[test]
+fn every_sequence_event_without_allocating() {
+    use rill::{Event, Payload};
+    // Every kind handled; chords held while instances are halted, restarted
+    // and replaced, many at a time.
+    let src = "
+        seq riff(step: 1/16, tempo: 600bpm, gate: 1, repeat: 3, instances: 4) {
+            [C4, E4, G4], _, [D4, F4, A4], C5,
+        }
+        event go control_change(sender: 1)
+        rill voice() Sample {
+            state level: Float = 0
+            on riff_note_on(n) claim { level = n.velocity }
+            on riff_note_off release { level = 0 }
+            return level
+        }
+        rill main() [Sample; 2] {
+            state count: Float = 0
+            on start { invoke 1 riff }
+            on go(v) {
+                if v == 1 { invoke riff; invoke riff; invoke riff; invoke riff; invoke riff }
+                if v == 2 { trigger 3 1 riff }
+                if v == 3 { halt riff }
+            }
+            on riff_start(s) { count = count + s.step as Float }
+            on riff_finished { invoke riff }
+            on riff_halted { count = count + 1 }
+            on riff_replaced { count = count + 1 }
+            on riff_end { count = count + 1 }
+            on riff_repeated(r) { count = count + r.pass as Float }
+            on riff_step(s) { count = count + s.step as Float }
+            on riff_rest { count = count + 1 }
+            on riff_beat(b) { count = count + b.beat as Float }
+            on riff_bar(b) { count = count + b.bar as Float }
+            let mix = sum([voice(); 6])
+            return [mix, count]
+        }
+    ";
+    let config = Config {
+        sample_rate: 48_000,
+        max_frames: 256,
+        out_channels: 2,
+    };
+    let (graph, _) = rill::lang::load(src, &config, "main").unwrap();
+    let mut engine = Engine::new(graph, config).unwrap();
+    let go = |v| Event {
+        sender: 1,
+        channel: 0,
+        payload: Payload::Control(v),
+    };
+    let mut out = vec![0.0f32; 2 * 4800];
+    // Warm up: let everything happen once.
+    engine.render_interleaved(&mut out);
+    let count = allocations_during(|| {
+        for round in 0..20 {
+            engine.send(&go(1.0 + (round % 3) as f32));
+            engine.render_interleaved(&mut out);
+        }
+    });
+    assert_eq!(count, 0);
+    assert!(out.chunks(2).any(|f| f[1] > 0.0));
+}

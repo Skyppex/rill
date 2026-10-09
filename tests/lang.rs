@@ -70,15 +70,22 @@ fn assert_ok(src: &str) {
     }
 }
 
-/// The `let name = ...` at the top of some definition's body.
+/// The `let name = ...` at the top of some definition's body, or of one of
+/// its `on` handlers.
 fn find_let<'p>(program: &'p Program, name: &str) -> &'p rill::lang::ast::Expr {
     for item in &program.items {
-        for s in &item.def().body.stmts {
-            if let Stmt::Let { name: n, value, .. } = s
-                && n.name == name
-                && value.is_some()
-            {
-                return value.as_ref().unwrap();
+        let handlers = item.def().body.stmts.iter().filter_map(|s| match s {
+            Stmt::EventHandler { body, .. } => Some(&body.stmts),
+            _ => None,
+        });
+        for stmts in std::iter::once(&item.def().body.stmts).chain(handlers) {
+            for s in stmts {
+                if let Stmt::Let { name: n, value, .. } = s
+                    && n.name == name
+                    && value.is_some()
+                {
+                    return value.as_ref().unwrap();
+                }
             }
         }
     }
@@ -1665,4 +1672,219 @@ fn random_picks_a_number_of_any_type() {
         rill main() Sample { return tone() }
     ";
     assert!(errors(src).is_empty(), "{:?}", errors(src));
+}
+
+const RIFF: &str = "seq riff(meter: 3/4, step: 1/8, instances: 8) { C4, _, E4, _, G4, _ }";
+
+/// [`RIFF`] and a `main` with `body`, invoking the riff at the start.
+fn with_riff(body: &str) -> String {
+    format!("{RIFF}\nrill main() Sample {{\non start {{ invoke riff }}\n{body}\nreturn 0\n}}")
+}
+
+#[test]
+fn sequences_make_their_own_events() {
+    let src = with_riff(
+        "on riff_note_on(n) { let a = n.pitch }
+         on riff_note_off(n) { let b = n.release }
+         on riff_start(s) { let c = s.step }
+         on riff_finished(f) { let d = f.step }
+         on riff_halted(h) { let e = h.instance }
+         on riff_replaced(r) { let f = r.step }
+         on riff_end(e) { let g = e.step }
+         on riff_repeated(r) { let h = r.pass }
+         on riff_step(s) { let i = s.pass }
+         on riff_rest(r) { let j = r.step }
+         on riff_beat(b) { let k = b.bar }
+         on riff_bar(b) { let l = b.bar }",
+    );
+    assert!(errors(&src).is_empty(), "{:?}", errors(&src));
+    assert_eq!(type_of(&src, "a"), Type::Pitch);
+    assert_eq!(type_of(&src, "b"), Type::Float);
+    for name in ["c", "d", "e", "f", "g", "h", "i", "j", "k", "l"] {
+        assert_eq!(type_of(&src, name), Type::Int, "{name}");
+    }
+    // Fields that belong to another kind are pointed out.
+    let (m, h) = error(&with_riff("on riff_step(s) { let x = s.beat }"));
+    assert_eq!(m, "a `SeqStep` has no field `beat`");
+    assert!(h.unwrap().contains("`instance`, `step` and `pass`"));
+}
+
+#[test]
+fn a_sequences_events_cannot_be_declared_or_invoked() {
+    let (m, h) = error(&format!(
+        "{RIFF}\nevent riff_step note_on\n{}",
+        body("on riff_step { }")
+    ));
+    assert_eq!(m, "sequence `riff` already makes an event `riff_step`");
+    assert!(h.unwrap().contains("rename this one"));
+    assert_eq!(
+        error(&with_riff("on riff_step { invoke riff_start(step: 1) }")).0,
+        "`riff_start` is made by sequence `riff`, so it cannot be invoked"
+    );
+    assert_eq!(
+        error("event x seq_step\nrill main() Sample { return 0 }").0,
+        "unknown event kind `seq_step`"
+    );
+    // A fn or rill with one of the names.
+    let src = format!(
+        "{RIFF}\nrill riff_end() Sample {{ return 0 }}\n{}",
+        with_riff("").replace(RIFF, "")
+    );
+    assert_eq!(
+        error(&src).0,
+        "sequence `riff` makes event `riff_end`, which is already the name of a fn or rill"
+    );
+}
+
+#[test]
+fn restarting_from_a_sequences_events() {
+    // Later events are fine: finishing, repeating, ending (an instance is
+    // never replaced in the sample it started).
+    for h in [
+        "on riff_finished { invoke riff }",
+        "on riff_repeated { trigger 1 3 riff }",
+        "on riff_end { invoke riff }",
+        "on riff_step { halt riff }",
+    ] {
+        assert!(
+            errors(&with_riff(h)).is_empty(),
+            "{h}: {:?}",
+            errors(&with_riff(h))
+        );
+    }
+    // Starting again from what starting does would never end.
+    for (h, chain) in [
+        (
+            "on riff_start { invoke riff }",
+            "`riff_start` -> `riff` -> `riff_start`",
+        ),
+        (
+            "on riff_beat { invoke riff }",
+            "`riff_beat` -> `riff` -> `riff_beat`",
+        ),
+        // A restart halts, and the halt ends the instance at once.
+        (
+            "on riff_end { trigger 1 3 riff }",
+            "`riff_end` -> `riff` -> `riff_end`",
+        ),
+        (
+            "on riff_halted { halt riff }",
+            "`riff_halted` -> `riff` -> `riff_halted`",
+        ),
+    ] {
+        let (m, _) = error(&with_riff(h));
+        assert_eq!(
+            m,
+            format!("invoking here can lead back to the same handler: {chain}"),
+            "{h}"
+        );
+    }
+}
+
+#[test]
+fn sequence_fields() {
+    let src = format!(
+        "{RIFF}\n{}",
+        body(
+            "let a = riff.step_count
+             let b = riff.beats_per_bar
+             let c = riff.beat_unit
+             let d = riff.step_size
+             let e = riff.steps_per_beat
+             let f = riff.beat_count
+             let g = riff.bar_count
+             let h = riff.instances"
+        )
+    );
+    for (name, ty) in [
+        ("a", Type::Int),
+        ("b", Type::Int),
+        ("c", Type::Int),
+        ("d", Type::Float),
+        ("e", Type::Float),
+        ("f", Type::Float),
+        ("g", Type::Float),
+        ("h", Type::Int),
+    ] {
+        assert_eq!(type_of(&src, name), ty, "{name}");
+    }
+    let (program, checked) = lang::compile(&src).unwrap();
+    let value = |name| checked.const_values[&find_let(&program, name).id];
+    assert_eq!(
+        ["a", "b", "c", "d", "e", "f", "g", "h"].map(value),
+        [6.0, 3.0, 4.0, 0.125, 2.0, 3.0, 1.0, 8.0]
+    );
+
+    // Constants: usable as defaults and state initialisers.
+    let src = format!(
+        "{RIFF}\nrill f(n: Int = riff.step_count) Sample {{ state s: Float = riff.bar_count\nreturn s }}\n{}",
+        body("let x = f()")
+    );
+    assert!(errors(&src).is_empty(), "{:?}", errors(&src));
+
+    let (m, h) = error(&format!("{RIFF}\n{}", body("let x = riff.step_cuont")));
+    assert_eq!(m, "sequence `riff` has no field `step_cuont`");
+    assert_eq!(h.unwrap(), "did you mean `step_count`?");
+    let (m, h) = error(&format!("{RIFF}\n{}", body("let x = riff.tempo")));
+    assert_eq!(m, "sequence `riff` has no field `tempo`");
+    assert!(h.unwrap().starts_with("a sequence has `step_count`"));
+    // A local of the same name hides the sequence.
+    assert!(
+        !errors(&format!(
+            "{RIFF}\n{}",
+            body("let riff = 1\nlet x = riff.step_count")
+        ))
+        .is_empty()
+    );
+}
+
+#[test]
+fn constant_sizes() {
+    let src = format!(
+        "{RIFF}
+        fn first<N>(x: [Float; N]) Float {{ x[0] }}
+        {}",
+        body(
+            "let a: [Float; riff.step_count] = [1, 2, 3, 4, 5, 6]
+             let b = [0.5; riff.step_count * 2]
+             let c: [Float; 6] = a
+             let d = first<riff.step_count>(a)
+             let e = [1; 7 % 4 + (2.9 as Int)]"
+        )
+    );
+    assert!(errors(&src).is_empty(), "{:?}", errors(&src));
+    assert_eq!(type_of(&src, "b"), frame(Type::Num, 12));
+    assert_eq!(type_of(&src, "e"), frame(Type::Num, 5));
+
+    // Inside a generic rill, `[x; N]` takes the size parameter.
+    let src = "rill copies<N>(x: Sample) [Sample; N] { return [x; N] }\nrill main() [Sample; 3] { return copies<3>(1) }";
+    assert!(errors(src).is_empty(), "{:?}", errors(src));
+
+    for (size, msg) in [
+        (
+            "2.5",
+            "a size must be a whole number of at least 1; this is 2.5",
+        ),
+        (
+            "riff.step_count - 6",
+            "a size must be a whole number of at least 1; this is 0",
+        ),
+        ("RATE", "`RATE` cannot be a size"),
+        ("sin(1)", "a size must be a constant whole number"),
+    ] {
+        assert_eq!(
+            error(&format!(
+                "{RIFF}\n{}",
+                body(&format!("let x = [1; {size}]"))
+            ))
+            .0,
+            msg,
+            "{size}"
+        );
+    }
+    assert_eq!(
+        error("rill f<N>(x: [Sample; N * 2]) Sample { return 0 }\nrill main() Sample { return 0 }")
+            .0,
+        "a size cannot be worked out from size parameter `N` yet"
+    );
 }

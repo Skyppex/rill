@@ -84,7 +84,7 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | Type | Meaning | Notes |
 | --- | --- | --- |
 | `Sample` | One audio value, nominally \[-1.0, 1.0\] | Storage chosen per target |
-| `[Sample; N]` | A frame of N channels | N is a compile-time constant |
+| `[Sample; N]` | A frame of N channels | N is a compile-time constant: a whole number, a size parameter, or a constant expression such as `riff.step_count * 2` |
 | `[[Sample; 2]; N]` | Frames nest: N stereo voices or buses | See Polyphony |
 | `Float`, `Int`, `Bool` | Plain values for control logic | Not converted at I/O |
 | `Freq`, `Time` | Unit-carrying numbers | Convert to samples via the host rate |
@@ -222,26 +222,31 @@ Rules:
 
 ## Sequences
 
-A sequence is a pattern of notes that plays only when the program says so, at its own tempo and meter. Several can play at once.
+A sequence is a pattern of notes that plays only when the program says so, at its own tempo and meter. Several can play at once. It makes no sound itself: while it plays, it makes events named after it, which handlers react to.
 
 ```rill
 seq riff(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.9, velocity: 0.8) {
     C4, _, E4@0.5, _, [G4, B4]@1, E4, _, C5
 }
 
-event lead_on note_on(sender: riff)     // only the riff's notes
-event lead_off note_off(sender: riff)
-event pad note_on(sender: 2, channel: 10)
+rill voice() Sample {
+    state pitch: Pitch = C4
+    state level: Float = 0
+    on riff_note_on(note) claim { pitch = note.pitch; level = note.velocity }
+    on riff_note_off release { level = 0 }
+    return sine(pitch |> equal) * level
+}
 
 rill main(speed: Freq = 120bpm) Sample {
-    state current: Int = 0
-    on start { current = invoke riff(loop: true) }
-    on pad(hit) { trigger 5 current riff(tempo: speed * hit.velocity) }
-    ...
+    state accent: Float = 1
+    let accents: [Float; riff.step_count] = [1.2, 1, 0.8, 1, 1.2, 1, 0.8, 1]
+    on start { invoke riff(loop: true) }
+    on riff_step(s) { accent = accents[s.step - 1] }
+    return sum([voice(); 8]) * accent
 }
 ```
 
-- **Steps** are separated by commas: a pitch, a chord (`[G4, B4]`) or a rest (`_`). `@0.5` sets a step's velocity, from 0 to 1. Each note sends a `note_on` at the start of its step and a `note_off` `gate` × `step` later.
+- **Steps** are separated by commas: a pitch, a chord (`[G4, B4]`) or a rest (`_`). `@0.5` sets a step's velocity, from 0 to 1. Each note starts with its step and ends `gate` × `step` later.
 - **Settings** are all optional:
 
   | Setting | Default | When |
@@ -253,16 +258,57 @@ rill main(speed: Freq = 120bpm) Sample {
   | `repeat`, `loop` | `1`, `false` | per invocation |
   | `instances` | `64` | fixed; how many copies can play at once |
 
-- **A sequence is a sender**, so its notes reach rills through declared events like any others: `sender: riff` hears only the riff, and a declaration without a `sender` filter hears every sequence and the host.
 - **Invoking** happens in `on` handlers, which are moments; a rill body runs every sample:
   - `invoke riff` starts a new instance and returns its id, an `Int`. Invoking twice plays two overlapping copies.
   - `invoke id riff` uses instance `id` of `riff`, and does nothing while it is playing. Ids you pick are whole numbers ≥ 1; fresh ids are negative.
   - `trigger 5 id riff` starts at step 5 (steps count from 1), restarting the instance if it is playing. A step computed while playing wraps around.
   - `halt id riff` or `halt riff` stops instances; the notes they hold end.
   - Settings can be given at invocation: `invoke riff(tempo: 90bpm, repeat: 4)`. A tempo that reads the rill's streams follows them while playing; values from the handler, like `hit.velocity`, are kept from the moment of invoking.
-  - `invoke lead_on(pitch: C4, velocity: 1)` sends a declared event directly. Invoked events and a sequence's first notes arrive at the same sample, after the current handler; a handler that could invoke itself again, through events or sequences, is an error.
-- **Tempo:** a tempo known when the program is built must be above 0bpm. While playing, an invocation whose tempo is 0bpm or below does nothing, so it never sends a note; a running sequence whose tempo stream drops to 0 holds still.
-- At most `instances` copies of a sequence play at once; a new one beyond that replaces the oldest.
+  - `invoke lead_on(pitch: C4, velocity: 1)` sends a declared event directly. Invoked events arrive after the current handler, in the same sample.
+- **Tempo:** a tempo known when the program is built must be above 0bpm. While playing, an invocation whose tempo is 0bpm or below does nothing; a running sequence whose tempo stream drops to 0 holds still.
+- At most `instances` copies of a sequence play at once; a new one beyond that replaces the oldest (never one started in the same sample; then the new one does not start).
+
+### What a sequence makes
+
+For `seq riff`, these events exist without being declared. The name says what happened; the payload carries the details, all `Int` except the notes'.
+
+| Event | When | Payload |
+| --- | --- | --- |
+| `riff_start` | an instance starts: `invoke`, or `trigger` on a stopped one | `instance`, `step` (where it starts) |
+| `riff_finished` | its last pass is over | `instance`, `step` (the last) |
+| `riff_halted` | stopped early: `halt`, or `trigger` restarting it | `instance`, `step` (the one it was on) |
+| `riff_replaced` | stopped to make room for a new instance | `instance`, `step` |
+| `riff_end` | right after any of the three stops | `instance`, `step` |
+| `riff_repeated` | back to step 1 for another pass, from `repeat` or `loop` | `instance`, `pass` (the one beginning) |
+| `riff_bar` | the first beat of every bar | `instance`, `bar`, `pass` |
+| `riff_beat` | every beat of the meter | `instance`, `beat` (in the bar), `bar`, `pass` |
+| `riff_step` | every step, rests included | `instance`, `step`, `pass` |
+| `riff_rest` | a step without notes | `instance`, `step`, `pass` |
+| `riff_note_on` | a note starts | `pitch`, `velocity`, `instance` (a `NoteOn`) |
+| `riff_note_off` | a note ends | `pitch`, `release`, `instance` (a `NoteOff`) |
+
+- Everything counts from 1. Every start is followed, eventually, by exactly one of the three stops and then `end`; reaching the last step is not stopping, and a looping sequence only stops when halted or replaced.
+- **Bars and beats** follow the meter and count from the start of each pass: step 1 is always bar 1, beat 1. A beat can fall between steps (`step: 3/16` in 4/4). A pattern that does not fill its last bar ends on a short bar. After `trigger N`, the first beat is the next one in the pattern, or at once if step N starts one.
+- **Order in one sample:** note-offs; a stop and `end`; `start` or `repeated`; `bar`; `beat`; `step`; `rest`; note-ons. So a step's handler sees the notes before it already released.
+- They are ordinary events: `claim` and `release` work on the note events, plain handlers run in every voice. They cannot be invoked, and a written event cannot take one of their names. Declarations can still filter a sequence's notes, as in `event lead note_on(sender: riff, channel: 2)`; one with no `sender` hears every sequence and the host.
+- A handler that could start again what runs it, in the same sample, is an error: `on riff_start { invoke riff }` would never end. Starting, the first step and its notes happen at once; so do the note-offs, `halted` and `end` of a `halt` or a restarting `trigger`. Later events (`finished`, `repeated`, later steps) are fine: `on riff_finished { invoke riff }` plays it again and again.
+
+### What is fixed about a sequence
+
+`riff.field` reads what is fixed when the program is built and the same for every instance. They are constants: usable as defaults, state initialisers and sizes (`[Float; riff.step_count]`).
+
+| Field | Type | `seq riff(meter: 3/4, step: 1/8) { 6 steps }` |
+| --- | --- | --- |
+| `step_count` | `Int` | 6 |
+| `beats_per_bar` | `Int` | 3 |
+| `beat_unit` | `Int` | 4 |
+| `step_size` | `Float` | 0.125 (of a whole note) |
+| `steps_per_beat` | `Float` | 2 |
+| `beat_count` | `Float` | 3 |
+| `bar_count` | `Float` | 1 |
+| `instances` | `Int` | 64 |
+
+Settings an invocation can change (`tempo`, `gate`, `velocity`, `repeat`, `loop`) are not fields.
 
 ## Voices
 

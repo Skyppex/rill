@@ -135,6 +135,9 @@ pub struct Defs<'a> {
     pub vectorize: bool,
     /// Where `random()` draws its numbers from.
     pub random: Random,
+    /// Values the checker worked out: sequence fields and sizes written as
+    /// expressions, by expression id.
+    const_values: &'a HashMap<u32, f64>,
 }
 
 /// The numbers `random()` picks while a program is built: SplitMix64 from a
@@ -187,6 +190,7 @@ impl<'a> Defs<'a> {
             seqs: Vec::new(),
             vectorize: true,
             random: Random::default(),
+            const_values: &checked.const_values,
             map: defs
                 .zip(&checked.signatures)
                 .map(|(d, s)| (d.name.name.as_str(), (d, s)))
@@ -381,6 +385,7 @@ pub fn seq_tables(
             repeat: 1,
             looping: false,
             instances: 64,
+            beats_per_bar: 4,
         };
         // A beat is a `1/beat` note; a step is `n/d` of a whole note.
         let mut beat = 4u32;
@@ -389,7 +394,10 @@ pub fn seq_tables(
             let name = setting.name.name.as_str();
             let fraction = super::check::fraction(&setting.value);
             match (name, fraction) {
-                ("meter", Some((_, d))) => beat = d,
+                ("meter", Some((n, d))) => {
+                    table.beats_per_bar = n.max(1);
+                    beat = d;
+                }
                 ("step", Some(f)) => step = f,
                 ("meter" | "step", None) => {}
                 _ => {
@@ -882,22 +890,33 @@ impl<'a> Compiler<'a> {
         match ty {
             TypeExpr::Named(_) => Ok(CVal::Scalar(Operand::Const(0.0))),
             TypeExpr::Frame { elem, size, .. } => {
-                let n = match size {
-                    SizeExpr::Lit(n, _) => *n,
-                    SizeExpr::Var(id) => {
-                        let Some(binding) = self.lookup(&id.name) else {
-                            return Err(internal(id.span, "unknown frame size"));
-                        };
-                        let Operand::Const(n) = binding.val.scalar() else {
-                            return Err(internal(id.span, "frame size is not constant"));
-                        };
-                        n as u32
-                    }
-                };
+                let n = self.size(size)?;
                 let elem = self.zero_for_type(elem)?;
                 Ok(CVal::Frame((0..n).map(|_| elem.clone()).collect()))
             }
             TypeExpr::Fn { span, .. } => Err(internal(*span, "cannot zero-initialize a function")),
+        }
+    }
+
+    /// The number a size stands for here.
+    fn size(&self, size: &SizeExpr) -> CResult<u32> {
+        match size {
+            SizeExpr::Lit(n, _) => Ok(*n),
+            SizeExpr::Var(id) => {
+                let Some(binding) = self.lookup(&id.name) else {
+                    return Err(internal(id.span, "unknown frame size"));
+                };
+                let Operand::Const(n) = binding.val.scalar() else {
+                    return Err(internal(id.span, "frame size is not constant"));
+                };
+                Ok(n as u32)
+            }
+            SizeExpr::Expr(e) => self
+                .defs
+                .const_values
+                .get(&e.id)
+                .map(|&v| v as u32)
+                .ok_or_else(|| internal(e.span, "size not worked out by the checker")),
         }
     }
 
@@ -1296,7 +1315,10 @@ impl<'a> Compiler<'a> {
                 }
                 Ok(result)
             }
-            ExprKind::Repeat(x, n) => self.repeat(x, *n),
+            ExprKind::Repeat(x, n) => {
+                let n = self.size(n)?;
+                self.repeat(x, n)
+            }
             ExprKind::Invoke {
                 step,
                 id,
@@ -1320,6 +1342,10 @@ impl<'a> Compiler<'a> {
                 });
                 Ok(CVal::unit())
             }
+            // A sequence's field, worked out by the checker.
+            ExprKind::Field(..) if self.defs.const_values.contains_key(&e.id) => Ok(CVal::Scalar(
+                Operand::Const(self.defs.const_values[&e.id] as f32),
+            )),
             ExprKind::Field(base, field) => {
                 let CVal::Event(fields) = self.expr(base)? else {
                     return Err(internal(e.span, "field access on a non-event value"));
@@ -1369,7 +1395,7 @@ impl<'a> Compiler<'a> {
         if let (Some(param), Some(kind)) = (params.first(), kind) {
             let value = match kind {
                 EventKind::ControlChange => CVal::Scalar(fields[0].1),
-                EventKind::NoteOn | EventKind::NoteOff => CVal::Event(fields),
+                _ => CVal::Event(fields),
             };
             self.bind(&param.name, value, false);
         }
@@ -1887,13 +1913,7 @@ impl<'a> Compiler<'a> {
     ) -> CResult<HashMap<String, CVal>> {
         let mut out = HashMap::new();
         for (name, size) in sig.generics.iter().zip(sizes) {
-            let val = match size {
-                SizeExpr::Lit(n, _) => CVal::Scalar(Operand::Const(*n as f32)),
-                SizeExpr::Var(id) => self
-                    .lookup(&id.name)
-                    .map(|b| b.val.clone())
-                    .ok_or_else(|| internal(id.span, &format!("unknown size `{}`", id.name)))?,
-            };
+            let val = CVal::Scalar(Operand::Const(self.size(size)? as f32));
             out.insert(name.clone(), val);
         }
         Ok(out)

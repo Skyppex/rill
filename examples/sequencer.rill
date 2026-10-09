@@ -1,4 +1,18 @@
 // Sequencing: patterns that play when told to, each at its own tempo.
+//
+// A `seq` is a list of steps. It makes no sound itself: while it plays, it
+// makes events named after it, and handlers react to them:
+//
+//   riff_note_on, riff_note_off  a note starts or ends (pitch, velocity)
+//   riff_start, riff_end         an instance starts or stops
+//   riff_finished                it stopped because it ran out of repeats
+//   riff_halted, riff_replaced   it was stopped early, or to make room
+//   riff_repeated                it goes back to step 1 (`repeat`, `loop`)
+//   riff_bar, riff_beat          time passing, by the meter
+//   riff_step, riff_rest         every step, and every step without notes
+//
+// A voice turns notes into sound: it keeps the pitch of the note it holds,
+// tunes it into a frequency, and plays it.
 
 // Eighth notes at 120bpm in 4/4. `@` sets a step's velocity; `_` is a rest.
 seq riff(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.6, velocity: 0.7) {
@@ -7,12 +21,6 @@ seq riff(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.6, velocity: 0.7) {
 
 // A slower bass line in 3/4, a step per beat.
 seq bass(meter: 3/4, step: 1/4, tempo: 90bpm, gate: 0.9) { C2, G2@0.5, G2@0.5 }
-
-// A sequence is a sender: these hear only its notes.
-event lead_on note_on(sender: riff)
-event lead_off note_off(sender: riff)
-event low_on note_on(sender: bass)
-event low_off note_off(sender: bass)
 
 // A pad on host sender 2 restarts the riff from step 5.
 event pad note_on(sender: 2, channel: 10)
@@ -23,44 +31,53 @@ rill sine(freq: Freq) Sample {
     return sin(phase * TAU)
 }
 
-// A voice that takes one note at a time and fades out after its release.
+// One voice for the riff. `claim` gives each new note to one voice of a
+// pool, and `release` gives its note-off to the voice holding it.
 rill lead() Sample {
     state pitch: Pitch = C4
     state level: Float = 0
     state gate: Float = 0
 
-    on lead_on(note) claim {
+    on riff_note_on(note) claim {
         pitch = note.pitch
         level = note.velocity
         gate = 1
     }
 
-    on lead_off release {
+    on riff_note_off release {
         gate = 0
     }
 
+    // Hold while the note is on, then fade out.
     level = if gate > 0 { level } else { level * 0.9995 }
+    // A pitch is a note name; a tuning makes it a frequency.
     return (pitch |> equal |> sine) * level
 }
 
+// The bass plays one note at a time, tuned in just intonation.
 rill low() Sample {
     state pitch: Pitch = C2
     state level: Float = 0
 
-    on low_on(note) {
+    on bass_note_on(note) {
         pitch = note.pitch
         level = note.velocity
     }
 
-    on low_off {
+    on bass_note_off {
         level = 0
     }
 
-    return (pitch |> equal |> sine) * level
+    return (pitch |> just(root: C2) |> sine) * level
 }
 
 rill main(speed: Freq = 120bpm, volume: Gain = -12dB) [Sample; 2] {
     state current: Int = 0
+    state accent: Float = 1
+
+    // One accent per step of the riff: `riff.step_count` is fixed when the
+    // program is built, so it can size a frame.
+    let accents: [Float; riff.step_count] = [1.2, 1, 0.8, 1, 1.2, 1, 0.8, 1]
 
     on start {
         current = invoke riff(tempo: speed, loop: true)
@@ -71,8 +88,12 @@ rill main(speed: Freq = 120bpm, volume: Gain = -12dB) [Sample; 2] {
         trigger 5 current riff
     }
 
+    on riff_step(s) {
+        accent = accents[s.step - 1]
+    }
+
     // Eight voices share the riff's notes, one note each.
     let voices = [lead(); 8]
-    let mix = sum(voices) * 0.3 + low() * 0.5
+    let mix = sum(voices) * 0.3 * accent + low() * 0.5
     return [mix, mix] + volume
 }

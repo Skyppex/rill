@@ -370,12 +370,7 @@ impl Parser<'_> {
             self.nest += 1;
             let elem = self.ty()?;
             self.expect(TokenKind::Semi, "and a channel count, as in `[Sample; 2]`")?;
-            let size = if self.at(TokenKind::Ident) {
-                SizeExpr::Var(self.ident("")?)
-            } else {
-                let at = self.peek().span;
-                SizeExpr::Lit(self.int("as the channel count")?, at)
-            };
+            let size = self.size()?;
             self.expect(TokenKind::RBracket, "to close the frame type")?;
             self.nest -= 1;
             return Ok(TypeExpr::Frame {
@@ -996,12 +991,7 @@ impl Parser<'_> {
         }
         let mut sizes = Vec::new();
         loop {
-            if self.at(TokenKind::Ident) {
-                sizes.push(SizeExpr::Var(self.ident("as a size argument")?));
-            } else {
-                let at = self.peek().span;
-                sizes.push(SizeExpr::Lit(self.int("as a size argument")?, at));
-            }
+            sizes.push(self.size()?);
             if self.eat(TokenKind::Comma).is_none() || self.at(TokenKind::Gt) {
                 break;
             }
@@ -1014,11 +1004,26 @@ impl Parser<'_> {
         if self.peek().newline_before || self.peek().kind != TokenKind::Lt {
             return false;
         }
+        // Sizes separated by commas, each a name or number, possibly with
+        // fields and arithmetic (`riff.step_count * 2`), then `>(`.
         let mut pos = self.pos + 1;
         loop {
             match self.tokens.get(pos).map(|t| t.kind) {
                 Some(TokenKind::Ident | TokenKind::Number { .. }) => pos += 1,
                 _ => return false,
+            }
+            while let Some(
+                TokenKind::Ident
+                | TokenKind::Number { .. }
+                | TokenKind::Dot
+                | TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Star
+                | TokenKind::Slash
+                | TokenKind::Percent,
+            ) = self.tokens.get(pos).map(|t| t.kind)
+            {
+                pos += 1;
             }
             match self.tokens.get(pos).map(|t| t.kind) {
                 Some(TokenKind::Comma) => pos += 1,
@@ -1031,6 +1036,21 @@ impl Parser<'_> {
                 _ => return false,
             }
         }
+    }
+
+    /// A size: a whole number, a size parameter, or another constant, with
+    /// arithmetic but no comparisons (so `f<N>(x)` ends at `>`).
+    fn size(&mut self) -> PResult<SizeExpr> {
+        let e = self.binary(ADD_LEVEL)?;
+        Ok(match e.kind {
+            ExprKind::Number {
+                value,
+                unit: None,
+                integral: true,
+            } if value <= f64::from(u32::MAX) => SizeExpr::Lit(value as u32, e.span),
+            ExprKind::Name(name) => SizeExpr::Var(Ident { name, span: e.span }),
+            _ => SizeExpr::Expr(Box::new(e)),
+        })
     }
 
     fn primary(&mut self) -> PResult<Expr> {
@@ -1100,7 +1120,7 @@ impl Parser<'_> {
                 while !self.at(TokenKind::RBracket) {
                     elems.push(self.expr()?);
                     if elems.len() == 1 && self.eat(TokenKind::Semi).is_some() {
-                        let count = self.int("as the number of copies")?;
+                        let count = self.size()?;
                         self.expect(TokenKind::RBracket, "to close the frame")?;
                         self.nest -= 1;
                         let span = self.span_from(t.span);
@@ -1280,6 +1300,8 @@ impl Parser<'_> {
 }
 
 const CMP_LEVEL: u8 = 2;
+/// The level of `+` and `-`: from here on, only arithmetic.
+const ADD_LEVEL: u8 = 3;
 
 fn binop(kind: TokenKind) -> Option<(BinOp, u8)> {
     use TokenKind as T;

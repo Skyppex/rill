@@ -151,6 +151,19 @@ pub struct FnParam {
 pub enum SizeExpr {
     Lit(u32, Span),
     Var(Ident),
+    /// Any other constant, as in `riff.step_count * 2`, worked out by the
+    /// checker.
+    Expr(Box<Expr>),
+}
+
+impl SizeExpr {
+    pub fn span(&self) -> Span {
+        match self {
+            SizeExpr::Lit(_, span) => *span,
+            SizeExpr::Var(id) => id.span,
+            SizeExpr::Expr(e) => e.span,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -281,7 +294,7 @@ pub enum ExprKind {
     /// `[a, b]`
     Frame(Vec<Expr>),
     /// `[synth(); 8]`: the expression evaluated that many times.
-    Repeat(Box<Expr>, u32),
+    Repeat(Box<Expr>, SizeExpr),
     Index(Box<Expr>, Box<Expr>),
     Field(Box<Expr>, Ident),
     /// `x as Float`

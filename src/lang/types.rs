@@ -21,10 +21,9 @@ pub enum Type {
     /// A level change, written in `dB`. Stored as an amplitude factor, so
     /// any plain number can be used where a `Gain` is expected.
     Gain,
-    /// What an `on` handler of a `note_on` event receives.
-    NoteOn,
-    /// What an `on` handler of a `note_off` event receives.
-    NoteOff,
+    /// What an `on` handler of an event receives, as in `NoteOn` for a
+    /// `note_on` event. Never `ControlChange`, whose payload is a `Float`.
+    Event(crate::event::EventKind),
     /// An unsuffixed number literal not yet pinned to `Sample`, `Float` or
     /// `Int`. It becomes whichever plain numeric type it meets.
     Num,
@@ -111,8 +110,7 @@ impl fmt::Display for Type {
             Type::Time => f.write_str("Time"),
             Type::Interval => f.write_str("Interval"),
             Type::Gain => f.write_str("Gain"),
-            Type::NoteOn => f.write_str("NoteOn"),
-            Type::NoteOff => f.write_str("NoteOff"),
+            Type::Event(kind) => f.write_str(kind.type_name()),
             Type::Num => f.write_str("number"),
             Type::Frame(elem, size) => write!(f, "[{elem}; {size}]"),
             Type::Range => f.write_str("range"),
@@ -161,11 +159,10 @@ impl Type {
         self.is_plain() || self.is_dimensioned() || matches!(self, Type::Pitch | Type::Gain)
     }
 
-    /// The event kind whose payload this is, for `NoteOn` and `NoteOff`.
+    /// The event kind whose payload this is.
     pub fn event_kind(&self) -> Option<crate::event::EventKind> {
         match self {
-            Type::NoteOn => Some(crate::event::EventKind::NoteOn),
-            Type::NoteOff => Some(crate::event::EventKind::NoteOff),
+            Type::Event(kind) => Some(*kind),
             _ => None,
         }
     }

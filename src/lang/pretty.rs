@@ -186,10 +186,7 @@ struct Printer<'a> {
 }
 
 fn size_span(size: &SizeExpr) -> Span {
-    match size {
-        SizeExpr::Lit(_, span) => *span,
-        SizeExpr::Var(id) => id.span,
-    }
+    size.span()
 }
 
 impl Printer<'_> {
@@ -483,7 +480,7 @@ impl Printer<'_> {
                 Node::new(typed(kw("fn")), children)
             }
             ExprKind::Repeat(x, n) => Node::new(
-                typed(prop("repeat").plain(" ").value(n.to_string())),
+                typed(prop("repeat").plain(" ").value(self.text(n.span()))),
                 vec![self.expr(x)],
             ),
             ExprKind::Invoke {

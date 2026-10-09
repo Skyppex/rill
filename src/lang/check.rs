@@ -46,9 +46,28 @@ pub struct Checked {
     /// targets and types. Declarations are in `bindings` and the program's
     /// definitions instead.
     pub resolutions: Vec<(Span, Resolution)>,
-    /// The program's event declarations, in source order (the same as
-    /// [`Program::events`]). `None` where a declaration has an unknown kind.
+    /// The program's event declarations: the written ones in source order
+    /// (the same as [`Program::events`]), then the events every sequence
+    /// makes ([`Checked::seq_event`]). `None` where a declaration has an
+    /// unknown kind.
     pub events: Vec<Option<Declared>>,
+    /// How many of `events` are written in the program.
+    pub written_events: usize,
+    /// Per sequence, what is fixed about it.
+    pub seq_facts: Vec<SeqFacts>,
+    /// Values worked out while checking, by expression id: sequence fields
+    /// (`riff.step_count`) and sizes written as expressions.
+    pub const_values: HashMap<u32, f64>,
+}
+
+impl Checked {
+    /// For one of the events a sequence makes, by index into
+    /// [`Checked::events`]: the sequence's index and the kind.
+    pub fn seq_event(&self, i: usize) -> Option<(usize, EventKind)> {
+        let k = i.checked_sub(self.written_events)?;
+        let n = EventKind::SEQ.len();
+        (i < self.events.len()).then(|| (k / n, EventKind::SEQ[k % n]))
+    }
 }
 
 /// Index into [`Checked::bindings`].
@@ -145,6 +164,9 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         sizes: Vec::new(),
         current_def: 0,
         events: Vec::new(),
+        written_events: 0,
+        seq_facts: Vec::new(),
+        const_values: HashMap::new(),
         event_used: Vec::new(),
         seq_names: program.seqs.iter().map(|s| s.name.name.clone()).collect(),
         seq_steps: program.seqs.iter().map(|s| s.steps.len()).collect(),
@@ -154,6 +176,15 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
     };
 
     c.declare_events(&program.events, &program.seqs);
+    c.generate_seq_events(program);
+    for seq in &program.seqs {
+        let instances = seq
+            .settings
+            .iter()
+            .find(|s| s.name.name == "instances")
+            .and_then(|s| c.const_value(&s.value).ok());
+        c.seq_facts.push(SeqFacts::of(seq, instances));
+    }
     for item in &program.items {
         match item {
             Item::Fn(d) => c.declare(d, DefKind::Fn),
@@ -167,6 +198,25 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
                 decl.name.span,
                 format!("`{}` is already the name of a fn or rill", decl.name.name),
             );
+            c.report(e);
+        }
+    }
+    for i in c.written_events..c.events.len() {
+        let name = c.events[i]
+            .as_ref()
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+        if c.defs.contains_key(&name) {
+            let j = (i - c.written_events) / EventKind::SEQ.len();
+            let e = c
+                .error(
+                    program.seqs[j].name.span,
+                    format!(
+                        "sequence `{}` makes event `{name}`, which is already the name of a fn or rill",
+                        program.seqs[j].name.name
+                    ),
+                )
+                .with_help("rename the fn or rill, or the sequence");
             c.report(e);
         }
     }
@@ -206,6 +256,9 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         bindings: c.bindings,
         resolutions: c.resolutions,
         events: c.events,
+        written_events: c.written_events,
+        seq_facts: c.seq_facts,
+        const_values: c.const_values,
     };
     (checked, errors)
 }
@@ -292,6 +345,11 @@ struct Checker {
     /// Every `invoke` and `trigger`: from the handler it is in, to what it
     /// starts, for the loop check.
     invokes: Vec<(Node, Node, Span)>,
+    /// How many of `events` are written in the program; the rest are made
+    /// by sequences.
+    written_events: usize,
+    seq_facts: Vec<SeqFacts>,
+    const_values: HashMap<u32, f64>,
 }
 
 /// Something that runs handlers, for the invoke-loop check.
@@ -299,7 +357,11 @@ struct Checker {
 enum Node {
     Start,
     Event(usize),
-    Seq(usize),
+    /// Starting an instance of a sequence: its start and its first step
+    /// happen at once.
+    SeqStarts(usize),
+    /// Stopping one early: its note-offs, `halted` and `end` happen at once.
+    SeqStops(usize),
 }
 
 impl Checker {
@@ -447,6 +509,38 @@ impl Checker {
         }
     }
 
+    /// The events every sequence makes, `<seq>_<kind>` for each of
+    /// [`EventKind::SEQ`], after the written declarations.
+    fn generate_seq_events(&mut self, program: &Program) {
+        self.written_events = self.events.len();
+        // Two sequences never make the same name: no suffix is another
+        // suffix with a word in front.
+        for (j, seq) in program.seqs.iter().enumerate() {
+            for kind in EventKind::SEQ {
+                let name = format!("{}_{}", seq.name.name, kind.suffix());
+                if let Some(d) = program.events.iter().find(|d| d.name.name == name) {
+                    let e = self
+                        .error(
+                            d.name.span,
+                            format!("sequence `{}` already makes an event `{name}`", seq.name.name),
+                        )
+                        .with_help(format!(
+                            "every sequence makes its own events, such as `{0}_note_on` and `{0}_step`; rename this one",
+                            seq.name.name
+                        ));
+                    self.report(e);
+                }
+                self.events.push(Some(Declared {
+                    name,
+                    kind,
+                    sender: Some(Sender::Seq(j as u16)),
+                    channel: None,
+                }));
+                self.event_used.push(true);
+            }
+        }
+    }
+
     /// `invoke`, `trigger` and `halt` start and stop things at a moment, so
     /// they belong in handlers; a rill body runs every sample.
     fn in_handler_only(&mut self, span: Span, word: &str) {
@@ -506,7 +600,11 @@ impl Checker {
             self.resolve(target.span, Resolution::Seq(j));
             self.seq_used[j] = true;
             if let Some(from) = self.handler {
-                self.invokes.push((from, Node::Seq(j), target.span));
+                self.invokes.push((from, Node::SeqStarts(j), target.span));
+                // `trigger` on a playing instance restarts it.
+                if step.is_some() && id.is_some() {
+                    self.invokes.push((from, Node::SeqStops(j), target.span));
+                }
             }
             if let Some(id) = id {
                 self.instance_id(id);
@@ -608,6 +706,23 @@ impl Checker {
             return Type::Error;
         };
         self.resolve(target.span, Resolution::Event(i));
+        if i >= self.written_events {
+            let seq = self.seq_names[(i - self.written_events) / EventKind::SEQ.len()].clone();
+            let e = self
+                .error(
+                    target.span,
+                    format!(
+                        "`{}` is made by sequence `{seq}`, so it cannot be invoked",
+                        target.name
+                    ),
+                )
+                .with_help(format!("invoke the sequence instead, as in `invoke {seq}`"));
+            self.report(e);
+            for a in args {
+                self.expr(&a.value);
+            }
+            return Type::Error;
+        }
         if let Some(from) = self.handler {
             self.invokes.push((from, Node::Event(i), target.span));
         }
@@ -674,28 +789,45 @@ impl Checker {
         for &(from, to, at) in &self.invokes {
             edges.entry(from).or_default().push((to, at));
         }
+        // What happens in the same sample as starting or stopping an
+        // instance. Later events (later steps, repeats, finishing) cannot
+        // loop within one sample; replacing an instance can, but never one
+        // started in the same sample, so it ends.
+        const AT_START: [EventKind; 6] = [
+            EventKind::Start,
+            EventKind::Bar,
+            EventKind::Beat,
+            EventKind::Step,
+            EventKind::Rest,
+            EventKind::NoteOn,
+        ];
+        const AT_STOP: [EventKind; 3] = [EventKind::NoteOff, EventKind::Halted, EventKind::End];
         for j in 0..program.seqs.len() {
             let from = Sender::Seq(j as u16);
+            let span = program.seqs[j].name.span;
             for (i, d) in self.events.iter().enumerate() {
-                if let Some(d) = d
-                    && (d.accepts(from, 0, EventKind::NoteOn)
-                        || d.accepts(from, 0, EventKind::NoteOff))
-                {
-                    let span = program.seqs[j].name.span;
-                    edges
-                        .entry(Node::Seq(j))
-                        .or_default()
-                        .push((Node::Event(i), span));
+                let Some(d) = d else { continue };
+                for (node, kinds) in [
+                    (Node::SeqStarts(j), &AT_START[..]),
+                    (Node::SeqStops(j), &AT_STOP[..]),
+                ] {
+                    if kinds.iter().any(|&k| d.accepts(from, 0, k)) {
+                        edges.entry(node).or_default().push((Node::Event(i), span));
+                    }
                 }
             }
         }
+        let events = &self.events;
         let name = |n: Node| match n {
             Node::Start => "start".to_owned(),
-            Node::Event(i) => program.events[i].name.name.clone(),
-            Node::Seq(j) => program.seqs[j].name.name.clone(),
+            Node::Event(i) => events[i]
+                .as_ref()
+                .map_or_else(String::new, |d| d.name.clone()),
+            Node::SeqStarts(j) | Node::SeqStops(j) => program.seqs[j].name.name.clone(),
         };
         let mut reported: HashSet<Vec<String>> = HashSet::new();
-        for start in (0..program.events.len()).map(Node::Event) {
+        let mut found = Vec::new();
+        for start in (0..self.events.len()).map(Node::Event) {
             // Depth-first search for a path back to `start`. `path` holds
             // the nodes after `start`, each with the invoke that led there.
             let mut path: Vec<(Node, Span)> = Vec::new();
@@ -725,10 +857,7 @@ impl Checker {
                             .map(|n| format!("`{n}`"))
                             .collect::<Vec<_>>()
                             .join(" -> ");
-                        let e = self
-                            .error(site, format!("invoking here can lead back to the same handler: {chain}"))
-                            .with_help("a sequence's first notes and invoked events arrive at the same sample, so this would never end");
-                        self.report(e);
+                        found.push((site, chain));
                     }
                     continue;
                 }
@@ -738,6 +867,12 @@ impl Checker {
                 path.push((to, at));
                 stack.push((to, 0));
             }
+        }
+        for (site, chain) in found {
+            let e = self
+                .error(site, format!("invoking here can lead back to the same handler: {chain}"))
+                .with_help("a sequence's start and first step, a halt, and invoked events all happen in the same sample, so this would never end");
+            self.report(e);
         }
     }
 
@@ -1012,8 +1147,11 @@ impl Checker {
         self.sizes.clear();
         self.def_bindings.push((generic_ids, param_ids));
 
+        // A type that failed to resolve may well have used it.
+        let broken = params.iter().any(|p| p.ty.leaf().is_wild()) || ret.leaf().is_wild();
         for g in &d.generics {
-            let used = params.iter().any(|p| mentions_size(&p.ty, &g.name))
+            let used = broken
+                || params.iter().any(|p| mentions_size(&p.ty, &g.name))
                 || mentions_size(&ret, &g.name);
             if !used {
                 let e = self
@@ -1085,26 +1223,10 @@ impl Checker {
                     self.report(e);
                     return Type::Error;
                 }
-                let size = match size {
-                    SizeExpr::Lit(n, _) => Size::Const(*n),
-                    SizeExpr::Var(id) => {
-                        if !generics.contains(&id.name) {
-                            let e = self
-                                .error(id.span, format!("unknown size `{}`", id.name))
-                                .with_help(format!(
-                                    "declare it after the name, as in `rill f<{}>(...)`",
-                                    id.name
-                                ));
-                            self.report(e);
-                            return Type::Error;
-                        }
-                        if let Some(&(_, b)) = self.sizes.iter().find(|(n, _)| *n == id.name) {
-                            self.resolve(id.span, Resolution::Binding(b));
-                        }
-                        Size::Var(id.name.clone())
-                    }
-                };
-                Type::Frame(Box::new(elem_ty), size)
+                match self.size(size, generics) {
+                    Some(size) => Type::Frame(Box::new(elem_ty), size),
+                    None => Type::Error,
+                }
             }
             TypeExpr::Fn { params, ret, .. } => {
                 let params = params
@@ -1516,9 +1638,8 @@ impl Checker {
                 self.scope_spans.push(body.span);
                 if let Some(param) = params.first() {
                     let ty = match kind {
-                        Some(EventKind::NoteOn) => Type::NoteOn,
-                        Some(EventKind::NoteOff) => Type::NoteOff,
                         Some(EventKind::ControlChange) => Type::Float,
+                        Some(kind) => Type::Event(kind),
                         None => Type::Error,
                     };
                     self.bind(param, ty, VarKind::EventParam, param.span.end);
@@ -1813,6 +1934,8 @@ impl Checker {
             ExprKind::Fn { params, ret, body } => self.lambda(e, params, ret.as_ref(), body, None),
             ExprKind::Repeat(x, n) => {
                 let t = self.expr(x);
+                let generics = self.generics();
+                let size = self.size(n, &generics);
                 if t.is_wild() {
                     Type::Error
                 } else if !t.leaf().is_quantity() {
@@ -1822,12 +1945,12 @@ impl Checker {
                     );
                     self.report(d);
                     Type::Error
-                } else if *n == 0 {
+                } else if size == Some(Size::Const(0)) {
                     let d = self.error(e.span, "a frame needs at least one channel");
                     self.report(d);
                     Type::Error
                 } else {
-                    Type::Frame(Box::new(t), Size::Const(*n))
+                    size.map_or(Type::Error, |n| Type::Frame(Box::new(t), n))
                 }
             }
             ExprKind::Invoke {
@@ -1842,7 +1965,12 @@ impl Checker {
                     self.instance_id(id);
                 }
                 match self.seq_names.iter().position(|n| *n == target.name) {
-                    Some(j) => self.resolve(target.span, Resolution::Seq(j)),
+                    Some(j) => {
+                        self.resolve(target.span, Resolution::Seq(j));
+                        if let Some(from) = self.handler {
+                            self.invokes.push((from, Node::SeqStops(j), target.span));
+                        }
+                    }
                     None => {
                         let d = self.unknown_seq(target);
                         self.report(d);
@@ -1854,6 +1982,33 @@ impl Checker {
                 let from = self.expr(x);
                 let to = self.resolve_type(te, &self.generics());
                 self.cast(e.span, &from, to)
+            }
+            ExprKind::Field(base, field) if self.seq_of(base).is_some() => {
+                let j = self.seq_of(base).expect("matched");
+                self.resolve(base.span, Resolution::Seq(j));
+                match seq_field(&self.seq_facts[j], &field.name) {
+                    Some((ty, value)) => {
+                        self.const_values.insert(e.id, value);
+                        ty
+                    }
+                    None => {
+                        let fields =
+                            listing(&SEQ_FIELDS.iter().map(|(n, _)| *n).collect::<Vec<_>>());
+                        let mut d = self.error(
+                            field.span,
+                            format!(
+                                "sequence `{}` has no field `{}`",
+                                self.seq_names[j], field.name
+                            ),
+                        );
+                        d = match suggest(&field.name, SEQ_FIELDS.iter().map(|(n, _)| *n)) {
+                            Some(s) => d.with_help(format!("did you mean `{s}`?")),
+                            None => d.with_help(format!("a sequence has {fields}")),
+                        };
+                        self.report(d);
+                        Type::Error
+                    }
+                }
             }
             ExprKind::Field(base, field) => {
                 let base_ty = self.expr(base);
@@ -2280,22 +2435,135 @@ impl Checker {
         let generics = self.generics();
         let mut out = Vec::new();
         for size in sizes {
-            out.push(match size {
-                SizeExpr::Lit(n, _) => Size::Const(*n),
-                SizeExpr::Var(id) if generics.contains(&id.name) => {
-                    if let Some(var) = self.lookup(&id.name) {
-                        self.resolve(id.span, Resolution::Binding(var.id));
-                    }
-                    Size::Var(id.name.clone())
-                }
-                SizeExpr::Var(id) => {
-                    let e = self.error(id.span, format!("unknown size `{}`", id.name));
-                    self.report(e);
-                    Size::Const(0)
-                }
-            });
+            out.push(self.size(size, &generics).unwrap_or(Size::Const(0)));
         }
         Some(out)
+    }
+
+    /// A size: a whole number, one of `generics`, or a constant worked out
+    /// here (`riff.step_count * 2`). `None` after reporting a problem.
+    fn size(&mut self, size: &SizeExpr, generics: &[String]) -> Option<Size> {
+        match size {
+            SizeExpr::Lit(n, _) => Some(Size::Const(*n)),
+            SizeExpr::Var(id) => {
+                if builtins::constant(&id.name).is_some() && !generics.contains(&id.name) {
+                    let e = self
+                        .error(id.span, format!("`{}` cannot be a size", id.name))
+                        .with_help("a size is a whole number known while checking, as in `8` or `riff.step_count`");
+                    self.report(e);
+                    return None;
+                }
+                if !generics.contains(&id.name) {
+                    let e = self
+                        .error(id.span, format!("unknown size `{}`", id.name))
+                        .with_help(format!(
+                            "a size is a whole number, a constant such as `riff.step_count`, or a size parameter declared after the name, as in `rill f<{}>(...)`",
+                            id.name
+                        ));
+                    self.report(e);
+                    return None;
+                }
+                let binding = self
+                    .sizes
+                    .iter()
+                    .find(|(n, _)| *n == id.name)
+                    .map(|&(_, b)| b)
+                    .or_else(|| self.lookup(&id.name).map(|v| v.id));
+                if let Some(b) = binding {
+                    self.resolve(id.span, Resolution::Binding(b));
+                }
+                Some(Size::Var(id.name.clone()))
+            }
+            SizeExpr::Expr(e) => {
+                let mut names = Vec::new();
+                expr_names(e, &mut names);
+                if let Some(name) = names.into_iter().find(|n| generics.contains(n)) {
+                    let d = self
+                        .error(
+                            e.span,
+                            format!("a size cannot be worked out from size parameter `{name}` yet"),
+                        )
+                        .with_help(format!(
+                            "take the size as a size parameter of its own, next to `{name}`"
+                        ));
+                    self.report(d);
+                    return None;
+                }
+                let t = self.expr(e);
+                if t.is_wild() {
+                    return None;
+                }
+                let problem = match self.const_value(e) {
+                    Ok(v) if v >= 1.0 && v.fract() == 0.0 && v <= f64::from(u32::MAX) => {
+                        self.const_values.insert(e.id, v);
+                        return Some(Size::Const(v as u32));
+                    }
+                    Ok(v) => self
+                        .error(e.span, format!("a size must be a whole number of at least 1; this is {v}")),
+                    Err(Some(name)) => self
+                        .error(e.span, format!("a size cannot be worked out from size parameter `{name}` yet"))
+                        .with_help(format!("take the size as a size parameter of its own, next to `{name}`")),
+                    Err(None) => self
+                        .error(e.span, "a size must be a constant whole number")
+                        .with_help("as in `8`, `riff.step_count` or `riff.step_count * 2`; values known only while playing, and `RATE`, cannot be sizes"),
+                };
+                self.report(problem);
+                None
+            }
+        }
+    }
+
+    /// The value of `e` if it is known while checking: numbers, arithmetic,
+    /// casts and the fixed facts of sequences. `Err(Some(n))` if it depends
+    /// on size parameter `n`, `Err(None)` if it is not known.
+    fn const_value(&self, e: &Expr) -> Result<f64, Option<String>> {
+        match &e.kind {
+            ExprKind::Number {
+                value, unit: None, ..
+            } => Ok(*value),
+            ExprKind::Unary(UnOp::Neg, x) => Ok(-self.const_value(x)?),
+            ExprKind::Unary(UnOp::Plus, x) => self.const_value(x),
+            ExprKind::Binary(op, a, b) => {
+                let (a, b) = (self.const_value(a)?, self.const_value(b)?);
+                match op {
+                    BinOp::Add => Ok(a + b),
+                    BinOp::Sub => Ok(a - b),
+                    BinOp::Mul => Ok(a * b),
+                    BinOp::Div => Ok(a / b),
+                    BinOp::Rem => Ok(a % b),
+                    _ => Err(None),
+                }
+            }
+            ExprKind::Cast(x, TypeExpr::Named(t)) if t.name == "Int" => {
+                Ok(self.const_value(x)?.trunc())
+            }
+            ExprKind::Cast(x, TypeExpr::Named(t))
+                if matches!(t.name.as_str(), "Float" | "Sample") =>
+            {
+                self.const_value(x)
+            }
+            ExprKind::Field(base, field) => match self.seq_of(base) {
+                Some(j) => seq_field(&self.seq_facts[j], &field.name)
+                    .map(|(_, v)| v)
+                    .ok_or(None),
+                None => Err(None),
+            },
+            ExprKind::Name(n) => match self.lookup(n) {
+                Some(v) if v.kind == VarKind::Size => Err(Some(n.clone())),
+                _ => Err(None),
+            },
+            _ => Err(None),
+        }
+    }
+
+    /// The sequence `e` names, if it is a name that is not shadowed.
+    fn seq_of(&self, e: &Expr) -> Option<usize> {
+        match &e.kind {
+            ExprKind::Name(n) if self.lookup(n).is_none() => {
+                self.seq_names.iter().position(|s| s == n)
+            }
+            _ => None,
+        }
     }
 
     /// Report every `each` in `args`, where `why` says there are no copies.
@@ -2653,10 +2921,10 @@ impl Checker {
                     && !builtins::lookup(name).is_empty()
                     && args.iter().all(|a| self.is_const(&a.value))
             }
+            ExprKind::Field(base, _) => self.seq_of(base).is_some(),
             ExprKind::If { .. }
             | ExprKind::Block(_)
             | ExprKind::Index(..)
-            | ExprKind::Field(..)
             | ExprKind::Range { .. }
             | ExprKind::Fn { .. }
             | ExprKind::Invoke { .. }
@@ -2850,11 +3118,21 @@ fn mentions_size(t: &Type, name: &str) -> bool {
     }
 }
 
-fn size_span(size: &SizeExpr) -> Span {
-    match size {
-        SizeExpr::Lit(_, span) => *span,
-        SizeExpr::Var(id) => id.span,
+/// The plain names `e` reads, for spotting size parameters in sizes.
+fn expr_names(e: &Expr, out: &mut Vec<String>) {
+    match &e.kind {
+        ExprKind::Name(n) => out.push(n.clone()),
+        ExprKind::Unary(_, x) | ExprKind::Cast(x, _) | ExprKind::Field(x, _) => expr_names(x, out),
+        ExprKind::Binary(_, a, b) => {
+            expr_names(a, out);
+            expr_names(b, out);
+        }
+        _ => {}
     }
+}
+
+fn size_span(size: &SizeExpr) -> Span {
+    size.span()
 }
 
 fn unify(param: &Type, arg: &Type, subst: &mut Subst, generics: &[String]) -> bool {
@@ -3185,6 +3463,87 @@ fn gain_arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
 }
 
 /// `a`, `b` and `c`
+/// What is fixed about a sequence when the program is built, and the same
+/// for every instance: what `riff.step_count` and the others read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SeqFacts {
+    pub step_count: u32,
+    /// The meter, as in 3/4.
+    pub beats_per_bar: u32,
+    pub beat_unit: u32,
+    /// A step, as a fraction of a whole note.
+    pub step_size: f64,
+    pub instances: u32,
+}
+
+impl SeqFacts {
+    fn of(seq: &SeqDecl, instances: Option<f64>) -> SeqFacts {
+        let setting = |name: &str| {
+            seq.settings
+                .iter()
+                .find(|s| s.name.name == name)
+                .and_then(|s| fraction(&s.value))
+                .filter(|&(n, d)| n >= 1 && d >= 1)
+        };
+        let (beats_per_bar, beat_unit) = setting("meter").unwrap_or((4, 4));
+        let (n, d) = setting("step").unwrap_or((1, 8));
+        SeqFacts {
+            step_count: seq.steps.len() as u32,
+            beats_per_bar,
+            beat_unit,
+            step_size: f64::from(n) / f64::from(d),
+            instances: instances
+                .filter(|v| *v >= 1.0 && v.fract() == 0.0 && *v <= 65_535.0)
+                .map_or(64, |v| v as u32),
+        }
+    }
+
+    /// How many beats one step lasts.
+    pub fn step_beats(&self) -> f64 {
+        self.step_size * f64::from(self.beat_unit)
+    }
+}
+
+/// The fields of a sequence, with what each means.
+pub const SEQ_FIELDS: &[(&str, &str)] = &[
+    ("step_count", "How many steps it has, rests included."),
+    ("beats_per_bar", "The top of its meter: 3 in 3/4."),
+    (
+        "beat_unit",
+        "The bottom of its meter: 4 in 3/4, so a beat is a quarter note.",
+    ),
+    (
+        "step_size",
+        "How long a step is, as a fraction of a whole note: 0.125 for `step: 1/8`.",
+    ),
+    (
+        "steps_per_beat",
+        "How many steps make a beat: 2 for eighth-note steps in 4/4.",
+    ),
+    ("beat_count", "How long it is, in beats."),
+    (
+        "bar_count",
+        "How long it is, in bars; not a whole number when the last bar is short.",
+    ),
+    ("instances", "How many instances can play at once."),
+];
+
+/// The type and value of field `name` of a sequence with `facts`.
+pub fn seq_field(facts: &SeqFacts, name: &str) -> Option<(Type, f64)> {
+    let beats = f64::from(facts.step_count) * facts.step_beats();
+    Some(match name {
+        "step_count" => (Type::Int, f64::from(facts.step_count)),
+        "beats_per_bar" => (Type::Int, f64::from(facts.beats_per_bar)),
+        "beat_unit" => (Type::Int, f64::from(facts.beat_unit)),
+        "step_size" => (Type::Float, facts.step_size),
+        "steps_per_beat" => (Type::Float, 1.0 / facts.step_beats()),
+        "beat_count" => (Type::Float, beats),
+        "bar_count" => (Type::Float, beats / f64::from(facts.beats_per_bar)),
+        "instances" => (Type::Int, f64::from(facts.instances)),
+        _ => return None,
+    })
+}
+
 fn listing(names: &[&str]) -> String {
     let quoted: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
     match quoted.split_last() {
@@ -3232,6 +3591,8 @@ fn event_field_type(kind: EventKind, name: &str) -> Option<Type> {
         (EventKind::NoteOn | EventKind::NoteOff, "pitch") => Some(Type::Pitch),
         (EventKind::NoteOn | EventKind::NoteOff, "instance") => Some(Type::Int),
         (EventKind::NoteOn, "velocity") | (EventKind::NoteOff, "release") => Some(Type::Float),
+        // The events sequences make carry whole numbers.
+        (kind, name) if kind.is_seq_only() && kind.fields().contains(&name) => Some(Type::Int),
         _ => None,
     }
 }

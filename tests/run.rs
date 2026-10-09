@@ -31,8 +31,14 @@ fn graph(src: &str, channels: usize) -> Graph {
     graph_from(src, channels, "main")
 }
 
+/// Built with a fixed seed, so programs using `random()` build the same
+/// every time.
 fn graph_from(src: &str, channels: usize, entry: &str) -> Graph {
-    match lang::load(src, &config(channels), entry) {
+    let options = lang::build::Options {
+        seed: Some(0),
+        ..Default::default()
+    };
+    match lang::load_with(src, &config(channels), entry, &options) {
         Ok((graph, _)) => graph,
         Err(diags) => {
             let rendered: String = diags.iter().map(|d| d.render("test.rill", src)).collect();
@@ -1846,4 +1852,263 @@ fn running_together_with_each() {
         }
     ";
     same_either_way(src, 2, 2000, &[]);
+}
+
+// ---- the events sequences make -------------------------------------------
+
+/// Handlers that log what a sequence called `riff` does, as digits, one
+/// per event in the order they arrive within a sample. `life`: note on 1,
+/// note off 2, start 3, finished 4, halted 5, replaced 6, end 7, repeated
+/// 8. `time`: bar 1, beat 2, step 3, rest 4, note on 5.
+const RIFF_LOG: &str = "
+    state life: Float = 0
+    state time: Float = 0
+    on riff_note_on { life = life * 10 + 1; time = time * 10 + 5 }
+    on riff_note_off { life = life * 10 + 2 }
+    on riff_start { life = life * 10 + 3 }
+    on riff_finished { life = life * 10 + 4 }
+    on riff_halted { life = life * 10 + 5 }
+    on riff_replaced { life = life * 10 + 6 }
+    on riff_end { life = life * 10 + 7 }
+    on riff_repeated { life = life * 10 + 8 }
+    on riff_bar { time = time * 10 + 1 }
+    on riff_beat { time = time * 10 + 2 }
+    on riff_step { time = time * 10 + 3 }
+    on riff_rest { time = time * 10 + 4 }
+    let out = [life, time]
+    life = 0
+    time = 0
+";
+
+/// Render `main` (with [`RIFF_LOG`] at the top of its body and `body`
+/// after) for `frames`, sending a control change `value` from sender 1 at
+/// each `(frame, value)`. Returns the frames where something happened,
+/// with what.
+fn riff_log(
+    head: &str,
+    body: &str,
+    frames: usize,
+    sends: &[(usize, f32)],
+) -> Vec<(usize, u32, u32)> {
+    let src = format!("{head}\nrill main() [Sample; 2] {{\n{RIFF_LOG}\n{body}\nreturn out\n}}");
+    let mut engine = Engine::new(graph(&src, 2), config(2)).unwrap();
+    let mut out = vec![0.0f32; frames * 2];
+    let mut done = 0;
+    for &(at, value) in sends.iter().chain(std::iter::once(&(frames, 0.0))) {
+        engine.render_interleaved(&mut out[done * 2..at * 2]);
+        if at < frames {
+            engine.send(&Event {
+                sender: 1,
+                channel: 0,
+                payload: Payload::Control(value),
+            });
+        }
+        done = at;
+    }
+    out.chunks(2)
+        .enumerate()
+        .filter(|(_, f)| f[0] != 0.0 || f[1] != 0.0)
+        .map(|(i, f)| (i, f[0] as u32, f[1] as u32))
+        .collect()
+}
+
+// At 48000bpm a beat is 60 samples, so an eighth-note step in 4/4 is 30.
+
+#[test]
+fn a_sequence_tells_what_it_does() {
+    let head = "seq riff(step: 1/8, tempo: 48000bpm, gate: 0.5, repeat: 2) { C4, _, E4 }";
+    let log = riff_log(head, "on start { invoke riff }", 400, &[]);
+    assert_eq!(
+        log,
+        [
+            // Start, then bar 1, beat 1, step 1 and its note.
+            (0, 31, 1235),
+            (15, 2, 0),
+            // Step 2 is a rest.
+            (30, 0, 34),
+            // Beat 2, step 3.
+            (60, 1, 235),
+            (75, 2, 0),
+            // The pattern is 1.5 beats; the second pass starts on bar 1.
+            (90, 81, 1235),
+            (105, 2, 0),
+            (120, 0, 34),
+            (150, 1, 235),
+            (165, 2, 0),
+            // Finished once the last step is over, then the end.
+            (180, 47, 0),
+        ]
+    );
+}
+
+#[test]
+fn sequences_restart_replace_and_halt() {
+    let head = "
+        seq riff(step: 1/8, tempo: 48000bpm, gate: 0.5, loop: true, instances: 2) { C4, D4 }
+        event go control_change(sender: 1)
+    ";
+    let body = "
+        on start { invoke 7 riff }
+        on go(v) {
+            if v == 1 { trigger 2 7 riff }
+            if v == 2 { invoke riff; invoke riff }
+            if v == 3 { halt riff }
+        }
+    ";
+    let log = riff_log(head, body, 100, &[(10, 1.0), (50, 2.0), (70, 3.0)]);
+    assert_eq!(
+        log,
+        [
+            (0, 31, 1235),
+            // Restarting at step 2: the held note ends, `halted` and `end`,
+            // then `start` and step 2 (no beat starts there).
+            (10, 25731, 35),
+            (25, 2, 0),
+            (40, 81, 1235),
+            // Two starts with room for one more: the first takes the free
+            // instance, the second replaces the oldest (ending its note).
+            // Both then play step 1.
+            (50, 3267311, 12351235),
+            (65, 22, 0),
+            // Halting both.
+            (70, 5757, 0),
+        ]
+    );
+}
+
+#[test]
+fn bars_and_beats_follow_the_meter() {
+    // 3/4 with eighth-note steps: 8 steps are 4 beats, a bar and a short one.
+    let head =
+        "seq riff(meter: 3/4, step: 1/8, tempo: 48000bpm, repeat: 2) { C4, _, _, _, _, _, _, _ }";
+    let src = format!(
+        "{head}
+        rill main() [Sample; 4] {{
+            state beat: Float = 0
+            state bar: Float = 0
+            state pass: Float = 0
+            state start: Float = 0
+            on start {{ trigger 3 riff }}
+            on riff_start(s) {{ start = (s.step * 100 + s.instance) as Float }}
+            on riff_beat(b) {{
+                beat = b.beat as Float
+                bar = b.bar as Float
+                pass = b.pass as Float
+            }}
+            return [beat, bar, pass, start]
+        }}"
+    );
+    let out = render_with(&src, 4, 400, Blocks::Fixed(64));
+    let at = |f: usize| [out[f * 4], out[f * 4 + 1], out[f * 4 + 2]];
+    // `trigger 3` starts on a beat: beat 2 of bar 1, at once.
+    assert_eq!(out[3], 300.0 - 1.0, "step 3, fresh id -1");
+    assert_eq!(at(0), [2.0, 1.0, 1.0]);
+    assert_eq!(at(60), [3.0, 1.0, 1.0]);
+    assert_eq!(at(120), [1.0, 2.0, 1.0]);
+    // The second pass starts on bar 1 again.
+    assert_eq!(at(180), [1.0, 1.0, 2.0]);
+    assert_eq!(at(300), [3.0, 1.0, 2.0]);
+    assert_eq!(at(360), [1.0, 2.0, 2.0]);
+}
+
+#[test]
+fn beats_can_fall_between_steps() {
+    // Dotted eighths in 4/4: steps every 0.75 beats.
+    let head = "seq riff(step: 3/16, tempo: 48000bpm, gate: 0.5) { C4, C4, C4, C4 }";
+    let log = riff_log(head, "on start { invoke riff }", 300, &[]);
+    let times: Vec<(usize, u32)> = log
+        .iter()
+        .map(|&(f, _, t)| (f, t))
+        .filter(|&(_, t)| t != 0)
+        .collect();
+    assert_eq!(
+        times,
+        [(0, 1235), (45, 35), (60, 2), (90, 35), (120, 2), (135, 35)]
+    );
+    assert_eq!(log.last(), Some(&(180, 47, 0)));
+}
+
+#[test]
+fn voices_claim_a_sequences_own_notes() {
+    let src = "
+        seq riff(step: 1/4, tempo: 480bpm) { [C4, E4, G4] }
+        rill voice() Sample {
+            state level: Float = 0
+            on riff_note_on(n) claim { level = n.velocity }
+            on riff_note_off release { level = 0 }
+            return level
+        }
+        rill main() [Sample; 3] {
+            on start { invoke riff(velocity: 0.5) }
+            return [voice(); 3]
+        }
+    ";
+    assert_eq!(render_with(src, 3, 1, Blocks::Fixed(1)), [0.5, 0.5, 0.5]);
+}
+
+#[test]
+fn restarting_when_finished() {
+    // Each run finishes, and its handler starts the next one.
+    let src = "
+        seq riff(step: 1/8, tempo: 48000bpm) { C4, C4 }
+        rill main() Sample {
+            state runs: Float = 0
+            on start { invoke riff }
+            on riff_finished { invoke riff }
+            on riff_start { runs = runs + 1 }
+            return runs
+        }
+    ";
+    let out = render(src, 200);
+    // A run lasts 60 samples.
+    assert_eq!((out[0], out[59], out[60], out[199]), (1.0, 1.0, 2.0, 4.0));
+}
+
+#[test]
+fn sequence_facts_are_constants() {
+    let src = "
+        seq riff(meter: 3/4, step: 1/16, instances: 8) { C4, _, E4, _, G4, _ }
+        rill main() [Sample; 4] {
+            let accents = [0.5; riff.step_count]
+            let pads: [Float; riff.instances / 4] = [1, 1]
+            return [sum(accents), sum(pads), riff.bar_count, riff.steps_per_beat]
+        }
+    ";
+    assert_eq!(
+        render_with(src, 4, 1, Blocks::Fixed(1)),
+        [3.0, 2.0, 0.5, 4.0]
+    );
+}
+
+#[test]
+fn running_together_with_sequence_events() {
+    let src = "
+        seq riff(meter: 3/4, step: 1/8, tempo: 300bpm, gate: 0.8, repeat: 3) {
+            [C4, E4], _, G4, [D4, F4, A4], _, B4,
+        }
+        rill sine(freq: Freq) Sample {
+            state phase: Float = 0
+            phase = wrap(phase + freq / RATE)
+            return sin(phase * TAU)
+        }
+        rill voice() Sample {
+            state pitch: Pitch = C4
+            state level: Float = 0
+            state accent: Float = 1
+            on riff_note_on(n) claim { pitch = n.pitch; level = n.velocity }
+            on riff_note_off release { level = 0 }
+            on riff_bar { accent = 1.5 }
+            on riff_beat(b) { accent = if b.beat == 1 { 1.5 } else { 1 } }
+            return sine(pitch |> equal) * level * accent
+        }
+        rill main() [Sample; 2] {
+            state steps: Float = 0
+            on start { invoke riff }
+            on riff_finished { invoke riff(tempo: 400bpm) }
+            on riff_step(s) { steps = s.step as Float / riff.step_count as Float }
+            let mix = sum([voice(); 4]) * 0.2
+            return [mix, mix * steps]
+        }
+    ";
+    same_either_way(src, 2, 48_000, &[]);
 }

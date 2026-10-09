@@ -881,14 +881,21 @@ fn every_lifted_element_has_its_own_state() {
 
 #[test]
 fn nested_frames_in_operators_state_and_indexing() {
-    // A shorter frame lines up with the outer layer: one gain per bus.
-    let src = "rill main() [Sample; 2] { return sum([[1, 2], [3, 4]] * [10, 100]) }";
-    assert_eq!(stereo(src, 1), [[310.0, 420.0]]);
+    // A shorter frame lines up with the end it matches: one gain per bus,
+    // or one per channel of every bus.
+    let src = "rill main() [Sample; 2] { return sum([[1, 2], [3, 4], [5, 6]] * [10, 100, 1000]) }";
+    assert_eq!(stereo(src, 1), [[5310.0, 6420.0]]);
+    let src = "rill main() [Sample; 2] { return sum([[1, 2], [3, 4], [5, 6]] * [10, 100]) }";
+    assert_eq!(stereo(src, 1), [[90.0, 1200.0]]);
+    // A square shape needs saying which.
+    let src = "rill main() [Sample; 2] { return sum([[1, 2], [3, 4]] * [[10, 100]; 2]) }";
+    assert_eq!(stereo(src, 1), [[40.0, 600.0]]);
 
     // One level per voice.
-    let src = "rill main() [Sample; 2] { return sum([[1, 1], [1, 1]] + [0dB, -6dB]) }";
+    let src =
+        "rill main() [Sample; 2] { return sum([[1, 1], [1, 1], [1, 1]] + [0dB, -6dB, -6dB]) }";
     let out = stereo(src, 1);
-    assert!((out[0][0] - 1.501).abs() < 1e-3, "{out:?}");
+    assert!((out[0][0] - 2.002).abs() < 1e-3, "{out:?}");
 
     // Reductions take the outer layer off.
     let src = "rill main() [Sample; 2] { return max([[1, 5], [3, 2]]) + min([[1, 5], [3, 2]]) }";
@@ -1485,7 +1492,10 @@ fn same_either_way(
     events: &[(usize, Event)],
 ) -> (usize, usize) {
     let run = |vectorize: bool| {
-        let options = lang::build::Options { vectorize };
+        let options = lang::build::Options {
+            vectorize,
+            seed: Some(7),
+        };
         let (graph, _) = lang::load_with(src, &config(channels), "main", &options)
             .unwrap_or_else(|d| panic!("{d:#?}"));
         let mut engine = Engine::new(graph, config(channels)).unwrap();
@@ -1665,4 +1675,175 @@ fn running_together_with_sequences() {
         }
     ";
     same_either_way(src, 1, 48_000, &[]);
+}
+
+// ---- lining shapes up, `each` and `random()` -------------------------------
+
+/// Render `src` built with `seed` for `random()`.
+fn render_seeded(src: &str, channels: usize, frames: usize, seed: Option<u64>) -> Vec<f32> {
+    let options = lang::build::Options {
+        seed,
+        ..Default::default()
+    };
+    let (graph, _) = lang::load_with(src, &config(channels), "main", &options)
+        .unwrap_or_else(|d| panic!("{d:#?}"));
+    let mut engine = Engine::new(graph, config(channels)).unwrap();
+    offline::render(&mut engine, frames, &Blocks::Fixed(1))
+}
+
+#[test]
+fn shorter_shapes_reach_the_right_copies() {
+    let src = "
+        rill mul(x: Sample, g: Float) Sample { return x * g }
+        rill main() [Sample; 4] {
+            let b: [[Sample; 2]; 3] = [[1, 2], [3, 4], [5, 6]]
+            let inner = b * [10, 100]
+            let outer = b * [1, 2, 3]
+            let lifted_inner = mul(b, [10, 100])
+            let lifted_outer = mul(b, [1, 2, 3])
+            return [inner[2][1], outer[2][0], lifted_inner[1][1], lifted_outer[1][0]]
+        }
+    ";
+    assert_eq!(
+        render_with(src, 4, 1, Blocks::Fixed(1)),
+        [600.0, 15.0, 400.0, 6.0]
+    );
+}
+
+const PICK: &str = "
+rill pick(x: Sample, r: Float) Sample { return r }
+";
+
+#[test]
+fn each_makes_a_value_per_copy() {
+    let shared = format!(
+        "{PICK}
+        rill main() [Sample; 4] {{
+            let v: [Sample; 4] = [0, 0, 0, 0]
+            return pick(v, random())
+        }}"
+    );
+    let out = render_seeded(&shared, 4, 1, Some(1));
+    assert!(out.iter().all(|&x| x == out[0]), "{out:?}");
+
+    let each = format!(
+        "{PICK}
+        rill main() [Sample; 6] {{
+            let v: [[Sample; 2]; 3] = [[0, 0], [0, 0], [0, 0]]
+            let p = v |> pick(r: each random())
+            return [p[0][0], p[0][1], p[1][0], p[1][1], p[2][0], p[2][1]]
+        }}"
+    );
+    let out = render_seeded(&each, 6, 1, Some(1));
+    for (i, x) in out.iter().enumerate() {
+        assert!((0.0..1.0).contains(x), "{out:?}");
+        assert!(out[..i].iter().all(|y| y != x), "{out:?}");
+    }
+}
+
+#[test]
+fn each_gives_every_copy_its_own_rill_instance() {
+    // A shared instance would count up once per copy every tick.
+    let src = format!(
+        "{PICK}
+        rill acc(step: Float) Float {{
+            state t: Float = 0
+            t += step
+            return t
+        }}
+        rill main() [Sample; 4] {{
+            let v: [Sample; 4] = [0, 0, 0, 0]
+            return pick(v, r: each acc(random()))
+        }}"
+    );
+    let out = render_seeded(&src, 4, 3, Some(3));
+    let (first, third) = (&out[..4], &out[8..]);
+    for (a, c) in first.iter().zip(third) {
+        assert!((c - 3.0 * a).abs() < 1e-5, "{out:?}");
+    }
+    assert!(first.iter().skip(1).any(|x| *x != first[0]), "{out:?}");
+}
+
+#[test]
+fn random_is_picked_from_the_seed() {
+    let src = main_returning("random()");
+    let one = render_seeded(&src, 1, 2, Some(42));
+    assert_eq!(one, render_seeded(&src, 1, 2, Some(42)));
+    assert_ne!(one, render_seeded(&src, 1, 2, Some(43)));
+    // Without a seed, every build picks a new one.
+    assert_ne!(
+        render_seeded(&src, 1, 1, None),
+        render_seeded(&src, 1, 1, None)
+    );
+    // Picked once: the same number every sample.
+    assert_eq!(one[0], one[1]);
+    assert!((0.0..1.0).contains(&one[0]));
+}
+
+#[test]
+fn random_picks_within_its_range() {
+    let src = "
+        rill main() [Sample; 4] {
+            return [
+                random(lo: 100Hz, hi: 200Hz) / 1Hz,
+                amp(random(-12dB, 0dB)),
+                random(-1, 1),
+                random(),
+            ]
+        }
+    ";
+    for seed in 0..50 {
+        let out = render_seeded(src, 4, 1, Some(seed));
+        assert!((100.0..200.0).contains(&out[0]), "{out:?}");
+        assert!((0.25..=1.0).contains(&out[1]), "{out:?}");
+        assert!((-1.0..1.0).contains(&out[2]), "{out:?}");
+        assert!((0.0..1.0).contains(&out[3]), "{out:?}");
+    }
+    // Each `random()` picks its own number.
+    let out = render_seeded(&main_returning("random() - random()"), 1, 1, Some(5));
+    assert_ne!(out[0], 0.0);
+}
+
+#[test]
+fn random_numbers_are_constants() {
+    let src = "
+        rill main() Sample {
+            let x = random(lo: 0.2, hi: 0.4)
+            return sin(x * TAU) * random()
+        }
+    ";
+    let options = lang::build::Options {
+        seed: Some(9),
+        ..Default::default()
+    };
+    let (graph, _) = lang::load_with(src, &config(1), "main", &options).unwrap();
+    let engine = Engine::new(graph, config(1)).unwrap();
+    assert_eq!(engine.program_size().0, 0);
+}
+
+#[test]
+fn running_together_with_each() {
+    let src = "
+        fn blep(t: Float, dt: Float) Float {
+            if t < dt { let x = t / dt; x + x - x * x - 1 }
+            else if t > 1 - dt { let x = (t - 1) / dt; x * x + x + x + 1 }
+            else { 0 }
+        }
+        rill saw(freq: Freq, offset: Float = 0) Sample {
+            state phase: Float = 0
+            phase = wrap(phase + freq / RATE)
+            let p = wrap(phase + offset)
+            return p * 2 - 1 - blep(p, freq / RATE)
+        }
+        rill flip(x: Sample, r: Float) Sample {
+            if r < 0.5 { return -x }
+            return x
+        }
+        rill main() [Sample; 2] {
+            let freqs = [[110Hz, 111Hz, 112Hz, 113Hz], [220Hz, 221Hz, 222Hz, 223Hz]]
+            let voices = freqs |> saw(offset: each random()) |> flip(each random())
+            return [sum(voices[0]), sum(voices[1])] * [0.25, 0.25]
+        }
+    ";
+    same_either_way(src, 2, 2000, &[]);
 }

@@ -311,6 +311,9 @@ pub enum ExprKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Arg {
     pub name: Option<Ident>,
+    /// The span of `each` before the value: evaluate it once per copy of a
+    /// call that runs per element.
+    pub each: Option<Span>,
     pub value: Expr,
 }
 

@@ -383,7 +383,7 @@ fn lifting_needs_matching_channel_counts() {
     ";
     assert_eq!(
         error(src).0,
-        "channel counts differ: this has 3 channels, an earlier argument has 2"
+        "channel counts differ: this has 3 channels, another argument has 2"
     );
     assert_eq!(
         error(&body("let x = [1, 2] + [1, 2, 3]")).0,
@@ -1095,14 +1095,45 @@ fn lifting_peels_layers_until_the_argument_fits() {
 }
 
 #[test]
-fn lifted_arguments_need_the_same_extra_layers() {
+fn lifted_arguments_line_up_with_either_end() {
+    let stereo = || frame(Type::Sample, 2);
+    let src = with_voices(
+        "let a = pan(buses, [0.1, 0.2, 0.3, 0.4])
+         let b = pan(buses, [0.1, 0.9])
+         let c = pan([0.1, 0.9], pos: [mono, mono])",
+    );
+    // One position per bus (outer), or one per channel of every bus
+    // (inner).
+    assert_eq!(type_of(&src, "a"), frame(frame(stereo(), 2), 4));
+    assert_eq!(type_of(&src, "b"), frame(frame(stereo(), 2), 4));
+    assert_eq!(type_of(&src, "c"), frame(frame(stereo(), 3), 2));
+
     assert_eq!(
-        error(&with_voices("let x = pan(buses, [0.1, 0.2, 0.3, 0.4])")).0,
-        "this runs `pan` over shape `4`, an earlier argument over shape `4 × 2`"
+        error(&with_voices("let x = pan(buses, [0.1, 0.2, 0.3])")),
+        (
+            "this runs `pan` over shape `3`, another argument over shape `4 × 2`".into(),
+            Some(
+                "a value with fewer layers must match the outer or the inner layers of the other"
+                    .into()
+            )
+        )
+    );
+    assert_eq!(
+        error(&with_voices(
+            "let sq: [[Sample; 2]; 2] = [[s, s], [s, s]]\nlet x = pan(sq, [0.1, 0.9])"
+        )),
+        (
+            "shape `2` could line up with the outer or the inner layers of shape `2 × 2`".into(),
+            Some(
+                "say which: to reuse it for every outer element, repeat it, as in `[x; 2]`; for \
+                 one value per outer element, build the full shape"
+                    .into()
+            )
+        )
     );
     assert_eq!(
         error(&with_voices("let x = gain(buses, [1, 2])")).0,
-        "channel counts differ: this has 2 channels, an earlier argument has 4"
+        "channel counts differ: this has 2 channels, another argument has 4"
     );
     // Fns still take exactly what they declare.
     let src = format!(
@@ -1116,7 +1147,7 @@ fn lifted_arguments_need_the_same_extra_layers() {
 }
 
 #[test]
-fn operators_line_up_with_the_outer_layers() {
+fn operators_line_up_with_either_end() {
     let stereo = || frame(Type::Sample, 2);
     let src = with_voices(
         "let a = buses * 0.5
@@ -1131,9 +1162,25 @@ fn operators_line_up_with_the_outer_layers() {
     }
     assert_eq!(type_of(&src, "f"), frame(stereo(), 3));
 
+    // A frame matching the inner layers applies to every bus.
+    let src = with_voices("let g = buses * [1, 0.5]\nlet h = buses - [0dB, -6dB]");
+    assert_eq!(type_of(&src, "g"), frame(stereo(), 4));
+    assert_eq!(type_of(&src, "h"), frame(stereo(), 4));
+
     assert_eq!(
-        error(&with_voices("let x = buses * [1, 2]")).0,
-        "channel counts differ: `[[Sample; 2]; 4]` and `[number; 2]`"
+        error(&with_voices("let x = buses * [1, 2, 3]")).0,
+        "shapes do not line up: `[[Sample; 2]; 4]` and `[number; 3]`"
+    );
+    assert_eq!(
+        error(&with_voices(
+            "let sq: [[Sample; 2]; 2] = [[s, s], [s, s]]\nlet x = sq * [1, 2]"
+        ))
+        .0,
+        "`[number; 2]` could line up with the outer or the inner layers of `[[Sample; 2]; 2]`"
+    );
+    assert_eq!(
+        error(&with_voices("let x = buses * [[1, 2], [3, 4]]")).0,
+        "channel counts differ: `[[Sample; 2]; 4]` and `[[number; 2]; 2]`"
     );
 }
 
@@ -1560,4 +1607,62 @@ fn repeated_frames() {
     let src = "rill v() Sample { return 0 }\nrill main() Sample { let a = [v(); 3]\nlet b = [[1, 2]; 2]\nreturn 0 }";
     assert_eq!(type_of(src, "a"), frame(Type::Sample, 3));
     assert_eq!(type_of(src, "b"), frame(frame(Type::Num, 2), 2));
+}
+
+#[test]
+fn each_makes_an_argument_per_copy() {
+    let stereo = || frame(Type::Sample, 2);
+    let src = with_voices(
+        "let a = pan(mono, pos: each random())
+         let b = buses |> pan(each random(lo: 0.2, hi: 0.8))
+         let each = 0.5
+         let c = pan(s, each)
+         let d = pan(s, pos: each)",
+    );
+    assert_eq!(type_of(&src, "a"), frame(stereo(), 3));
+    assert_eq!(type_of(&src, "b"), frame(frame(stereo(), 2), 4));
+    assert_eq!(type_of(&src, "c"), stereo());
+    assert_eq!(type_of(&src, "d"), stereo());
+
+    assert_eq!(
+        error(&with_voices("let x = pan(s, pos: each random())")).0,
+        "`each` needs copies, but `pan` runs once here"
+    );
+    assert_eq!(
+        error(&with_voices("let x = sin(each random())")).0,
+        "`each` only works on rills, and `sin` is a built-in function"
+    );
+    assert_eq!(
+        error(&with_voices(
+            "let f = fn(x: Float) Float { x }\nlet x = f(each 1)"
+        ))
+        .0,
+        "`each` needs copies, but `f` is a function value, which never runs per element"
+    );
+    // The value is made per copy, so it is never taken apart itself.
+    assert_eq!(
+        error(&with_voices("let x = pan(mono, pos: each [0.1, 0.2, 0.3])")).0,
+        "argument `pos` of `pan` expects `Float`, found `[number; 3]`"
+    );
+}
+
+#[test]
+fn random_picks_a_number_of_any_type() {
+    let src = body(
+        "let a = random()
+         let b = random(100Hz, 200Hz)
+         let c = random(lo: -6dB, hi: 0dB)
+         let d = random(C4, C5)",
+    );
+    assert_eq!(type_of(&src, "a"), Type::Float);
+    assert_eq!(type_of(&src, "b"), Type::Freq);
+    assert_eq!(type_of(&src, "c"), Type::Gain);
+    assert_eq!(type_of(&src, "d"), Type::Pitch);
+    assert!(!errors(&body("let x = random(1Hz, 2s)")).is_empty());
+    // It is known before audio starts, so it can be a default.
+    let src = "
+        rill tone(offset: Float = random()) Sample { return offset }
+        rill main() Sample { return tone() }
+    ";
+    assert!(errors(src).is_empty(), "{:?}", errors(src));
 }

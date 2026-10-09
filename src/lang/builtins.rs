@@ -89,6 +89,8 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         // The level of an amplitude, and the amplitude factor of a level.
         "level" => vec![sig(&[("x", t())], Type::Gain)],
         "amp" => vec![sig(&[("gain", Type::Gain)], Type::Float)],
+        // A number picked when the program is built.
+        "random" => vec![sig(&[], Type::Float), sig(&[("lo", s()), ("hi", s())], s())],
         _ => Vec::new(),
     }
 }
@@ -163,6 +165,13 @@ pub fn doc(name: &str) -> Option<&'static str> {
             "The level of an amplitude, as a `Gain`: `level(1)` is 0dB. Silence is held at -120dB instead of -inf."
         }
         "amp" => "The amplitude factor of a level: `amp(-6dB)` is about 0.5.",
+        "random" => {
+            "A random number in [0, 1), or in [`lo`, `hi`) of any number type (levels are picked \
+             evenly in dB). Each `random()` in the program picks its own number once, when the \
+             program is built: it stays the same while playing, not a new one every sample. Use \
+             `each random()` for a different number in every copy of a rill. Runs differ unless \
+             a seed is given with `--seed`."
+        }
         _ => return None,
     })
 }
@@ -193,6 +202,7 @@ pub const FUNCTIONS: &[&str] = &[
     "just",
     "pythagorean",
     "meantone",
+    "random",
 ];
 
 #[cfg(test)]

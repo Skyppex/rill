@@ -12,9 +12,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::ast::*;
-use super::check::Checked;
+use super::check::{Checked, operand_alignment};
 use super::diag::{Diagnostic, Span};
-use super::types::{Signature, Size, Type};
+use super::types::{Align, Signature, Size, Type, align, frame_shape};
 use super::vm::{
     Code, EventCode, Handles, Instr, InvokeCall, Mode, Operand, SeqStep, SeqTable, Source, Tuning,
 };
@@ -133,6 +133,31 @@ pub struct Defs<'a> {
     /// Run the copies of voice pools, loop iterations and frame elements
     /// together where they line up (see [`super::vector`]).
     pub vectorize: bool,
+    /// Where `random()` draws its numbers from.
+    pub random: Random,
+}
+
+/// The numbers `random()` picks while a program is built: SplitMix64 from a
+/// seed, so the same seed picks the same numbers.
+#[derive(Debug, Default)]
+pub struct Random(std::cell::Cell<u64>);
+
+impl Random {
+    pub fn new(seed: u64) -> Random {
+        Random(std::cell::Cell::new(seed))
+    }
+
+    /// The next number, in [0, 1).
+    pub fn next(&self) -> f32 {
+        let s = self.0.get().wrapping_add(0x9e37_79b9_7f4a_7c15);
+        self.0.set(s);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        // The top 24 bits, exactly representable as an `f32` below 1.
+        (z >> 40) as f32 / (1u64 << 24) as f32
+    }
 }
 
 impl<'a> Defs<'a> {
@@ -161,6 +186,7 @@ impl<'a> Defs<'a> {
             decls: checked.events.iter().flatten().cloned().collect(),
             seqs: Vec::new(),
             vectorize: true,
+            random: Random::default(),
             map: defs
                 .zip(&checked.signatures)
                 .map(|(d, s)| (d.name.name.as_str(), (d, s)))
@@ -496,6 +522,9 @@ struct Compiler<'a> {
     in_lanes: u32,
     /// The loop ranges, kept apart until the pools are known.
     loop_ranges: Vec<Vec<(u32, u32)>>,
+    /// The operator being compiled lines a shorter frame up with the inner
+    /// layers of the longer one, not the outer ones.
+    align_inner: bool,
 }
 
 type CResult<T> = Result<T, Diagnostic>;
@@ -539,6 +568,7 @@ impl<'a> Compiler<'a> {
             lane_ranges: Vec::new(),
             in_lanes: 0,
             loop_ranges: Vec::new(),
+            align_inner: false,
         }
     }
 
@@ -661,11 +691,14 @@ impl<'a> Compiler<'a> {
     }
 
     /// Element-wise `op`. Two frames pair up element by element; a value
-    /// with fewer layers applies to every element of the other, so it lines
-    /// up with the outer layers.
+    /// with fewer layers applies to every element of the other, lining up
+    /// with its outer layers, or its inner ones with `align_inner`.
     fn zip2(&mut self, op: Op2, a: &CVal, b: &CVal) -> CResult<CVal> {
+        let (da, db) = (a.depth(), b.depth());
+        let split_a = matches!(a, CVal::Frame(_)) && !(self.align_inner && da < db);
+        let split_b = matches!(b, CVal::Frame(_)) && !(self.align_inner && db < da);
         let n = match (a, b) {
-            (CVal::Frame(xs), CVal::Frame(ys)) => {
+            (CVal::Frame(xs), CVal::Frame(ys)) if split_a && split_b => {
                 if xs.len() != ys.len() {
                     return Err(internal(
                         self.span,
@@ -674,12 +707,12 @@ impl<'a> Compiler<'a> {
                 }
                 xs.len()
             }
-            (CVal::Frame(xs), _) => xs.len(),
-            (_, CVal::Frame(ys)) => ys.len(),
+            (CVal::Frame(xs), _) if split_a => xs.len(),
+            (_, CVal::Frame(ys)) if split_b => ys.len(),
             _ => return Ok(CVal::Scalar(self.op2(op, a.scalar(), b.scalar())?)),
         };
-        let element = |v: &CVal, k: usize| match v {
-            CVal::Frame(xs) => xs[k].clone(),
+        let element = |v: &CVal, split: bool, k: usize| match v {
+            CVal::Frame(xs) if split => xs[k].clone(),
             v => v.clone(),
         };
         // The elements do the same thing to different values, so they can
@@ -690,7 +723,7 @@ impl<'a> Compiler<'a> {
             self.cse.clear();
             self.in_lanes += 1;
             let start = self.code.len() as u32;
-            let v = self.zip2(op, &element(a, k), &element(b, k));
+            let v = self.zip2(op, &element(a, split_a, k), &element(b, split_b, k));
             self.in_lanes -= 1;
             self.cse.clear();
             out.push(v?);
@@ -700,6 +733,31 @@ impl<'a> Compiler<'a> {
             self.loop_ranges.push(ranges);
         }
         Ok(CVal::Frame(out))
+    }
+
+    /// `a op b`, with the operands already compiled.
+    fn binary(
+        &mut self,
+        e: &Expr,
+        op: BinOp,
+        a: &Expr,
+        b: &Expr,
+        va: &CVal,
+        vb: &CVal,
+    ) -> CResult<CVal> {
+        let (ga, gb) = (
+            is_gain(&self.types[a.id as usize]),
+            is_gain(&self.types[b.id as usize]),
+        );
+        if ga || gb {
+            return self.gain_binary(op, va, vb, ga, gb, &self.types[e.id as usize]);
+        }
+        let (ta, tb) = (&self.types[a.id as usize], &self.types[b.id as usize]);
+        if is_freq(&self.types[e.id as usize]) && is_freq(ta) && is_interval(tb) {
+            return self.freq_interval_binary(op, va, vb);
+        }
+        let op = op2_for(op, &self.types[e.id as usize]);
+        self.zip2(op, va, vb)
     }
 
     fn map1(&mut self, op: Op1, x: &CVal) -> CResult<CVal> {
@@ -1178,19 +1236,13 @@ impl<'a> Compiler<'a> {
             ExprKind::Binary(op, a, b) => {
                 let va = self.expr(a)?;
                 let vb = self.expr(b)?;
-                let (ga, gb) = (
-                    is_gain(&self.types[a.id as usize]),
-                    is_gain(&self.types[b.id as usize]),
-                );
-                if ga || gb {
-                    return self.gain_binary(*op, &va, &vb, ga, gb, &self.types[e.id as usize]);
-                }
-                let (ta, tb) = (&self.types[a.id as usize], &self.types[b.id as usize]);
-                if is_freq(&self.types[e.id as usize]) && is_freq(ta) && is_interval(tb) {
-                    return self.freq_interval_binary(*op, &va, &vb);
-                }
-                let op = op2_for(*op, &self.types[e.id as usize]);
-                self.zip2(op, &va, &vb)
+                let inner =
+                    operand_alignment(&self.types[a.id as usize], &self.types[b.id as usize])
+                        .unwrap_or(false);
+                let saved = std::mem::replace(&mut self.align_inner, inner);
+                let v = self.binary(e, *op, a, b, &va, &vb);
+                self.align_inner = saved;
+                v
             }
             ExprKind::Range { .. } => Err(Diagnostic::error(
                 e.span,
@@ -1749,17 +1801,36 @@ impl<'a> Compiler<'a> {
             if sig.rate != (1, 1) {
                 return Err(rate_unsupported(callee.span, name));
             }
-            let slots = order_args(sig, args);
+            let slots = order_arg_refs(sig, args);
+            // Values given with `each` are made inside every copy instead.
+            let each: Vec<Option<&Expr>> = slots
+                .iter()
+                .map(|a| a.filter(|a| a.each.is_some()).map(|a| &a.value))
+                .collect();
             let mut vals: Vec<Option<CVal>> = Vec::new();
             for slot in &slots {
                 vals.push(match slot {
-                    Some(a) => Some(self.expr(a)?),
+                    Some(a) if a.each.is_some() => Some(CVal::unit()),
+                    Some(a) => Some(self.expr(&a.value)?),
                     None => None,
                 });
             }
             let filled = self.fill_defaults(def, sig, vals, e.span)?;
             let sizes = self.size_values(sizes, sig)?;
-            return self.call_lifted(def, sig, filled, sizes);
+            // The layers each argument runs over, as the checker saw them.
+            let shapes: Vec<Vec<Size>> = slots
+                .iter()
+                .zip(&sig.params)
+                .map(|(slot, p)| match slot {
+                    Some(a) if a.each.is_none() => {
+                        let shape = frame_shape(&self.types[a.value.id as usize]);
+                        let extra = shape.len().saturating_sub(type_depth(&p.ty));
+                        shape[..extra].to_vec()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect();
+            return self.call_lifted(def, sig, filled, sizes, &shapes, &each);
         }
         if !sizes.is_empty() {
             return Err(Diagnostic::error(
@@ -1934,60 +2005,87 @@ impl<'a> Compiler<'a> {
     }
 
     /// Inline `def`, once per element if arguments have more frame layers
-    /// than their parameters (lifting). The checker made sure every lifted
-    /// argument has the same extra layers.
+    /// than their parameters (lifting). `shapes[i]` are the extra layers of
+    /// argument `i`; the checker made sure the shorter ones line up with an
+    /// end of the longest. `each[i]` is an argument to make in every copy.
     fn call_lifted(
         &mut self,
         def: &Def,
         sig: &Signature,
         args: Vec<CVal>,
         sizes: HashMap<String, CVal>,
+        shapes: &[Vec<Size>],
+        each: &[Option<&Expr>],
     ) -> CResult<CVal> {
-        let extra: Vec<usize> = sig
-            .params
+        let longest = shapes.iter().map(Vec::len).max().unwrap_or(0);
+        let longest = shapes
             .iter()
-            .zip(&args)
-            .map(|(p, a)| match a {
-                CVal::Frame(_) => a.depth().saturating_sub(type_depth(&p.ty)),
+            .find(|s| s.len() == longest)
+            .cloned()
+            .unwrap_or_default();
+        let extra: Vec<usize> = shapes.iter().map(Vec::len).collect();
+        // A shape lining up with the inner layers is passed whole through
+        // the outer ones.
+        let skip: Vec<usize> = shapes
+            .iter()
+            .map(|s| match align(&longest, s) {
+                Align::Inner => longest.len() - s.len(),
                 _ => 0,
             })
             .collect();
-        self.lift(&extra, &args, &mut |s, args| {
+        self.lift(&extra, &skip, &args, &mut |s, mut args| {
+            for (arg, e) in args.iter_mut().zip(each) {
+                if let Some(e) = e {
+                    *arg = s.expr(e)?;
+                }
+            }
             s.inline(def, sig, args, sizes.clone())
         })
     }
 
     /// Run `f` once per element of the extra layers of `args`, `extra[i]`
-    /// layers for argument `i`, and collect the results in those layers.
+    /// layers for argument `i` after passing it whole through the first
+    /// `skip[i]`, and collect the results in those layers.
     fn lift(
         &mut self,
         extra: &[usize],
+        skip: &[usize],
         args: &[CVal],
         f: &mut dyn FnMut(&mut Self, Vec<CVal>) -> CResult<CVal>,
     ) -> CResult<CVal> {
-        let n = extra.iter().zip(args).find_map(|(&e, a)| match a {
-            CVal::Frame(xs) if e > 0 => Some(xs.len()),
+        let splits: Vec<bool> = extra
+            .iter()
+            .zip(skip)
+            .map(|(&e, &k)| e > 0 && k == 0)
+            .collect();
+        let n = splits.iter().zip(args).find_map(|(&split, a)| match a {
+            CVal::Frame(xs) if split => Some(xs.len()),
             _ => None,
         });
         let Some(n) = n else {
             return f(self, args.to_vec());
         };
-        let inner: Vec<usize> = extra.iter().map(|&e| e.saturating_sub(1)).collect();
+        let inner: Vec<usize> = extra
+            .iter()
+            .zip(&splits)
+            .map(|(&e, &split)| if split { e - 1 } else { e })
+            .collect();
+        let inner_skip: Vec<usize> = skip.iter().map(|&k| k.saturating_sub(1)).collect();
         let mut out = Vec::with_capacity(n);
         // The copies form a voice pool.
         let pool = self.start_pool();
         let saved = self.voice;
         for c in 0..n {
-            let per_element: Vec<CVal> = extra
+            let per_element: Vec<CVal> = splits
                 .iter()
                 .zip(args)
-                .map(|(&e, a)| match a {
-                    CVal::Frame(xs) if e > 0 => xs[c].clone(),
+                .map(|(&split, a)| match a {
+                    CVal::Frame(xs) if split => xs[c].clone(),
                     _ => a.clone(),
                 })
                 .collect();
             let start = self.start_copy(pool, c as u16);
-            let v = self.lift(&inner, &per_element, f);
+            let v = self.lift(&inner, &inner_skip, &per_element, f);
             self.voice = saved;
             let v = v?;
             self.end_copy(pool, start, &v);
@@ -2049,8 +2147,25 @@ impl<'a> Compiler<'a> {
     /// defaults for the rest.
     fn call_builtin(&mut self, span: Span, name: &str, args: &[Arg]) -> CResult<CVal> {
         let sigs = super::builtins::lookup(name);
+        // Overloads are picked by argument count, as the checker did.
+        let sig = match sigs.as_slice() {
+            [sig] => Some(sig),
+            _ => sigs.iter().find(|s| s.params.len() == args.len()),
+        };
+        // Levels are picked evenly in dB: between the factors on a log
+        // scale.
+        if let ("random", [lo, hi]) = (name, args)
+            && is_gain(&self.types[lo.value.id as usize])
+        {
+            let lo = self.expr(&lo.value)?;
+            let hi = self.expr(&hi.value)?;
+            let r = CVal::Scalar(Operand::Const(self.defs.random.next()));
+            let ratio = self.zip2(Op2::Div, &hi, &lo)?;
+            let scale = self.zip2(Op2::Pow, &ratio, &r)?;
+            return self.zip2(Op2::Mul, &lo, &scale);
+        }
         let mut vals = Vec::new();
-        if let [sig] = sigs.as_slice() {
+        if let Some(sig) = sig {
             for (slot, p) in order_args(sig, args).into_iter().zip(&sig.params) {
                 vals.push(match slot {
                     Some(a) => self.expr(a)?,
@@ -2087,6 +2202,13 @@ impl<'a> Compiler<'a> {
                 self.zip2(Op2::Max, &size, &CVal::Scalar(Operand::Const(1e-6)))
             }
             ("amp", [x]) => Ok(x.clone()),
+            ("random", []) => Ok(CVal::Scalar(Operand::Const(self.defs.random.next()))),
+            ("random", [lo, hi]) => {
+                let r = CVal::Scalar(Operand::Const(self.defs.random.next()));
+                let span = self.zip2(Op2::Sub, hi, lo)?;
+                let offset = self.zip2(Op2::Mul, &span, &r)?;
+                self.zip2(Op2::Add, lo, &offset)
+            }
             ("pow", [x, y]) => self.zip2(Op2::Pow, x, y),
             ("min", [x, y]) => self.zip2(Op2::Min, x, y),
             ("max", [x, y]) => self.zip2(Op2::Max, x, y),
@@ -2162,6 +2284,14 @@ pub fn op2_for(op: BinOp, result: &Type) -> Op2 {
 
 /// The argument expression for each parameter, by position or name.
 pub fn order_args<'e>(sig: &Signature, args: &'e [Arg]) -> Vec<Option<&'e Expr>> {
+    order_arg_refs(sig, args)
+        .into_iter()
+        .map(|a| a.map(|a| &a.value))
+        .collect()
+}
+
+/// The argument for each parameter of `sig`, if one was given.
+fn order_arg_refs<'e>(sig: &Signature, args: &'e [Arg]) -> Vec<Option<&'e Arg>> {
     let mut slots = vec![None; sig.params.len()];
     for (i, a) in args.iter().enumerate() {
         let pi = match &a.name {
@@ -2169,7 +2299,7 @@ pub fn order_args<'e>(sig: &Signature, args: &'e [Arg]) -> Vec<Option<&'e Expr>>
             None => Some(i),
         };
         if let Some(pi) = pi {
-            slots[pi] = Some(&a.value);
+            slots[pi] = Some(a);
         }
     }
     slots

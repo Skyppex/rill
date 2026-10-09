@@ -406,11 +406,15 @@ impl Printer<'_> {
                     .iter()
                     .map(|a| {
                         let mut node = self.expr(&a.value);
+                        let mut prefixed = Label::default();
                         if let Some(name) = &a.name {
-                            let mut prefixed = Label::default().ident(&name.name).plain(": ");
-                            prefixed.0.append(&mut node.label.0);
-                            node.label = prefixed;
+                            prefixed = prefixed.ident(&name.name).plain(": ");
                         }
+                        if a.each.is_some() {
+                            prefixed = prefixed.kw("each").plain(" ");
+                        }
+                        prefixed.0.append(&mut node.label.0);
+                        node.label = prefixed;
                         node
                     })
                     .collect();

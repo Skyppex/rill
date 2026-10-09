@@ -1,0 +1,99 @@
+// Giving every copy its own values. A chord of 3 notes, 8 detuned saws
+// each: 24 copies of `saw`, which by default would all start in step.
+//
+// - `each` before an argument makes it once per copy instead of once for
+//   all of them, so `each random()` is a different number for every saw.
+// - A frame with fewer layers lines up with whichever end of the other it
+//   matches: `[Float; 3]` with the notes, `[Float; 8]` with the voices.
+//
+// `random()` is picked when the program is built, so it costs nothing while
+// playing. Every run sounds a little different; pass `--seed` (the one
+// printed at the start) to hear a run again.
+
+// The correction a jump at phase 0 needs, to remove most of its aliasing
+// (PolyBLEP). `dt` is how far the phase moves in one sample.
+fn blep(t: Float, dt: Float) Float {
+    if t < dt {
+        let x = t / dt
+        x + x - x * x - 1
+    } else if t > 1 - dt {
+        let x = (t - 1) / dt
+        x * x + x + x + 1
+    } else {
+        0
+    }
+}
+
+// `offset` starts the wave part of a cycle later (0 to 1).
+rill saw(freq: Freq, offset: Float = 0) Sample {
+    state phase: Float = 0
+    phase = wrap(phase + freq / RATE)
+    let p = wrap(phase + offset)
+    return p * 2 - 1 - blep(p, freq / RATE)
+}
+
+// A slow wave from 0 to 1.
+rill lfo(rate: Freq, offset: Float = 0) Float {
+    state phase: Float = 0
+    phase = wrap(phase + rate / RATE)
+    return sin(wrap(phase + offset) * TAU) * 0.5 + 0.5
+}
+
+// Turns `x` down by up to `depth`.
+rill duck(x: Sample, depth: Float) Sample {
+    return x * (1 - depth)
+}
+
+// Equal-power panning: 0 is hard left, 1 hard right.
+rill pan(x: Sample, pos: Float) [Sample; 2] {
+    let angle = pos * PI / 2
+    return [x * cos(angle), x * sin(angle)]
+}
+
+// `N` pitches spread evenly across `width`, centred on `pitch`.
+rill spread<N>(pitch: Freq, width: Interval) [Freq; N] {
+    let pitches: [Freq; N]
+
+    for i in 0..N {
+        let t = if N == 1 { 0.5 } else { i as Float / (N - 1) as Float }
+        pitches[i] = pitch + width * (t - 0.5)
+    }
+
+    return pitches
+}
+
+rill lowpass(x: Sample, cutoff: Freq) Sample {
+    state y = 0.0
+    let alpha = 1.0 - exp(-2.0 * PI * cutoff / RATE)
+    y += alpha * (x - y)
+    return y
+}
+
+rill main(volume: Gain = -12dB) [Sample; 2] {
+    let chord = [C3, G3, D#4] |> equal
+    let voices = spread<8>(chord, 12cents) // [[Freq; 8]; 3]
+
+    // Every saw starts at its own point in the cycle, so the 24 never line
+    // up and the chord does not fade in its first second. `[[Sample; 8]; 3]`.
+    let saws = voices |> saw(offset: each random())
+
+    // One level per note: `[Float; 3]` lines up with the outer layer.
+    let notes = saws * [1, 0.8, 0.7]
+    // One level per voice, the same for every note: `[Float; 8]` lines up
+    // with the inner layer. The middle voices are the loudest.
+    let shaped = notes * [0.5, 0.7, 0.9, 1, 1, 0.9, 0.7, 0.5]
+
+    // Everything after `each` is made per copy, including the `lfo` and the
+    // `random()` calls inside it: every saw gets its own slow swell, at its
+    // own speed, starting at its own point.
+    let moving = shaped
+        |> duck(each lfo(random(lo: 0.1Hz, hi: 0.4Hz), offset: random()) * 0.6)
+
+    // Every saw also gets its own place in the stereo field, making
+    // `[[[Sample; 2]; 8]; 3]`.
+    let stereo = moving |> pan(each random(lo: 0.15, hi: 0.85))
+
+    // Random phases add up like noise, to about the square root of the
+    // count: √24 ≈ 5.
+    return (sum(sum(stereo)) / 5 + volume) |> lowpass(2kHz)
+}

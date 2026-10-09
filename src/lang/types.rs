@@ -52,6 +52,44 @@ pub enum Size {
     Var(String),
 }
 
+/// Where a shorter shape lines up with a longer one, both listed from the
+/// outer layer in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    /// With the outer layers; reused across the inner ones.
+    Outer,
+    /// With the inner layers; reused for every element of the outer ones.
+    Inner,
+    /// Either way, so it has to be said which.
+    Both,
+    Neither,
+}
+
+/// How `short` lines up with `long`. A shape with no layers, or the same
+/// shape, lines up with the outer end.
+pub fn align(long: &[Size], short: &[Size]) -> Align {
+    if short.is_empty() || long == short {
+        return Align::Outer;
+    }
+    match (long.starts_with(short), long.ends_with(short)) {
+        (true, true) => Align::Both,
+        (true, false) => Align::Outer,
+        (false, true) => Align::Inner,
+        (false, false) => Align::Neither,
+    }
+}
+
+/// The sizes of the frame layers of `t`, from the outer layer in.
+pub fn frame_shape(t: &Type) -> Vec<Size> {
+    let mut out = Vec::new();
+    let mut t = t;
+    while let Type::Frame(elem, n) = t {
+        out.push(n.clone());
+        t = elem;
+    }
+    out
+}
+
 impl fmt::Display for Size {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

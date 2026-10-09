@@ -39,7 +39,8 @@
 //! id      := NUMBER | NAME ("." NAME)*
 //! lambda  := "fn" "(" (NAME (":" type)?),* ")" type? block
 //! if      := "if" expr block ("else" (if | block))?
-//! args    := (NAME ":")? expr ("," (NAME ":")? expr)*
+//! args    := arg ("," arg)*
+//! arg     := (NAME ":")? "each"? expr
 //! ```
 //!
 //! Statements end at a line break or `;`. Outside brackets, a binary
@@ -618,6 +619,31 @@ impl Parser<'_> {
         }
     }
 
+    /// `each` before an argument's value, rather than a name `each`: it is
+    /// followed, on the same line, by something that starts an expression.
+    fn at_each(&self) -> bool {
+        if !self.at_ident("each") {
+            return false;
+        }
+        let (each, next) = (self.peek(), self.peek_at(1));
+        if next.newline_before {
+            return false;
+        }
+        match next.kind {
+            TokenKind::Ident
+            | TokenKind::Number { .. }
+            | TokenKind::LBracket
+            | TokenKind::If
+            | TokenKind::Fn
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Bang => true,
+            // `each (x)`, not a call `each(x)`.
+            TokenKind::LParen => next.span.start > each.span.end,
+            _ => false,
+        }
+    }
+
     fn at_ident(&self, name: &str) -> bool {
         self.at(TokenKind::Ident) && self.text(self.peek()) == name
     }
@@ -807,6 +833,7 @@ impl Parser<'_> {
             };
             let mut args = vec![Arg {
                 name: None,
+                each: None,
                 value: lhs,
             }];
             if self.at(TokenKind::LParen) && !self.peek().newline_before {
@@ -947,8 +974,13 @@ impl Parser<'_> {
             } else {
                 None
             };
+            let each = if self.at_each() {
+                Some(self.bump().span)
+            } else {
+                None
+            };
             let value = self.expr()?;
-            args.push(Arg { name, value });
+            args.push(Arg { name, each, value });
             if self.eat(TokenKind::Comma).is_none() {
                 break;
             }

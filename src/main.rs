@@ -31,7 +31,14 @@ struct SourceArgs {
     /// Output gain, for `--patch`.
     #[arg(long, default_value_t = 0.3, requires = "patch")]
     gain: f32,
+    /// Seed for the numbers `random()` picks; the same seed picks the same
+    /// numbers. Without one, every run picks a new seed and prints it.
+    #[arg(long)]
+    seed: Option<u64>,
 }
+
+/// The seed this run picked, when none was given.
+static PICKED_SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 impl SourceArgs {
     fn name(&self) -> String {
@@ -60,10 +67,28 @@ impl SourceArgs {
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let name = path.display().to_string();
-        match rill::lang::load_with(&src, config, &self.entry, options) {
-            Ok((graph, warnings)) => {
-                for w in &warnings {
+        let seed = self
+            .seed
+            .unwrap_or_else(|| *PICKED_SEED.get_or_init(rill::lang::build::new_seed));
+        let options = rill::lang::build::Options {
+            seed: Some(seed),
+            ..options.clone()
+        };
+        let built = rill::lang::compile(&src).and_then(|(program, checked)| {
+            let graph =
+                rill::lang::build::build_with(&program, &checked, config, &self.entry, &options)?;
+            Ok((graph, checked))
+        });
+        match built {
+            Ok((graph, checked)) => {
+                for w in &checked.warnings {
                     eprint!("{}", w.render(&name, &src));
+                }
+                if self.seed.is_none() && checked.uses_builtin("random") {
+                    static SHOWN: std::sync::Once = std::sync::Once::new();
+                    SHOWN.call_once(|| {
+                        eprintln!("rill: random seed {seed} (repeat with --seed {seed})")
+                    });
                 }
                 Ok(graph)
             }
@@ -627,7 +652,10 @@ fn profile(
         out_channels: usize::from(channels),
     };
     let built = Instant::now();
-    let options = rill::lang::build::Options { vectorize: !scalar };
+    let options = rill::lang::build::Options {
+        vectorize: !scalar,
+        ..Default::default()
+    };
     let mut engine = Engine::new(source.graph_with(&config, &options)?, config)?;
     let build_time = built.elapsed();
 

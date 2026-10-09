@@ -8,7 +8,7 @@
 
 use super::ast::Program;
 use super::check::{Checked, check_entry};
-use super::compile::{ArgSpec, CVal, Defs, compile_instance, default_value, seq_tables};
+use super::compile::{ArgSpec, CVal, Defs, Random, compile_instance, default_value, seq_tables};
 use super::diag::Diagnostic;
 use super::types::Type;
 use super::vm::{Operand, Program as ProgramNode};
@@ -24,12 +24,25 @@ pub struct Options {
     /// Run repeated code (voices, loop iterations, frame elements) as lanes
     /// together. The result is the same either way; off is for comparing.
     pub vectorize: bool,
+    /// Where the numbers `random()` picks come from: the same seed picks the
+    /// same numbers. `None` picks a new seed every build.
+    pub seed: Option<u64>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { vectorize: true }
+        Options {
+            vectorize: true,
+            seed: None,
+        }
     }
+}
+
+/// A seed for `random()` that differs from run to run.
+pub fn new_seed() -> u64 {
+    use std::hash::{BuildHasher, RandomState};
+    // Small enough to read out and type back in.
+    RandomState::new().hash_one(std::time::SystemTime::now()) % 1_000_000_000
 }
 
 /// Build the graph that runs `entry` on an engine with `config`.
@@ -53,6 +66,7 @@ pub fn build_with(
     check_entry(program, checked, entry)?;
     let mut defs = Defs::new(program, checked);
     defs.vectorize = options.vectorize;
+    defs.random = Random::new(options.seed.unwrap_or_else(new_seed));
     defs.seqs = seq_tables(&defs, &checked.types, config.sample_rate as f32, program)
         .map_err(|d| vec![d])?;
     let (def, sig) = defs.get(entry).expect("checked by check_entry");

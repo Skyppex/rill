@@ -25,7 +25,9 @@ use std::collections::{HashMap, HashSet};
 use super::ast::*;
 use super::builtins;
 use super::diag::{Diagnostic, Span, suggest};
-use super::types::{DefKind, ParamSig, Signature, Size, Type, coerces, join};
+use super::types::{
+    Align, DefKind, ParamSig, Signature, Size, Type, align, coerces, frame_shape, join,
+};
 use crate::event::{EventDecl as Declared, EventKind, Sender};
 
 /// Result of a successful check.
@@ -79,6 +81,15 @@ pub struct Binding {
     /// Index of the fn or rill it belongs to, into [`Checked::signatures`]
     /// (the same as the program's items).
     pub def: usize,
+}
+
+impl Checked {
+    /// Whether the program calls or names the built-in `name` anywhere.
+    pub fn uses_builtin(&self, name: &str) -> bool {
+        self.resolutions
+            .iter()
+            .any(|(_, r)| matches!(r, Resolution::Builtin(n) if n == name))
+    }
 }
 
 /// What a name refers to.
@@ -231,7 +242,7 @@ struct Subst {
     sizes: HashMap<String, Size>,
 }
 
-type OpError = (String, Option<String>);
+pub(crate) type OpError = (String, Option<String>);
 
 struct Checker {
     /// Name -> index into `signatures` (first definition wins).
@@ -490,6 +501,7 @@ impl Checker {
     ) -> Type {
         let word = if step.is_some() { "trigger" } else { "invoke" };
         self.in_handler_only(span, word);
+        self.no_each(args, &format!("`{word}` runs once"));
         if let Some(j) = self.seq_names.iter().position(|n| *n == target.name) {
             self.resolve(target.span, Resolution::Seq(j));
             self.seq_used[j] = true;
@@ -2091,7 +2103,7 @@ impl Checker {
                 subst.sizes.insert(name.clone(), size);
             }
         }
-        let mut lift: Option<(Vec<Size>, Span)> = None;
+        let mut lifts: Vec<(Vec<Size>, Span)> = Vec::new();
         for (pi, (p, slot)) in sig.params.iter().zip(&slots).enumerate() {
             let Some(ai) = *slot else { continue };
             let at = &arg_types[ai];
@@ -2101,6 +2113,8 @@ impl Checker {
                 continue;
             }
             // Peel as few outer layers as it takes for the argument to fit.
+            // A value given with `each` is made per copy, so it fits whole.
+            let each = args[ai].each.is_some();
             let mut peeled = Vec::new();
             let mut inner = at;
             let fitted = loop {
@@ -2109,7 +2123,7 @@ impl Checker {
                     break Some(trial);
                 }
                 match inner {
-                    Type::Frame(elem, n) => {
+                    Type::Frame(elem, n) if !each => {
                         peeled.push(n.clone());
                         inner = elem;
                     }
@@ -2121,9 +2135,9 @@ impl Checker {
                     subst = trial;
                     continue;
                 }
-                let lifts = kind == DefKind::Rill
+                let lifts_here = kind == DefKind::Rill
                     || (kind == DefKind::Builtin && pi == 0 && builtins::takes_frames(name));
-                if !lifts {
+                if !lifts_here {
                     let msg = if matches!(p.ty, Type::Frame(..)) {
                         format!("`{name}` takes `{}`, not `{at}`", substitute(&p.ty, &trial))
                     } else {
@@ -2144,27 +2158,7 @@ impl Checker {
                     ok = false;
                     continue;
                 }
-                match &lift {
-                    Some((earlier, _)) if *earlier != peeled => {
-                        let msg = match (earlier.as_slice(), peeled.as_slice()) {
-                            ([m], [n]) => format!(
-                                "channel counts differ: this has {n} channels, an earlier argument has {m}"
-                            ),
-                            _ => format!(
-                                "this runs `{name}` over shape `{}`, an earlier argument over shape `{}`",
-                                shape(&peeled),
-                                shape(earlier)
-                            ),
-                        };
-                        let d = self.error(arg_span, msg).with_help(
-                            "every argument that runs per element needs the same extra layers",
-                        );
-                        self.report(d);
-                        ok = false;
-                    }
-                    Some(_) => {}
-                    None => lift = Some((peeled, arg_span)),
-                }
+                lifts.push((peeled, arg_span));
                 subst = trial;
                 continue;
             }
@@ -2179,6 +2173,78 @@ impl Checker {
             self.report(d);
             ok = false;
         }
+        // The copies take the shape with the most layers; a shorter one lines
+        // up with its outer or inner end and is reused across the rest.
+        let lift = lifts
+            .iter()
+            .fold(None::<&Vec<Size>>, |best, (l, _)| match best {
+                Some(b) if b.len() >= l.len() => Some(b),
+                _ => Some(l),
+            })
+            .cloned();
+        if let Some(longest) = &lift {
+            for (peeled, at) in &lifts {
+                let d = if peeled.len() == longest.len() {
+                    if peeled == longest {
+                        continue;
+                    }
+                    let msg = match (longest.as_slice(), peeled.as_slice()) {
+                        ([m], [n]) => format!(
+                            "channel counts differ: this has {n} channels, another argument has {m}"
+                        ),
+                        _ => format!(
+                            "this runs `{name}` over shape `{}`, another argument over shape `{}`",
+                            shape(peeled),
+                            shape(longest)
+                        ),
+                    };
+                    self.error(*at, msg)
+                        .with_help("arguments that run per element need the same layers, or fewer that line up")
+                } else {
+                    match align(longest, peeled) {
+                        Align::Outer | Align::Inner => continue,
+                        Align::Both => self
+                            .error(
+                                *at,
+                                format!(
+                                    "shape `{}` could line up with the outer or the inner layers of shape `{}`",
+                                    shape(peeled),
+                                    shape(longest)
+                                ),
+                            )
+                            .with_help(ambiguous_help(longest)),
+                        Align::Neither => self
+                            .error(
+                                *at,
+                                format!(
+                                    "this runs `{name}` over shape `{}`, another argument over shape `{}`",
+                                    shape(peeled),
+                                    shape(longest)
+                                ),
+                            )
+                            .with_help(ALIGN_HELP),
+                    }
+                };
+                self.report(d);
+                ok = false;
+            }
+        }
+        // `each` makes a value per copy, so there must be copies.
+        for arg in args {
+            let Some(at) = arg.each else { continue };
+            if lift.is_some() && kind == DefKind::Rill {
+                continue;
+            }
+            let d = if kind == DefKind::Rill {
+                self.error(at, format!("`each` needs copies, but `{name}` runs once here"))
+                    .with_help("`each` makes a value for every copy of a rill that runs per element; remove it")
+            } else {
+                self.error(at, format!("`each` only works on rills, and `{name}` is a {}", kind_word(kind)))
+                    .with_help("`each` makes a value for every copy of a rill that runs per element; remove it")
+            };
+            self.report(d);
+            ok = false;
+        }
         if !ok {
             return Type::Error;
         }
@@ -2187,7 +2253,7 @@ impl Checker {
         match lift {
             None => ret,
             Some(_) if ret == Type::Unit => Type::Unit,
-            Some((layers, _)) => layers
+            Some(layers) => layers
                 .into_iter()
                 .rev()
                 .fold(ret, |t, n| Type::Frame(Box::new(t), n)),
@@ -2232,6 +2298,20 @@ impl Checker {
         Some(out)
     }
 
+    /// Report every `each` in `args`, where `why` says there are no copies.
+    /// Returns whether there were none.
+    fn no_each(&mut self, args: &[Arg], why: &str) -> bool {
+        let mut ok = true;
+        for at in args.iter().filter_map(|a| a.each) {
+            let d = self
+                .error(at, format!("`each` needs copies, but {why}"))
+                .with_help("`each` makes a value for every copy of a rill that runs per element; remove it");
+            self.report(d);
+            ok = false;
+        }
+        ok
+    }
+
     /// Check each argument with no expectation, so that errors inside them
     /// are still reported when the call itself is broken.
     fn exprs(&mut self, args: &[Arg]) {
@@ -2261,7 +2341,10 @@ impl Checker {
         ret: &Type,
     ) -> Type {
         let name = &callee.name;
-        let mut ok = true;
+        let mut ok = self.no_each(
+            args,
+            &format!("`{name}` is a function value, which never runs per element"),
+        );
         for (i, a) in args.iter().enumerate() {
             let expected = params.get(i).filter(|t| matches!(t, Type::Fn(..)));
             let t = self.expr_expect(&a.value, expected);
@@ -2650,6 +2733,14 @@ fn renamed_conversion(name: &str) -> Option<&'static str> {
     })
 }
 
+fn kind_word(kind: DefKind) -> &'static str {
+    match kind {
+        DefKind::Fn => "fn",
+        DefKind::Rill => "rill",
+        DefKind::Builtin => "built-in function",
+    }
+}
+
 fn var_word(kind: VarKind) -> &'static str {
     match kind {
         VarKind::Param => "parameter",
@@ -2873,23 +2964,84 @@ fn compare(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
     ))
 }
 
+/// Whether the operands of an operator on frames line up with their inner
+/// layers (`true`) or their outer ones. A side with fewer layers lines up
+/// with whichever end of the other it matches.
+pub(crate) fn operand_alignment(a: &Type, b: &Type) -> Result<bool, OpError> {
+    let (sa, sb) = (frame_shape(a), frame_shape(b));
+    if sa.len() == sb.len() {
+        if sa != sb {
+            return Err((
+                format!("channel counts differ: `{a}` and `{b}`"),
+                Some("operators on frames work channel by channel, so both sides need the same count".into()),
+            ));
+        }
+        return Ok(false);
+    }
+    let (long, short, lt, st) = if sa.len() > sb.len() {
+        (&sa, &sb, a, b)
+    } else {
+        (&sb, &sa, b, a)
+    };
+    match align(long, short) {
+        Align::Outer => Ok(false),
+        Align::Inner => Ok(true),
+        Align::Both => Err((
+            format!("`{st}` could line up with the outer or the inner layers of `{lt}`"),
+            Some(ambiguous_help(long)),
+        )),
+        Align::Neither => Err((
+            format!("shapes do not line up: `{a}` and `{b}`"),
+            Some(ALIGN_HELP.into()),
+        )),
+    }
+}
+
+const ALIGN_HELP: &str =
+    "a value with fewer layers must match the outer or the inner layers of the other";
+
+fn ambiguous_help(long: &[Size]) -> String {
+    format!(
+        "say which: to reuse it for every outer element, repeat it, as in `[x; {}]`; for one \
+         value per outer element, build the full shape",
+        long[0]
+    )
+}
+
+/// Apply `leaf` to the scalars of `a` and `b`, pairing frame layers up. With
+/// `inner`, the side with more layers is taken apart first, so the other
+/// lines up with its inner layers.
+fn zip_types(
+    a: &Type,
+    b: &Type,
+    inner: bool,
+    leaf: &dyn Fn(&Type, &Type) -> Result<Type, OpError>,
+) -> Result<Type, OpError> {
+    let (da, db) = (a.depth(), b.depth());
+    let split_a = matches!(a, Type::Frame(..)) && !(inner && da < db);
+    let split_b = matches!(b, Type::Frame(..)) && !(inner && db < da);
+    let t = match (a, b) {
+        (Type::Frame(ea, n), Type::Frame(eb, _)) if split_a && split_b => {
+            Type::Frame(Box::new(zip_types(ea, eb, inner, leaf)?), n.clone())
+        }
+        (Type::Frame(ea, n), _) if split_a => {
+            Type::Frame(Box::new(zip_types(ea, b, inner, leaf)?), n.clone())
+        }
+        (_, Type::Frame(eb, n)) if split_b => {
+            Type::Frame(Box::new(zip_types(a, eb, inner, leaf)?), n.clone())
+        }
+        _ => leaf(a, b)?,
+    };
+    Ok(t)
+}
+
 fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
     if a.is_wild() || b.is_wild() {
         return Ok(Type::Error);
     }
-    match (a, b) {
-        (Type::Frame(ea, na), Type::Frame(eb, nb)) => {
-            if na != nb {
-                return Err((
-                    format!("channel counts differ: `{a}` and `{b}`"),
-                    Some("operators on frames work channel by channel, so both sides need the same count".into()),
-                ));
-            }
-            return Ok(Type::Frame(Box::new(arith(op, ea, eb)?), na.clone()));
-        }
-        (Type::Frame(ea, n), s) => return Ok(Type::Frame(Box::new(arith(op, ea, s)?), n.clone())),
-        (s, Type::Frame(eb, n)) => return Ok(Type::Frame(Box::new(arith(op, s, eb)?), n.clone())),
-        _ => {}
+    if matches!(a, Type::Frame(..)) || matches!(b, Type::Frame(..)) {
+        let inner = operand_alignment(a, b)?;
+        return zip_types(a, b, inner, &|x, y| arith(op, x, y));
     }
 
     if *a == Type::Gain || *b == Type::Gain {

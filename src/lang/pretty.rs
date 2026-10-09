@@ -140,13 +140,19 @@ impl Node {
 /// ANSI colours if `color` is set.
 pub fn tree(src: &str, program: &Program, checked: &Checked, color: bool) -> String {
     let p = Printer { src, checked };
-    // Definitions and event declarations, in source order.
+    // Definitions and declarations, in source order.
     let mut nodes: Vec<(u32, Node)> = program
         .items
         .iter()
         .map(|item| (item.def().span.start, p.item(item)))
         .chain(program.events.iter().map(|e| (e.span.start, p.event(e))))
         .chain(program.seqs.iter().map(|s| (s.span.start, p.seq(s))))
+        .chain(
+            program
+                .consts
+                .iter()
+                .map(|c| (c.span.start, p.stmt(&Stmt::Const(c.clone())))),
+        )
         .collect();
     nodes.sort_by_key(|(start, _)| *start);
     let mut out = String::new();
@@ -295,6 +301,10 @@ impl Printer<'_> {
             Stmt::State { name, ty, init, .. } => {
                 Node::new(annotated("state", name, ty), vec![self.expr(init)])
             }
+            Stmt::Const(c) => Node::new(
+                annotated("const", &c.name, &c.ty),
+                vec![self.expr(&c.value)],
+            ),
             Stmt::Assign { target, value, .. } => Node::new(
                 prop("assign").plain(" ").ident(&target.name().name),
                 vec![self.expr(value)],

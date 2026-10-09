@@ -10,6 +10,8 @@ pub struct Program {
     pub events: Vec<EventDecl>,
     /// Sequences, in source order.
     pub seqs: Vec<SeqDecl>,
+    /// Top-level constants, in source order.
+    pub consts: Vec<ConstDecl>,
     /// Number of expressions; every [`Expr::id`] is below this.
     pub expr_count: u32,
 }
@@ -28,6 +30,16 @@ impl Item {
             Item::Fn(d) | Item::Rill(d) => d,
         }
     }
+}
+
+/// `const VOICES: Int = 8`: a value worked out while building, at the top
+/// level or in a block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstDecl {
+    pub name: Ident,
+    pub ty: Option<TypeExpr>,
+    pub value: Expr,
+    pub span: Span,
 }
 
 /// `event keys note_on(sender: 5, channel: 1)`: a name, a kind and
@@ -186,6 +198,7 @@ pub enum Stmt {
         init: Expr,
         span: Span,
     },
+    Const(ConstDecl),
     Assign {
         target: AssignTarget,
         value: Expr,
@@ -246,6 +259,7 @@ impl Stmt {
             | Stmt::Return { span, .. }
             | Stmt::EventHandler { span, .. }
             | Stmt::For { span, .. } => *span,
+            Stmt::Const(c) => c.span,
             Stmt::Expr(e) => e.span,
         }
     }

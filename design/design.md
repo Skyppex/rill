@@ -30,7 +30,7 @@ Design principles:
 
 ## Syntax sketch
 
-Two kinds of definitions: `fn` for pure functions on values, and `rill` for stream processors with optional state. A file contains only definitions; running it instantiates its entry rill, `main` unless another is named, and plays what that rill returns. All syntax here is provisional.
+Two kinds of definitions: `fn` for pure functions on values, and `rill` for stream processors with optional state. Beside them, a file holds `const`s (see Constants), event declarations and sequences, and nothing else; running it instantiates its entry rill, `main` unless another is named, and plays what that rill returns. All syntax here is provisional.
 
 ```rill
 // Pure function on one value. Takes exactly what it declares.
@@ -84,7 +84,7 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | Type | Meaning | Notes |
 | --- | --- | --- |
 | `Sample` | One audio value, nominally \[-1.0, 1.0\] | Storage chosen per target |
-| `[Sample; N]` | A frame of N channels | N is a compile-time constant: a whole number, a size parameter, or a constant expression such as `riff.step_count * 2` |
+| `[Sample; N]` | A frame of N channels | N is a compile-time constant: a whole number, a size parameter, a `const`, or a constant expression such as `riff.step_count * 2` |
 | `[[Sample; 2]; N]` | Frames nest: N stereo voices or buses | See Polyphony |
 | `Float`, `Int`, `Bool` | Plain values for control logic | Not converted at I/O |
 | `Freq`, `Time` | Unit-carrying numbers | Convert to samples via the host rate |
@@ -105,6 +105,29 @@ Lifting rules:
 7. `each` before an argument (`f(each expr)`, `f(name: each expr)`) evaluates it once per copy of a lifted rill, across every lifted layer, instead of once for all of them. It matters for anything whose evaluations differ: `saw(offset: each random())` gives every copy its own offset, and `each lfo(0.3Hz)` its own LFO with its own state. The value has the parameter's own type and is not lifted itself; `each` on a call that does not lift is an error. `each` is a keyword only there.
 
 Randomness: `random()` is a `Float` in [0, 1), and `random(lo: S, hi: S)` any number type in [`lo`, `hi`) (levels evenly in dB). Every evaluation picks its number when the program is built, so it is a constant while playing: `random()` written once in a rill body is one number for the whole run, not a new one every sample. The numbers come from a seed; the same program with the same seed picks the same numbers. Without `--seed`, every run picks a new seed and prints it, so a run worth keeping can be repeated. Noise that changes every sample is a separate, later feature.
+
+### Constants
+
+`const NAME: Type = value` names a value worked out when the program is built. The type may be left out, as with `let`.
+
+```rill
+const ROOT: Pitch = C3
+const CHORD = [ROOT, ROOT + 7st, ROOT + 15st]
+const VOICES = 8
+const DETUNE = random(lo: 5cents, hi: 15cents)
+
+rill pad() [Sample; 2] {
+    const SPREAD = DETUNE * 2
+    let levels: [Float; VOICES] = [1 / VOICES as Float; VOICES]
+    ...
+}
+```
+
+- **Where.** At the top level, a `const` belongs to its file and can be used in any order: `CHORD` above uses `ROOT` before it is written. A cycle (`const A = B`, `const B = A`) is an error. In a block, a `const` is scoped to the block, like `let`.
+- **The value** must be constant: numbers with units, pitches, chords and frames, arithmetic, built-in functions of constants (`random()` included), other `const`s, sequence fields and `RATE`. A `fn` or `rill` cannot be used, and a `const` cannot hold a function.
+- **One value.** A top-level `const` is worked out once, so `DETUNE` is the same number everywhere it is used. A `const` in a rill is worked out once per instance: each of `[pad(); 4]` gets its own `random()`. It can use the rill's size parameters.
+- **Sizes.** A `const` holding a whole number of at least 1 is a size: `[Float; VOICES]`, `spread<VOICES>(...)`. One worked out from `RATE` or from a size parameter is not (yet).
+- A `const` cannot be assigned. A name in a block can shadow a top-level `const`; a top-level `const` cannot take the name of a definition, sequence, event, note (`A`, `C4`), built-in function or built-in constant.
 
 Rate rules:
 

@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! program := item*
-//! item    := "fn" def | "rill" def | event
+//! item    := "fn" def | "rill" def | event | const
+//! const   := "const" NAME (":" type)? "=" expr
 //! event   := "event" NAME NAME ("(" (NAME ":" expr),* ")")?
 //! seq     := "seq" NAME ("(" (NAME ":" expr),* ")")? "{" (step ","?)* "}"
 //! step    := ("_" | expr) ("@" expr)?
@@ -15,6 +16,7 @@
 //! block   := "{" stmt* "}"
 //! stmt    := "let" NAME (":" type)? ("=" expr)?
 //!          | "state" NAME (":" type)? "=" expr
+//!          | const
 //!          | "return" expr
 //!          | "for" NAME "in" expr block
 //!          | assignable ("=" | "+=") expr
@@ -102,7 +104,27 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
         let mut events = Vec::new();
         let mut seqs = Vec::new();
+        let mut consts = Vec::new();
         while !self.at(TokenKind::Eof) {
+            if self.at(TokenKind::Const) {
+                let decl = self.const_decl().and_then(|c| {
+                    if self.eat(TokenKind::Semi).is_none()
+                        && !self.at(TokenKind::Eof)
+                        && !self.peek().newline_before
+                    {
+                        return Err(self.unexpected("a line break or `;` after the `const`"));
+                    }
+                    Ok(c)
+                });
+                match decl {
+                    Ok(c) => consts.push(c),
+                    Err(err) => {
+                        self.errors.push(err);
+                        self.recover();
+                    }
+                }
+                continue;
+            }
             if self.at_ident("seq") && self.peek_at(1).kind == TokenKind::Ident {
                 match self.seq_decl() {
                     Ok(s) => seqs.push(s),
@@ -135,6 +157,7 @@ impl<'a> Parser<'a> {
             items,
             events,
             seqs,
+            consts,
             expr_count: self.next_id,
         };
         (program, self.errors)
@@ -232,6 +255,7 @@ impl Parser<'_> {
             && !(self.peek().newline_before
                 && (self.at(TokenKind::Fn)
                     || self.at(TokenKind::Rill)
+                    || self.at(TokenKind::Const)
                     || self.at_ident("event")
                     || self.at_ident("seq")))
         {
@@ -247,8 +271,13 @@ impl Parser<'_> {
         if self.eat(TokenKind::Rill).is_some() {
             return Ok(Item::Rill(self.def("rill")?));
         }
+        if self.at(TokenKind::Let) {
+            return Err(self
+                .unexpected("`fn`, `rill` or `const`")
+                .with_help("a value at the top level is a `const`, as in `const VOICES = 8`"));
+        }
         Err(self
-            .unexpected("`fn` or `rill`")
+            .unexpected("`fn`, `rill` or `const`")
             .with_help("statements must be inside a rill; the program starts at `rill main`"))
     }
 
@@ -454,6 +483,7 @@ impl Parser<'_> {
                     }
                 }
             }
+            TokenKind::Const => Stmt::Const(self.const_decl()?),
             TokenKind::Return => {
                 self.bump();
                 let value = self.expr()?;
@@ -577,7 +607,7 @@ impl Parser<'_> {
     /// After the statement starting at token `stmt_start` failed to parse:
     /// skip to where the next one starts (a line break or `;` outside
     /// brackets opened since), or to the `}` closing the block. A line
-    /// starting with `let`, `state` or `return` always starts a statement,
+    /// starting with `let`, `state`, `const` or `return` always starts a statement,
     /// even inside brackets left open.
     fn skip_stmt(&mut self, stmt_start: usize) {
         self.nest = 0;
@@ -587,7 +617,11 @@ impl Parser<'_> {
             let t = self.peek();
             let starts_stmt = matches!(
                 t.kind,
-                TokenKind::Let | TokenKind::State | TokenKind::Return | TokenKind::For
+                TokenKind::Let
+                    | TokenKind::State
+                    | TokenKind::Const
+                    | TokenKind::Return
+                    | TokenKind::For
             );
             if self.pos > stmt_start && t.newline_before && starts_stmt {
                 return;
@@ -664,6 +698,24 @@ impl Parser<'_> {
             self.nest -= 1;
         }
         Ok(out)
+    }
+
+    /// `const NAME: Type = value`, at the top level or in a block.
+    fn const_decl(&mut self) -> PResult<ConstDecl> {
+        let start = self.expect(TokenKind::Const, "")?.span;
+        let name = self.ident("as the constant's name")?;
+        let ty = match self.eat(TokenKind::Colon) {
+            Some(_) => Some(self.ty()?),
+            None => None,
+        };
+        self.expect(TokenKind::Assign, "and a value: a `const` always has one")?;
+        let value = self.expr()?;
+        Ok(ConstDecl {
+            name,
+            ty,
+            value,
+            span: self.span_from(start),
+        })
     }
 
     fn seq_decl(&mut self) -> PResult<SeqDecl> {

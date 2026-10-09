@@ -2112,3 +2112,49 @@ fn running_together_with_sequence_events() {
     ";
     same_either_way(src, 2, 48_000, &[]);
 }
+
+#[test]
+fn a_const_has_one_value_everywhere() {
+    // Were `random()` copied to each use, the two would differ.
+    let src = "
+        const L = random()
+        rill main() Sample {
+            let a = L
+            let b = L
+            return (a - b) * 1000 + L
+        }
+    ";
+    let out = render(src, 4);
+    assert!((0.0..1.0).contains(&out[0]), "{out:?}");
+    assert!(out.iter().all(|&x| x == out[0]));
+}
+
+#[test]
+fn a_const_in_a_rill_belongs_to_each_copy() {
+    let src = "
+        rill v() Sample {
+            const R = random()
+            return R
+        }
+        rill main() Sample {
+            return v() - v()
+        }
+    ";
+    assert_ne!(render(src, 1)[0], 0.0);
+}
+
+#[test]
+fn consts_are_worked_out_when_building() {
+    let src = "
+        const NYQUIST = RATE / 2
+        const STEPS = 3
+        const CHORD = [A4, A5]
+        rill main() Sample {
+            const LEVELS: [Float; STEPS] = [0.25, 0.5, 1]
+            let f = CHORD |> equal
+            return NYQUIST / 1Hz / 1000 + f[0] / 1Hz + f[1] / 1Hz + LEVELS[2]
+        }
+    ";
+    let want = RATE as f32 / 2.0 / 1000.0 + 440.0 + 880.0 + 1.0;
+    close(&render(src, 2), &[want, want], 1e-3);
+}

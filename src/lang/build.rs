@@ -8,7 +8,9 @@
 
 use super::ast::Program;
 use super::check::{Checked, check_entry};
-use super::compile::{ArgSpec, CVal, Defs, Random, compile_instance, default_value, seq_tables};
+use super::compile::{
+    ArgSpec, CVal, Defs, Random, compile_instance, const_table, default_value, seq_tables,
+};
 use super::diag::Diagnostic;
 use super::types::Type;
 use super::vm::{Operand, Program as ProgramNode};
@@ -67,6 +69,14 @@ pub fn build_with(
     let mut defs = Defs::new(program, checked);
     defs.vectorize = options.vectorize;
     defs.random = Random::new(options.seed.unwrap_or_else(new_seed));
+    const_table(
+        &mut defs,
+        program,
+        checked,
+        &checked.types,
+        config.sample_rate as f32,
+    )
+    .map_err(|d| vec![d])?;
     defs.seqs = seq_tables(&defs, &checked.types, config.sample_rate as f32, program)
         .map_err(|d| vec![d])?;
     let (def, sig) = defs.get(entry).expect("checked by check_entry");

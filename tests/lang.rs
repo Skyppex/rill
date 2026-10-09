@@ -149,11 +149,19 @@ fn design_doc_types() {
 
 #[test]
 fn programs_are_only_definitions() {
-    let errs = lang::parse("let x = 1").unwrap_err();
-    assert_eq!(errs[0].message, "expected `fn` or `rill`, found `let`");
+    let errs = lang::parse("x = 1").unwrap_err();
+    assert_eq!(
+        errs[0].message,
+        "expected `fn`, `rill` or `const`, found `x`"
+    );
     assert_eq!(
         errs[0].help.as_deref(),
         Some("statements must be inside a rill; the program starts at `rill main`")
+    );
+    let errs = lang::parse("let x = 1").unwrap_err();
+    assert_eq!(
+        errs[0].help.as_deref(),
+        Some("a value at the top level is a `const`, as in `const VOICES = 8`")
     );
 }
 
@@ -1887,4 +1895,166 @@ fn constant_sizes() {
             .0,
         "a size cannot be worked out from size parameter `N` yet"
     );
+}
+
+// ---- const --------------------------------------------------------------
+
+#[test]
+fn consts_have_types_and_can_be_sizes() {
+    let src = "
+        const CHORD = [ROOT, ROOT + 7st, ROOT + 15st]
+        const ROOT: Pitch = C3
+        const VOICES = HALF * 2
+        const HALF = 4
+        const LEVEL: Float = 0.5
+        fn first<N>(x: [Float; N]) Float { x[0] }
+        rill main() Sample {
+            const WIDTH = VOICES - 1
+            let a: [Float; VOICES] = [LEVEL; VOICES]
+            let b = [1; WIDTH]
+            let c = first<VOICES>(a)
+            let d = CHORD
+            let e = [0; riff.step_count * HALF]
+            return 0
+        }
+        seq riff { C4, E4 }
+    ";
+    let errs: Vec<String> = diagnostics(src)
+        .into_iter()
+        .filter(|d| d.is_error())
+        .map(|d| d.message)
+        .collect();
+    assert!(errs.is_empty(), "{errs:?}");
+    assert_eq!(type_of(src, "a"), frame(Type::Float, 8));
+    assert_eq!(type_of(src, "b"), frame(Type::Num, 7));
+    assert_eq!(type_of(src, "d"), frame(Type::Pitch, 3));
+    assert_eq!(type_of(src, "e"), frame(Type::Num, 8));
+
+    let (program, checked) = lang::compile(src).unwrap();
+    assert_eq!(program.consts.len(), 5);
+    assert_eq!(checked.consts[2].value, Some(8.0));
+    assert_eq!(checked.consts[1].ty, Type::Pitch);
+    // Each comes after the ones it uses.
+    let at = |i: usize| checked.const_order.iter().position(|&k| k == i).unwrap();
+    assert!(at(1) < at(0) && at(3) < at(2));
+}
+
+#[test]
+fn a_const_must_be_constant() {
+    let (msg, help) = error(&body("state p: Float = 0\nconst K = p * 2"));
+    assert_eq!(msg, "the value of `K` must be a constant");
+    assert!(help.unwrap().contains("use `let`"));
+
+    assert_eq!(
+        error("const K = f(2)\nfn f(x: Float) Float { x }\nrill main() Sample { return 0 }").0,
+        "`f` cannot be used in a `const`"
+    );
+    assert_eq!(
+        error(&body("const S: fn(Float) Float = sqrt")).0,
+        "a `const` cannot hold a function"
+    );
+    assert_eq!(
+        error("const X = Y + 1\nconst Y = X\nrill main() Sample { return 0 }").0,
+        "`X` is worked out from itself: X → Y → X"
+    );
+    assert_eq!(
+        error("const X = X\nrill main() Sample { return 0 }").0,
+        "`X` is worked out from itself: X → X"
+    );
+    assert_eq!(
+        error(&body("const K: Pitch = 3")).0,
+        "`K` expects `Pitch`, found `number`"
+    );
+}
+
+#[test]
+fn a_const_cannot_change() {
+    assert_eq!(
+        error(&body("const K = 2\nK = 3")).0,
+        "`K` is a `const`, so it cannot change"
+    );
+    assert_eq!(
+        error(&format!("const K = 2\n{}", body("K = 3"))).0,
+        "`K` is a `const`, so it cannot change"
+    );
+}
+
+#[test]
+fn const_names_are_their_own() {
+    for (src, msg) in [
+        (
+            "const RATE = 2",
+            "`RATE` is already the name of a built-in constant",
+        ),
+        (
+            "const sin = 2",
+            "`sin` is already the name of a built-in function",
+        ),
+        ("const C4 = 2", "`C4` is already the name of a note"),
+        (
+            "const main = 2",
+            "`main` is already the name of a fn or rill",
+        ),
+        (
+            "const riff = 2\nseq riff { C4 }",
+            "`riff` is already the name of a sequence",
+        ),
+        ("const K = 2\nconst K = 3", "`K` is already a `const`"),
+    ] {
+        let src = format!("{src}\nrill main() Sample {{ return 0 }}");
+        assert!(
+            errors(&src).contains(&msg.to_owned()),
+            "{src}: {:?}",
+            errors(&src)
+        );
+    }
+    // A local name can shadow a `const`.
+    assert_ok("const K = 2\nrill main() Sample { let K = 0.5\nreturn K }");
+}
+
+#[test]
+fn const_sizes_follow_the_size_rules() {
+    for (decl, msg) in [
+        (
+            "const H = 2.5",
+            "a size must be a whole number of at least 1; this is 2.5",
+        ),
+        (
+            "const H = 0",
+            "a size must be a whole number of at least 1; this is 0",
+        ),
+        ("const H = RATE", "a size must be a constant whole number"),
+    ] {
+        let src = format!("{decl}\n{}", body("let x = [1; H]"));
+        assert_eq!(error(&src).0, msg, "{decl}");
+    }
+    // A `const` can use a size parameter as a value, not yet as a size.
+    assert_ok(
+        "rill f<N>(x: [Sample; N]) Sample { const HALF = N / 2\nreturn x[0] * HALF }\nrill main() Sample { return f<4>([1, 2, 3, 4]) }",
+    );
+    assert_eq!(
+        error("rill f<N>(x: [Sample; N]) Sample { const HALF = N / 2\nlet y = [0; HALF]\nreturn x[0] }\nrill main() Sample { return f<4>([1, 2, 3, 4]) }").0,
+        "a size cannot be worked out from size parameter `N` yet"
+    );
+}
+
+#[test]
+fn const_names_resolve() {
+    let src = "const K = 2\nrill main() Sample { const L = K\nreturn L }";
+    let (_, checked) = lang::compile(src).unwrap();
+    let at = |name: &str, nth: usize| {
+        let start = src.match_indices(name).nth(nth).unwrap().0 as u32;
+        checked
+            .resolutions
+            .iter()
+            .find(|(s, _)| s.start == start)
+            .map(|(_, r)| r.clone())
+    };
+    assert_eq!(at("K", 1), Some(lang::check::Resolution::Const(0)));
+    assert!(matches!(
+        at("L", 1),
+        Some(lang::check::Resolution::Binding(_))
+    ));
+    let l = checked.bindings.iter().find(|b| b.name == "L").unwrap();
+    assert_eq!(l.kind, lang::check::BindingKind::Const);
 }

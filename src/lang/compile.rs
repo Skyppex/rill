@@ -138,6 +138,8 @@ pub struct Defs<'a> {
     /// Values the checker worked out: sequence fields and sizes written as
     /// expressions, by expression id.
     const_values: &'a HashMap<u32, f64>,
+    /// The top-level `const`s, filled in by [`const_table`].
+    consts: HashMap<&'a str, CVal>,
 }
 
 /// The numbers `random()` picks while a program is built: SplitMix64 from a
@@ -167,6 +169,9 @@ impl<'a> Defs<'a> {
     pub fn new(program: &'a Program, checked: &'a Checked) -> Defs<'a> {
         let defs = program.items.iter().map(Item::def);
         let mut lambdas = HashMap::new();
+        for c in &program.consts {
+            collect_lambdas(&c.value, &mut lambdas);
+        }
         for d in program.items.iter().map(Item::def) {
             for p in &d.params {
                 if let Some(e) = &p.default {
@@ -191,6 +196,7 @@ impl<'a> Defs<'a> {
             vectorize: true,
             random: Random::default(),
             const_values: &checked.const_values,
+            consts: HashMap::new(),
             map: defs
                 .zip(&checked.signatures)
                 .map(|(d, s)| (d.name.name.as_str(), (d, s)))
@@ -268,6 +274,7 @@ fn collect_lambdas_in_block<'a>(b: &'a Block, out: &mut HashMap<u32, &'a Expr>) 
             | Stmt::State { init: e, .. }
             | Stmt::Assign { value: e, .. }
             | Stmt::Return { value: e, .. }
+            | Stmt::Const(ConstDecl { value: e, .. })
             | Stmt::Expr(e) => collect_lambdas(e, out),
             Stmt::Let { value: None, .. } => {}
             Stmt::EventHandler { body, .. } => collect_lambdas_in_block(body, out),
@@ -364,6 +371,28 @@ fn const_of(o: Operand) -> Option<f32> {
         Operand::Const(c) => Some(c),
         Operand::Reg(_) => None,
     }
+}
+
+/// Work out every top-level `const`, once, so all its uses share one
+/// value (and one pick of `random()`).
+pub fn const_table<'a>(
+    defs: &mut Defs<'a>,
+    program: &'a Program,
+    checked: &Checked,
+    types: &[Type],
+    sample_rate: f32,
+) -> Result<(), Diagnostic> {
+    for &i in &checked.const_order {
+        let decl = &program.consts[i];
+        let mut c = Compiler::new(defs, types, sample_rate, decl.span);
+        c.scopes = vec![HashMap::new()];
+        let value = c.expr(&decl.value)?;
+        if value.operands().iter().any(|o| const_of(*o).is_none()) {
+            return Err(internal(decl.value.span, "a `const` that is not constant"));
+        }
+        defs.consts.insert(decl.name.name.as_str(), value);
+    }
+    Ok(())
 }
 
 /// Build every sequence's table: its settings and steps, all constants.
@@ -903,10 +932,15 @@ impl<'a> Compiler<'a> {
         match size {
             SizeExpr::Lit(n, _) => Ok(*n),
             SizeExpr::Var(id) => {
-                let Some(binding) = self.lookup(&id.name) else {
-                    return Err(internal(id.span, "unknown frame size"));
+                let val = match self.lookup(&id.name) {
+                    Some(binding) => &binding.val,
+                    None => self
+                        .defs
+                        .consts
+                        .get(id.name.as_str())
+                        .ok_or_else(|| internal(id.span, "unknown frame size"))?,
                 };
-                let Operand::Const(n) = binding.val.scalar() else {
+                let Operand::Const(n) = val.scalar() else {
                     return Err(internal(id.span, "frame size is not constant"));
                 };
                 Ok(n as u32)
@@ -1079,6 +1113,11 @@ impl<'a> Compiler<'a> {
                 self.bind(&name.name, v, false);
                 Ok((None, false))
             }
+            Stmt::Const(decl) => {
+                let v = self.expr(&decl.value)?;
+                self.bind(&decl.name.name, v, false);
+                Ok((None, false))
+            }
             Stmt::State { name, init, .. } => {
                 let v = self.expr(init)?;
                 let mut regs = Vec::new();
@@ -1204,6 +1243,9 @@ impl<'a> Compiler<'a> {
             ExprKind::Name(name) => {
                 if let Some(b) = self.lookup(name) {
                     return Ok(b.val.clone());
+                }
+                if let Some(v) = self.defs.consts.get(name.as_str()) {
+                    return Ok(v.clone());
                 }
                 if let Some(p) = super::check::pitch_literal(name) {
                     return Ok(CVal::Scalar(Operand::Const(p)));
@@ -2414,6 +2456,7 @@ fn names_in_block(b: &Block, out: &mut Vec<String>) {
             | Stmt::State { init: e, .. }
             | Stmt::Assign { value: e, .. }
             | Stmt::Return { value: e, .. }
+            | Stmt::Const(ConstDecl { value: e, .. })
             | Stmt::Expr(e) => names_in(e, out),
             Stmt::Let { value: None, .. } => {}
             Stmt::EventHandler { body, .. } => names_in_block(body, out),

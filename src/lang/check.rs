@@ -58,6 +58,20 @@ pub struct Checked {
     /// Values worked out while checking, by expression id: sequence fields
     /// (`riff.step_count`) and sizes written as expressions.
     pub const_values: HashMap<u32, f64>,
+    /// The program's top-level `const`s, as [`Program::consts`].
+    pub consts: Vec<ConstInfo>,
+    /// The top-level `const`s in an order where each comes after the ones
+    /// it uses, by index into [`Checked::consts`]. A `const` in a cycle is
+    /// left out.
+    pub const_order: Vec<usize>,
+}
+
+/// What the checker found out about a top-level `const`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstInfo {
+    pub ty: Type,
+    /// The value, if it is a number known while checking.
+    pub value: Option<f64>,
 }
 
 impl Checked {
@@ -84,6 +98,8 @@ pub enum BindingKind {
     FnParam,
     /// The payload of an `on` handler.
     EventParam,
+    /// A `const` in a block.
+    Const,
 }
 
 /// A named value and where it can be used.
@@ -127,6 +143,8 @@ pub enum Resolution {
     Event(usize),
     /// A sequence, by index into the program's sequences.
     Seq(usize),
+    /// A top-level `const`, by index into [`Checked::consts`].
+    Const(usize),
 }
 
 /// Check `program`. On failure the list holds the errors and any warnings.
@@ -173,17 +191,26 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         seq_used: vec![false; program.seqs.len()],
         handler: None,
         invokes: Vec::new(),
+        const_names: HashMap::new(),
+        const_types: vec![Type::Error; program.consts.len()],
+        const_vals: vec![Err(None); program.consts.len()],
+        local_const_vals: HashMap::new(),
+        const_order: Vec::new(),
     };
 
     c.declare_events(&program.events, &program.seqs);
     c.generate_seq_events(program);
-    for seq in &program.seqs {
+    // Facts first, as `const`s can use them; `instances` can use a `const`
+    // in turn, so it is worked out again once they are known.
+    c.seq_facts = program.seqs.iter().map(|s| SeqFacts::of(s, None)).collect();
+    c.check_consts(&program.consts, &program.items);
+    for (j, seq) in program.seqs.iter().enumerate() {
         let instances = seq
             .settings
             .iter()
             .find(|s| s.name.name == "instances")
             .and_then(|s| c.const_value(&s.value).ok());
-        c.seq_facts.push(SeqFacts::of(seq, instances));
+        c.seq_facts[j] = SeqFacts::of(seq, instances);
     }
     for item in &program.items {
         match item {
@@ -191,6 +218,7 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
             Item::Rill(d) => c.declare(d, DefKind::Rill),
         }
     }
+    c.const_clashes(program);
     c.check_seqs(&program.seqs, &program.events);
     for (i, decl) in program.events.iter().enumerate() {
         if c.events[i].is_some() && c.defs.contains_key(&decl.name.name) {
@@ -259,6 +287,16 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         written_events: c.written_events,
         seq_facts: c.seq_facts,
         const_values: c.const_values,
+        consts: c
+            .const_types
+            .into_iter()
+            .zip(c.const_vals)
+            .map(|(ty, value)| ConstInfo {
+                ty,
+                value: value.ok(),
+            })
+            .collect(),
+        const_order: c.const_order,
     };
     (checked, errors)
 }
@@ -280,6 +318,8 @@ enum VarKind {
     Loop,
     /// The payload of an `on` handler.
     EventParam,
+    /// A `const` in a block.
+    Const,
 }
 
 #[derive(Clone, Debug)]
@@ -296,6 +336,9 @@ struct Subst {
 }
 
 pub(crate) type OpError = (String, Option<String>);
+
+/// What [`Checker::const_value`] gives.
+type ConstVal = Result<f64, Option<String>>;
 
 struct Checker {
     /// Name -> index into `signatures` (first definition wins).
@@ -345,6 +388,13 @@ struct Checker {
     /// Every `invoke` and `trigger`: from the handler it is in, to what it
     /// starts, for the loop check.
     invokes: Vec<(Node, Node, Span)>,
+    /// Top-level `const`s: by name, their types and values.
+    const_names: HashMap<String, usize>,
+    const_types: Vec<Type>,
+    const_vals: Vec<ConstVal>,
+    /// The values of `const`s in blocks, by binding.
+    local_const_vals: HashMap<BindingId, ConstVal>,
+    const_order: Vec<usize>,
     /// How many of `events` are written in the program; the rest are made
     /// by sequences.
     written_events: usize,
@@ -1384,6 +1434,7 @@ impl Checker {
             VarKind::Size => BindingKind::Size,
             VarKind::Loop => BindingKind::Let,
             VarKind::EventParam => BindingKind::EventParam,
+            VarKind::Const => BindingKind::Const,
         };
         let scope = Span {
             start: visible_from,
@@ -1434,6 +1485,13 @@ impl Checker {
                 };
                 self.bind(name, bound, VarKind::Let, span.end);
                 (Type::Unit, t == Type::Never)
+            }
+            Stmt::Const(decl) => {
+                let (t, value) = self.const_decl(decl);
+                self.bind(&decl.name, t, VarKind::Const, decl.span.end);
+                let id = self.lookup(&decl.name.name).expect("just bound").id;
+                self.local_const_vals.insert(id, value);
+                (Type::Unit, false)
             }
             Stmt::State {
                 name,
@@ -1534,6 +1592,20 @@ impl Checker {
                                 mismatch(value.span, &format!("`{}`", name.name), &expected, &t);
                             self.report(e);
                         }
+                    }
+                    Some(var) if var.kind == VarKind::Const => {
+                        let e = self
+                            .error(name.span, format!("`{}` is a `const`, so it cannot change", name.name))
+                            .with_help("use `let` for a value that changes, or `state` for one kept between ticks");
+                        self.report(e);
+                    }
+                    None if self.const_names.contains_key(&name.name) => {
+                        let i = self.const_names[&name.name];
+                        self.resolve(name.span, Resolution::Const(i));
+                        let e = self
+                            .error(name.span, format!("`{}` is a `const`, so it cannot change", name.name))
+                            .with_help("use `let` for a value that changes, or `state` for one kept between ticks");
+                        self.report(e);
                     }
                     Some(_) => {
                         let e = self
@@ -1718,6 +1790,10 @@ impl Checker {
                 if let Some(var) = self.lookup(name).cloned() {
                     self.resolve(e.span, Resolution::Binding(var.id));
                     return var.ty;
+                }
+                if let Some(&i) = self.const_names.get(name) {
+                    self.resolve(e.span, Resolution::Const(i));
+                    return self.const_types[i].clone();
                 }
                 if pitch_literal(name).is_some() {
                     self.resolve(e.span, Resolution::Note);
@@ -2053,6 +2129,7 @@ impl Checker {
             .flat_map(|s| s.keys().map(String::as_str))
             .collect();
         candidates.extend(builtins::CONSTANTS.iter().map(|(n, _)| *n));
+        candidates.extend(self.const_names.keys().map(String::as_str));
         let d = Diagnostic::error(span, format!("unknown name `{name}`"));
         match suggest(name, candidates) {
             Some(s) => d.with_help(format!("did you mean `{s}`?")),
@@ -2446,6 +2523,26 @@ impl Checker {
         match size {
             SizeExpr::Lit(n, _) => Some(Size::Const(*n)),
             SizeExpr::Var(id) => {
+                if !generics.contains(&id.name) {
+                    let local = self.lookup(&id.name).map(|v| (v.id, v.kind));
+                    let value = match (local, self.const_names.get(&id.name)) {
+                        (Some((b, VarKind::Const)), _) => {
+                            self.resolve(id.span, Resolution::Binding(b));
+                            Some(self.local_const_vals.get(&b).cloned().unwrap_or(Err(None)))
+                        }
+                        (None, Some(&i)) => {
+                            self.resolve(id.span, Resolution::Const(i));
+                            match self.const_types[i].is_wild() {
+                                true => return None,
+                                false => Some(self.const_vals[i].clone()),
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(value) = value {
+                        return self.size_of(id.span, value);
+                    }
+                }
                 if builtins::constant(&id.name).is_some() && !generics.contains(&id.name) {
                     let e = self
                         .error(id.span, format!("`{}` cannot be a size", id.name))
@@ -2493,23 +2590,237 @@ impl Checker {
                 if t.is_wild() {
                     return None;
                 }
-                let problem = match self.const_value(e) {
-                    Ok(v) if v >= 1.0 && v.fract() == 0.0 && v <= f64::from(u32::MAX) => {
-                        self.const_values.insert(e.id, v);
-                        return Some(Size::Const(v as u32));
-                    }
-                    Ok(v) => self
-                        .error(e.span, format!("a size must be a whole number of at least 1; this is {v}")),
-                    Err(Some(name)) => self
-                        .error(e.span, format!("a size cannot be worked out from size parameter `{name}` yet"))
-                        .with_help(format!("take the size as a size parameter of its own, next to `{name}`")),
-                    Err(None) => self
-                        .error(e.span, "a size must be a constant whole number")
-                        .with_help("as in `8`, `riff.step_count` or `riff.step_count * 2`; values known only while playing, and `RATE`, cannot be sizes"),
-                };
-                self.report(problem);
-                None
+                let value = self.const_value(e);
+                let size = self.size_of(e.span, value);
+                if let Some(Size::Const(n)) = size {
+                    self.const_values.insert(e.id, f64::from(n));
+                }
+                size
             }
+        }
+    }
+
+    /// The size a constant's `value` makes, or an error at `span`.
+    fn size_of(&mut self, span: Span, value: ConstVal) -> Option<Size> {
+        let problem = match value {
+            Ok(v) if v >= 1.0 && v.fract() == 0.0 && v <= f64::from(u32::MAX) => {
+                return Some(Size::Const(v as u32));
+            }
+            Ok(v) => self.error(span, format!("a size must be a whole number of at least 1; this is {v}")),
+            Err(Some(name)) => self
+                .error(span, format!("a size cannot be worked out from size parameter `{name}` yet"))
+                .with_help(format!("take the size as a size parameter of its own, next to `{name}`")),
+            Err(None) => self
+                .error(span, "a size must be a constant whole number")
+                .with_help("as in `8`, `VOICES` or `riff.step_count * 2`; values known only while playing, and `RATE`, cannot be sizes"),
+        };
+        self.report(problem);
+        None
+    }
+
+    /// Check the top-level `const`s, each after the ones it uses.
+    fn check_consts(&mut self, consts: &[ConstDecl], defs: &[Item]) {
+        for (i, c) in consts.iter().enumerate() {
+            if self.const_names.contains_key(&c.name.name) {
+                let e = self.error(
+                    c.name.span,
+                    format!("`{}` is already a `const`", c.name.name),
+                );
+                self.report(e);
+            } else {
+                self.const_names.insert(c.name.name.clone(), i);
+            }
+        }
+        let deps: Vec<Vec<usize>> = consts
+            .iter()
+            .map(|c| {
+                let mut names = Vec::new();
+                const_names_in(&c.value, &mut names);
+                let mut deps: Vec<usize> = names
+                    .iter()
+                    .filter_map(|n| self.const_names.get(n).copied())
+                    .collect();
+                deps.dedup();
+                deps
+            })
+            .collect();
+
+        // Depth first, so each comes after what it uses; a way back to one
+        // still being visited is a cycle.
+        let mut state = vec![0u8; consts.len()];
+        let mut in_cycle = vec![false; consts.len()];
+        let mut path = Vec::new();
+        fn visit(
+            i: usize,
+            deps: &[Vec<usize>],
+            state: &mut [u8],
+            in_cycle: &mut [bool],
+            path: &mut Vec<usize>,
+            order: &mut Vec<usize>,
+            cycles: &mut Vec<Vec<usize>>,
+        ) {
+            state[i] = 1;
+            path.push(i);
+            for &j in &deps[i] {
+                match state[j] {
+                    0 => visit(j, deps, state, in_cycle, path, order, cycles),
+                    1 => {
+                        let from = path.iter().position(|&k| k == j).expect("on the path");
+                        let cycle = path[from..].to_vec();
+                        for &k in &cycle {
+                            in_cycle[k] = true;
+                        }
+                        cycles.push(cycle);
+                    }
+                    _ => {}
+                }
+            }
+            path.pop();
+            state[i] = 2;
+            if !in_cycle[i] {
+                order.push(i);
+            }
+        }
+        let mut order = Vec::new();
+        let mut cycles = Vec::new();
+        for i in 0..consts.len() {
+            if state[i] == 0 {
+                visit(
+                    i,
+                    &deps,
+                    &mut state,
+                    &mut in_cycle,
+                    &mut path,
+                    &mut order,
+                    &mut cycles,
+                );
+            }
+        }
+        for cycle in cycles {
+            let names: Vec<&str> = cycle
+                .iter()
+                .chain(cycle.first())
+                .map(|&k| consts[k].name.name.as_str())
+                .collect();
+            let first = &consts[cycle[0]];
+            let e = self
+                .error(
+                    first.name.span,
+                    format!(
+                        "`{}` is worked out from itself: {}",
+                        first.name.name,
+                        names.join(" → ")
+                    ),
+                )
+                .with_help("a `const` can use other `const`s, but not in a circle");
+            self.report(e);
+        }
+
+        let def_names: HashSet<&str> = defs.iter().map(|d| d.def().name.name.as_str()).collect();
+        for &i in &order {
+            let c = &consts[i];
+            self.scopes = vec![HashMap::new()];
+            self.scope_spans = vec![c.span];
+            self.place = Place::Fn;
+            self.current = None;
+            self.sizes.clear();
+            let mut names = Vec::new();
+            const_names_in(&c.value, &mut names);
+            if let Some(n) = names.iter().find(|n| def_names.contains(n.as_str())) {
+                let e = self
+                    .error(c.value.span, format!("`{n}` cannot be used in a `const`"))
+                    .with_help("a `const` is worked out before any fn or rill runs: from numbers, pitches, other `const`s and built-in functions of them");
+                self.report(e);
+                continue;
+            }
+            let (ty, value) = self.const_decl(c);
+            self.const_types[i] = ty;
+            self.const_vals[i] = value;
+        }
+        self.scopes.clear();
+        self.scope_spans.clear();
+        self.const_order = order;
+    }
+
+    /// Check a `const`: its type and that its value is a constant.
+    fn const_decl(&mut self, c: &ConstDecl) -> (Type, ConstVal) {
+        let declared =
+            c.ty.as_ref()
+                .map(|te| self.resolve_type(te, &self.generics()));
+        let t = self.expr_expect(&c.value, declared.as_ref());
+        let mut ok = !t.is_wild();
+        if ok && let Some(part) = self.non_const_part(&c.value) {
+            let e = self
+                .error(part.span, format!("the value of `{}` must be a constant", c.name.name))
+                .with_help("a `const` is worked out once, before audio starts: from numbers, pitches, other `const`s and built-in functions of them; use `let` for a value worked out while playing");
+            self.report(e);
+            ok = false;
+        }
+        if matches!(t, Type::Fn(..)) {
+            let e = self
+                .error(c.span, "a `const` cannot hold a function")
+                .with_help("define it as a `fn`, or bind it with `let`");
+            self.report(e);
+            ok = false;
+        }
+        let bound = match declared {
+            Some(declared) => {
+                if !coerces(&t, &declared) {
+                    let e = mismatch(c.value.span, &format!("`{}`", c.name.name), &declared, &t);
+                    self.report(e);
+                    ok = false;
+                }
+                declared
+            }
+            None => t,
+        };
+        let value = match ok {
+            true => self.const_value(&c.value),
+            false => Err(None),
+        };
+        (bound, value)
+    }
+
+    /// The innermost part of `e` that is not a constant, if any.
+    fn non_const_part<'e>(&self, e: &'e Expr) -> Option<&'e Expr> {
+        if self.is_const(e) {
+            return None;
+        }
+        let inner = match &e.kind {
+            ExprKind::Unary(_, x) | ExprKind::Cast(x, _) | ExprKind::Repeat(x, _) => {
+                self.non_const_part(x)
+            }
+            ExprKind::Binary(_, a, b) => self.non_const_part(a).or_else(|| self.non_const_part(b)),
+            ExprKind::Frame(xs) => xs.iter().find_map(|x| self.non_const_part(x)),
+            ExprKind::Call { args, .. } => args.iter().find_map(|a| self.non_const_part(&a.value)),
+            _ => None,
+        };
+        inner.or(Some(e))
+    }
+
+    /// Top-level `const`s whose names are taken by something else.
+    fn const_clashes(&mut self, program: &Program) {
+        for c in &program.consts {
+            let n = c.name.name.as_str();
+            let what = if self.defs.contains_key(n) {
+                "a fn or rill"
+            } else if program.seqs.iter().any(|s| s.name.name == n) {
+                "a sequence"
+            } else if self.events.iter().flatten().any(|d| d.name == n) {
+                "an event"
+            } else if builtins::constant(n).is_some() {
+                "a built-in constant"
+            } else if pitch_literal(n).is_some() {
+                "a note"
+            } else if !builtins::lookup(n).is_empty() {
+                "a built-in function"
+            } else {
+                continue;
+            };
+            let e = self
+                .error(c.name.span, format!("`{n}` is already the name of {what}"))
+                .with_help("give the `const` a name of its own");
+            self.report(e);
         }
     }
 
@@ -2550,7 +2861,16 @@ impl Checker {
             },
             ExprKind::Name(n) => match self.lookup(n) {
                 Some(v) if v.kind == VarKind::Size => Err(Some(n.clone())),
-                _ => Err(None),
+                Some(v) if v.kind == VarKind::Const => self
+                    .local_const_vals
+                    .get(&v.id)
+                    .cloned()
+                    .unwrap_or(Err(None)),
+                Some(_) => Err(None),
+                None => match self.const_names.get(n) {
+                    Some(&i) => self.const_vals[i].clone(),
+                    None => Err(None),
+                },
             },
             _ => Err(None),
         }
@@ -2905,9 +3225,10 @@ impl Checker {
             ExprKind::Frame(xs) => xs.iter().all(|x| self.is_const(x)),
             ExprKind::Repeat(x, _) => self.is_const(x),
             ExprKind::Name(n) => match self.lookup(n) {
-                Some(v) => v.kind == VarKind::Size,
+                Some(v) => matches!(v.kind, VarKind::Size | VarKind::Const),
                 None => {
-                    builtins::constant(n).is_some()
+                    self.const_names.contains_key(n)
+                        || builtins::constant(n).is_some()
                         || pitch_literal(n).is_some()
                         // A named fn is a fixed value.
                         || self.defs.get(n).is_some_and(|&i| self.signatures[i].kind == DefKind::Fn)
@@ -3017,6 +3338,7 @@ fn var_word(kind: VarKind) -> &'static str {
         VarKind::Size => "size",
         VarKind::Loop => "loop variable",
         VarKind::EventParam => "event",
+        VarKind::Const => "constant",
     }
 }
 
@@ -3115,6 +3437,34 @@ fn mentions_size(t: &Type, name: &str) -> bool {
             params.iter().any(|p| mentions_size(p, name)) || mentions_size(ret, name)
         }
         _ => false,
+    }
+}
+
+/// The names a `const`'s value uses, for working out the order to check
+/// them in.
+fn const_names_in(e: &Expr, out: &mut Vec<String>) {
+    match &e.kind {
+        ExprKind::Name(n) => out.push(n.clone()),
+        ExprKind::Unary(_, x)
+        | ExprKind::Cast(x, _)
+        | ExprKind::Field(x, _)
+        | ExprKind::Repeat(x, _) => const_names_in(x, out),
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
+            const_names_in(a, out);
+            const_names_in(b, out);
+        }
+        ExprKind::Frame(xs) => {
+            for x in xs {
+                const_names_in(x, out);
+            }
+        }
+        ExprKind::Call { callee, args, .. } => {
+            out.push(callee.name.clone());
+            for a in args {
+                const_names_in(&a.value, out);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -117,7 +117,9 @@ Rate rules:
 Lifting makes polyphony the default. A chord is a frame of pitches, so it becomes one voice per note, and a stereo voice becomes a frame of stereo frames:
 
 ```rill
-rill pan(x: Sample, pos: Float) [Sample; 2] { return [x * (1 - pos), x * pos] }
+rill pan(x: Sample, pos: Float) [Sample; 2] {
+    return [x * (1 - pos), x * pos]
+}
 
 rill main() [Sample; 2] {
     return [C4, E4, G4] |> equal |> sine |> pan(0.3) |> sum
@@ -226,22 +228,37 @@ A sequence is a pattern of notes that plays only when the program says so, at it
 
 ```rill
 seq riff(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.9, velocity: 0.8) {
-    C4, _, E4@0.5, _, [G4, B4]@1, E4, _, C5
+    C4, _, E4@0.5, _, [G4, B4]@1, E4, _, C5,
 }
 
 rill voice() Sample {
     state pitch: Pitch = C4
     state level: Float = 0
-    on riff_note_on(note) claim { pitch = note.pitch; level = note.velocity }
-    on riff_note_off release { level = 0 }
+
+    on riff_note_on(note) claim {
+        pitch = note.pitch
+        level = note.velocity
+    }
+
+    on riff_note_off release {
+        level = 0
+    }
+
     return sine(pitch |> equal) * level
 }
 
 rill main(speed: Freq = 120bpm) Sample {
     state accent: Float = 1
     let accents: [Float; riff.step_count] = [1.2, 1, 0.8, 1, 1.2, 1, 0.8, 1]
-    on start { invoke riff(loop: true) }
-    on riff_step(s) { accent = accents[s.step - 1] }
+
+    on start {
+        invoke riff(loop: true)
+    }
+
+    on riff_step(s) {
+        accent = accents[s.step - 1]
+    }
+
     return sum([voice(); 8]) * accent
 }
 ```
@@ -318,8 +335,16 @@ A pool of voices is a frame of separate rill instances, written like the frame t
 rill lead() Sample {
     state pitch: Pitch = C4
     state level: Float = 0
-    on lead_on(note) claim { pitch = note.pitch; level = note.velocity }
-    on lead_off release { level = 0 }
+
+    on lead_on(note) claim {
+        pitch = note.pitch
+        level = note.velocity
+    }
+
+    on lead_off release {
+        level = 0
+    }
+
     return (pitch |> equal |> sine) * level
 }
 ```
@@ -426,5 +451,6 @@ The goal of the first milestone is hearing a sine wave from Rill source in real 
 - [x] **M4 — Live control.** `rill_set_param`, parameter smoothing, sample-accurate events with block splitting.
 - [x] **M5 — Pitch layer.** `Pitch`, `Interval`, chord literals, 12-TET and just tuning, constant folding.
 - [x] **M6 — Sequencing.** Time signatures, programmable sequences.
-- [ ] **M7 — Hot reload.** Swap graphs with a crossfade while audio plays.
+- [ ] **M7 — Module system.** Export/import, standard library.
+- [ ] **M8 — Hot reload.** Swap graphs with a crossfade while audio plays.
 - [ ] **M100 — Embedded spike.** Run a fixed patch on a microcontroller through the C API.

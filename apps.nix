@@ -18,7 +18,7 @@
 
   # Runs bench/ against the release build and writes a report to
   # bench/results/ (in the current directory, so the benchmarks and results
-  # are the ones being worked on).
+  # are the ones being worked on): `nix run .#bench -- -m "what changed"`.
   bench = {
     type = "app";
     program = "${pkgs.writeShellApplication {

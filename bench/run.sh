@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Runs the benchmarks in bench/ and writes a report to bench/results/,
-# named after when it ran and the commit rill was built from.
+# named after when it ran, the commit rill was built from, and what the run
+# is about, so a report can be found again by the change it measured.
 #
-#   bench/run.sh                   every benchmark
-#   bench/run.sh voices filters    only these
-#   bench/run.sh --seconds 2       shorter runs
-#   bench/run.sh --runs 5          best of 5 instead of 3
-#   bench/run.sh --threads 4       4 benchmarks at a time
+#   bench/run.sh -m "split run_vector"              every benchmark
+#   bench/run.sh -m "noise in lanes" noise song     only these
+#   bench/run.sh -m ... --seconds 2                 shorter runs
+#   bench/run.sh -m ... --runs 5                    best of 5 instead of 3
+#   bench/run.sh -m ... --threads 4                 4 benchmarks at a time
+#
+# -m (or --message) is required: a few words on what changed, or what the
+# run is for. It goes at the end of the report's name and at its top.
 #
 # Benchmarks running side by side share caches, memory and the CPU's power,
 # so they come out slower and noisier than one at a time (the default):
@@ -29,6 +33,7 @@ seconds=10
 runs=3
 threads=1
 names=()
+message=""
 
 usage() {
     sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"
@@ -42,6 +47,10 @@ while (($#)); do
         ;;
     --runs)
         runs="$2"
+        shift 2
+        ;;
+    -m | --message)
+        message="$2"
         shift 2
         ;;
     --threads)
@@ -62,6 +71,17 @@ while (($#)); do
         ;;
     esac
 done
+
+# Without the spaces around it.
+message="${message#"${message%%[![:space:]]*}"}"
+message="${message%"${message##*[![:space:]]}"}"
+# A few words for the file name: lowercase, with anything but letters and
+# digits turned into single dashes.
+slug="$(tr '[:upper:]' '[:lower:]' <<<"$message" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-60 | sed -E 's/-+$//')"
+if [[ -z "$slug" ]]; then
+    echo "bench: say what this run is about, as in: bench/run.sh -m \"split run_vector\"" >&2
+    exit 2
+fi
 
 for n in "$seconds:--seconds" "$runs:--runs" "$threads:--threads"; do
     value="${n%%:*}"
@@ -108,7 +128,7 @@ stamp="$(date +%Y-%m-%dT%H-%M-%S)"
 short="${commit:0:12}"
 [[ "$commit" == *-dirty ]] && short="$short-dirty"
 mkdir -p "$results"
-report="$results/${stamp}_${short:-unknown}.txt"
+report="$results/${stamp}_${short:-unknown}_${slug}.txt"
 
 # The CPU's name: x86 has it in /proc/cpuinfo, ARM often only its vendor.
 cpu="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -n 1)"
@@ -216,7 +236,7 @@ header="$(printf '%-12s %8s %10s %15s %9s %10s %10s %9s' \
     bench load ns/sample "worst block ms" "over" instr/smp registers "build ms")"
 
 {
-    echo "rill benchmarks"
+    echo "rill benchmarks: $message"
     echo
     echo "date:     $(date '+%Y-%m-%d %H:%M:%S %z')"
     echo "rill:     $version"

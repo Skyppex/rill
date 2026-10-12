@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 
 use super::opt::{Usage, reads, usage, writes};
-use super::vm::{Code, Instr, Operand, Source, VArg, VInstr, VectorBlock};
+use super::vm::{Code, Instr, Operand, Reg, Source, VArg, VInstr, VectorBlock};
 use crate::ops::{Op1, Op2};
 
 /// Replace every pool whose copies can run together with a vector block.
@@ -57,7 +57,7 @@ pub fn vectorize(code: &mut Code) {
         }
     }
     // Old register -> new register, for every register in a lane group.
-    let mut renames: HashMap<u16, u16> = HashMap::new();
+    let mut renames: HashMap<Reg, Reg> = HashMap::new();
     // Regions already replaced by a single instruction: where they were and
     // how many instructions went.
     let mut replaced: Vec<(u32, u32)> = Vec::new();
@@ -81,9 +81,6 @@ pub fn vectorize(code: &mut Code) {
         else {
             continue;
         };
-        if next > u32::from(u16::MAX) {
-            continue;
-        }
         code.regs = next as usize;
         renames.extend(new_names);
         code.state_init.extend(consts);
@@ -102,11 +99,11 @@ pub fn vectorize(code: &mut Code) {
 /// Lane values of one operand position, sorted out.
 enum Lanes {
     Const(f32),
-    Scalar(u16),
+    Scalar(Reg),
     /// Different constants per lane.
     Consts(Vec<f32>),
     /// A different register per lane.
-    Regs(Vec<u16>),
+    Regs(Vec<Reg>),
 }
 
 fn classify(ops: &[Operand]) -> Option<Lanes> {
@@ -142,33 +139,33 @@ fn classify(ops: &[Operand]) -> Option<Lanes> {
 struct Groups<'a> {
     lanes: usize,
     /// From earlier pools.
-    earlier: &'a HashMap<u16, u16>,
+    earlier: &'a HashMap<Reg, Reg>,
     /// From this pool.
-    names: HashMap<u16, u16>,
-    consts: Vec<(u16, f32)>,
+    names: HashMap<Reg, Reg>,
+    consts: Vec<(Reg, f32)>,
     next: &'a mut u32,
     /// Registers written somewhere in the region: they vary per lane.
-    written: &'a std::collections::HashSet<u16>,
+    written: &'a std::collections::HashSet<Reg>,
 }
 
 impl Groups<'_> {
-    fn alloc(&mut self) -> Option<u16> {
-        let base = u16::try_from(*self.next).ok()?;
-        *self.next += self.lanes as u32;
+    fn alloc(&mut self) -> Option<Reg> {
+        let base = *self.next;
+        *self.next = self.next.checked_add(self.lanes as u32)?;
         Some(base)
     }
 
-    fn name(&self, r: u16) -> Option<u16> {
+    fn name(&self, r: Reg) -> Option<Reg> {
         self.names.get(&r).or_else(|| self.earlier.get(&r)).copied()
     }
 
     /// The lane group holding `regs`, one per lane, creating it if none of
     /// them has a place yet.
-    fn group(&mut self, regs: &[u16]) -> Option<u16> {
+    fn group(&mut self, regs: &[Reg]) -> Option<Reg> {
         match self.name(regs[0]) {
             Some(base) => {
                 for (k, &r) in regs.iter().enumerate() {
-                    if self.name(r) != Some(base + k as u16) {
+                    if self.name(r) != Some(base + k as Reg) {
                         return None;
                     }
                 }
@@ -184,7 +181,7 @@ impl Groups<'_> {
                 }
                 let base = self.alloc()?;
                 for (k, &r) in regs.iter().enumerate() {
-                    self.names.insert(r, base + k as u16);
+                    self.names.insert(r, base + k as Reg);
                 }
                 Some(base)
             }
@@ -204,7 +201,7 @@ impl Groups<'_> {
             Lanes::Consts(cs) => {
                 let base = self.alloc()?;
                 for (k, c) in cs.into_iter().enumerate() {
-                    self.consts.push((base + k as u16, c));
+                    self.consts.push((base + k as Reg, c));
                 }
                 VArg::Lanes(base)
             }
@@ -212,12 +209,12 @@ impl Groups<'_> {
         })
     }
 
-    fn dst(&mut self, regs: &[u16]) -> Option<u16> {
+    fn dst(&mut self, regs: &[Reg]) -> Option<Reg> {
         self.group(regs)
     }
 }
 
-type Block = (VectorBlock, HashMap<u16, u16>, Vec<(u16, f32)>);
+type Block = (VectorBlock, HashMap<Reg, Reg>, Vec<(Reg, f32)>);
 
 fn vectorize_pool(
     code: &Code,
@@ -225,7 +222,7 @@ fn vectorize_pool(
     ranges: &[(u32, u32)],
     s: u32,
     e: u32,
-    earlier: &HashMap<u16, u16>,
+    earlier: &HashMap<Reg, Reg>,
     next: &mut u32,
 ) -> Option<Block> {
     let list = &code.instrs;
@@ -271,7 +268,7 @@ fn vectorize_pool(
     for p in 0..len {
         let at: Vec<&Instr> = copies.iter().map(|c| &c[p]).collect();
         let ops = |f: &dyn Fn(&Instr) -> Operand| at.iter().map(|i| f(i)).collect::<Vec<_>>();
-        let dsts = |f: &dyn Fn(&Instr) -> u16| at.iter().map(|i| f(i)).collect::<Vec<_>>();
+        let dsts = |f: &dyn Fn(&Instr) -> Reg| at.iter().map(|i| f(i)).collect::<Vec<_>>();
         let v = match *at[0] {
             Instr::Op2 { op, .. } => {
                 if !at
@@ -460,13 +457,13 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
         !saturated(via) && via == from[j]
     };
     // Reads of each register inside the copy, by position.
-    let mut local_reads: HashMap<u16, Vec<usize>> = HashMap::new();
+    let mut local_reads: HashMap<Reg, Vec<usize>> = HashMap::new();
     for (i, instr) in copy.iter().enumerate() {
         reads(instr, &mut |r| local_reads.entry(r).or_default().push(i));
     }
-    let fresh = |next: &mut u32| -> Option<u16> {
-        let r = u16::try_from(*next).ok()?;
-        *next += 1;
+    let fresh = |next: &mut u32| -> Option<Reg> {
+        let r = *next;
+        *next = next.checked_add(1)?;
         Some(r)
     };
 
@@ -535,7 +532,7 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
                 cur = None;
             }
             instr => {
-                let mut d = 0u16;
+                let mut d: Reg = 0;
                 writes(&instr, &mut |r| d = r);
                 let di = d as usize;
                 // Computing it on every path is harmless when it is a
@@ -589,8 +586,8 @@ fn replace_region(list: &mut Vec<Instr>, s: u32, e: u32, instr: Instr) {
 }
 
 /// Renumber registers everywhere in `code` by `map`.
-fn rename(code: &mut Code, map: &HashMap<u16, u16>) {
-    let r = |x: &mut u16| {
+fn rename(code: &mut Code, map: &HashMap<Reg, Reg>) {
+    let r = |x: &mut Reg| {
         if let Some(&n) = map.get(x) {
             *x = n;
         }

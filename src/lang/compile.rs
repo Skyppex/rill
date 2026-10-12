@@ -16,7 +16,7 @@ use super::check::{Checked, Resolution, operand_alignment};
 use super::diag::{Diagnostic, Span};
 use super::types::{Align, Signature, Size, Type, align, frame_shape};
 use super::vm::{
-    Code, EventCode, Handles, Instr, InvokeCall, Mode, Operand, SeqStep, SeqTable, Source,
+    Code, EventCode, Handles, Instr, InvokeCall, Mode, Operand, Reg, SeqStep, SeqTable, Source,
     StateKeys, Tuning,
 };
 use crate::event::{EventDecl as Declared, EventId, EventKind};
@@ -590,9 +590,9 @@ struct Compiler<'a> {
     /// Definitions and anonymous fns currently being inlined, innermost
     /// last. Meeting one again means recursion through a function value.
     inlining: Vec<String>,
-    regs: u16,
-    state_init: Vec<(u16, f32)>,
-    state_regs: HashSet<u16>,
+    regs: Reg,
+    state_init: Vec<(Reg, f32)>,
+    state_regs: HashSet<Reg>,
     scopes: Vec<HashMap<String, Binding>>,
     rets: Vec<Ret>,
     /// How many `if` branches deep the current code is.
@@ -613,7 +613,7 @@ struct Compiler<'a> {
     /// Results already computed in the straight-line code being emitted, by
     /// operation and operands, so the same calculation is not done twice.
     /// Cleared wherever registers may change or paths join.
-    cse: HashMap<(u8, u8, u64, u64), u16>,
+    cse: HashMap<(u8, u8, u64, u64), Reg>,
     /// The result slot of the `if` whose `else if` is being compiled, so
     /// the inner `if` writes its result straight into it.
     slot_hint: Option<CVal>,
@@ -759,7 +759,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn reg(&mut self) -> CResult<u16> {
+    fn reg(&mut self) -> CResult<Reg> {
         let r = self.regs;
         self.regs = self
             .regs
@@ -1703,7 +1703,7 @@ impl<'a> Compiler<'a> {
         let pool = self.pools.len() as u16;
         let segment = self.segment("pool");
         let key = self.key(&format!("/{segment}"));
-        self.keys.pools.push((key, pool));
+        self.keys.pools.push((key, pool.into()));
         self.pools.push(Vec::new());
         self.lane_ranges.push(self.main.then(Vec::new));
         pool
@@ -2531,7 +2531,7 @@ impl<'a> Compiler<'a> {
             let want = u16::try_from(c.ceilings.len())
                 .map_err(|_| Diagnostic::error(span, "too many ceilings"))?;
             c.ceilings.push((key.clone(), (len - 3) as f32 / rate));
-            c.keys.delays.push((key, line));
+            c.keys.delays.push((key, line.into()));
             let mut taps = Vec::new();
             for t in samples.operands() {
                 let dst = c.reg()?;
@@ -2609,7 +2609,7 @@ impl<'a> Compiler<'a> {
                 let segment = self.segment("noise");
                 let key = self.key(&format!("/{segment}"));
                 self.noises.push(self.defs.random.seed_at(&key));
-                self.keys.noises.push((key, source));
+                self.keys.noises.push((key, source.into()));
                 let dst = self.reg()?;
                 self.emit(Instr::Noise { dst, source });
                 Ok(CVal::Scalar(Operand::Reg(dst)))

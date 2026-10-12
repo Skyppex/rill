@@ -13,7 +13,7 @@ use super::compile::{
 };
 use super::diag::Diagnostic;
 use super::types::Type;
-use super::vm::{Operand, Program as ProgramNode};
+use super::vm::{Operand, Program as ProgramNode, Reg};
 use crate::engine::Config;
 use crate::graph::{Graph, Input};
 
@@ -119,7 +119,7 @@ pub fn build_with(
     .map_err(|d| vec![d])?;
     // Controls hold their defaults from the start, so `on start` and events
     // that arrive before the first sample see them.
-    let inputs: Vec<(u16, f32)> = code
+    let inputs: Vec<(Reg, f32)> = code
         .input_regs
         .iter()
         .copied()

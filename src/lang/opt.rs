@@ -12,7 +12,7 @@
 //! Every list of instructions is looked at together (the tick, the code
 //! after it, and the handlers), since they share registers.
 
-use super::vm::{Code, Instr, Operand, Source};
+use super::vm::{Code, Instr, Operand, Reg, Source};
 
 /// Rewrite `code` into an equivalent with fewer instructions.
 pub fn optimize(code: &mut Code) {
@@ -26,7 +26,7 @@ pub fn optimize(code: &mut Code) {
 
 /// The register an instruction writes as its result, for instructions that
 /// do nothing else.
-fn pure_dst(i: &Instr) -> Option<u16> {
+fn pure_dst(i: &Instr) -> Option<Reg> {
     match *i {
         Instr::Op1 { dst, .. }
         | Instr::Op2 { dst, .. }
@@ -36,7 +36,7 @@ fn pure_dst(i: &Instr) -> Option<u16> {
     }
 }
 
-fn pure_dst_mut(i: &mut Instr) -> Option<&mut u16> {
+fn pure_dst_mut(i: &mut Instr) -> Option<&mut Reg> {
     match i {
         Instr::Op1 { dst, .. }
         | Instr::Op2 { dst, .. }
@@ -47,7 +47,7 @@ fn pure_dst_mut(i: &mut Instr) -> Option<&mut u16> {
 }
 
 /// Every register an instruction writes.
-pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(u16)) {
+pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(Reg)) {
     match *i {
         Instr::Op1 { dst, .. }
         | Instr::Op2 { dst, .. }
@@ -70,7 +70,7 @@ pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(u16)) {
 }
 
 /// Every register an instruction reads.
-pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(u16)) {
+pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(Reg)) {
     let mut op = |o: Operand| {
         if let Operand::Reg(r) = o {
             f(r)
@@ -139,11 +139,11 @@ pub(crate) fn usage(code: &Code) -> Usage {
             reads(i, &mut |r| u.uses[r as usize] += 1);
         }
     }
-    let mut pin = |r: u16| {
+    let mut pin = |r: Reg| {
         u.pinned[r as usize] = true;
         u.uses[r as usize] += 1;
     };
-    let pin_op = |o: Operand, pin: &mut dyn FnMut(u16)| {
+    let pin_op = |o: Operand, pin: &mut dyn FnMut(Reg)| {
         if let Operand::Reg(r) = o {
             pin(r)
         }
@@ -345,7 +345,7 @@ mod tests {
     use super::*;
     use crate::ops::{Op1, Op2};
 
-    fn r(n: u16) -> Operand {
+    fn r(n: Reg) -> Operand {
         Operand::Reg(n)
     }
 

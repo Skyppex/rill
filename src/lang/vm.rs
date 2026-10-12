@@ -11,10 +11,13 @@ use crate::event::{EventDecl, EventId, EventKind, Payload, Sender};
 use crate::node::{Context, Inputs, Node, Outputs};
 use crate::ops::{Op1, Op2};
 
+/// A register's number.
+pub type Reg = u32;
+
 /// An instruction operand.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Operand {
-    Reg(u16),
+    Reg(Reg),
     Const(f32),
 }
 
@@ -22,30 +25,30 @@ pub enum Operand {
 pub enum Instr {
     Op2 {
         op: Op2,
-        dst: u16,
+        dst: Reg,
         a: Operand,
         b: Operand,
     },
     Op1 {
         op: Op1,
-        dst: u16,
+        dst: Reg,
         x: Operand,
     },
     Copy {
-        dst: u16,
+        dst: Reg,
         src: Operand,
     },
     /// `dst = tuning(pitch, setting, a4)`; see [`Tuning::frequency`].
     Tune {
         tuning: Tuning,
-        dst: u16,
+        dst: Reg,
         pitch: Operand,
         setting: Operand,
         a4: Operand,
     },
     /// `dst = if cond { a } else { b }`
     Select {
-        dst: u16,
+        dst: Reg,
         cond: Operand,
         a: Operand,
         b: Operand,
@@ -76,7 +79,7 @@ pub enum Instr {
     },
     /// `dst` = captured value `index` of instance slot `slot` of `seq`.
     LoadCapture {
-        dst: u16,
+        dst: Reg,
         seq: u16,
         slot: u16,
         index: u8,
@@ -97,14 +100,14 @@ pub enum Instr {
     },
     /// `dst` = the next number in [-1, 1) from noise generator `source`.
     Noise {
-        dst: u16,
+        dst: Reg,
         source: u16,
     },
     /// `dst` = what was written to delay line `line` `time` samples ago,
     /// interpolated between samples. Reads come before the tick's write. A
     /// time longer than the line is noted in ceiling `want`.
     DelayRead {
-        dst: u16,
+        dst: Reg,
         line: u16,
         time: Operand,
         want: u16,
@@ -136,9 +139,9 @@ pub struct VectorBlock {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VArg {
     /// A lane group starting at this register: a value per copy.
-    Lanes(u16),
+    Lanes(Reg),
     /// One register shared by every copy.
-    Scalar(u16),
+    Scalar(Reg),
     Const(f32),
 }
 
@@ -148,29 +151,29 @@ pub enum VArg {
 pub enum VInstr {
     Op2 {
         op: Op2,
-        d: u16,
+        d: Reg,
         a: VArg,
         b: VArg,
     },
     Op1 {
         op: Op1,
-        d: u16,
+        d: Reg,
         x: VArg,
     },
     Copy {
-        d: u16,
+        d: Reg,
         s: VArg,
     },
     /// `d = if cond { a } else { b }`, per lane.
     Select {
-        d: u16,
+        d: Reg,
         cond: VArg,
         a: VArg,
         b: VArg,
     },
     Tune {
         tuning: Tuning,
-        d: u16,
+        d: Reg,
         pitch: VArg,
         setting: VArg,
         a4: VArg,
@@ -276,98 +279,98 @@ fn ratio_tuning(pitch: f32, root: f32, a4: f32, ratios: [f32; 12]) -> f32 {
 #[derive(Clone, Copy, Debug)]
 enum Fast {
     AddRR {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     AddRC {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f32,
     },
     SubRR {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     SubRC {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f32,
     },
     SubCR {
-        d: u16,
+        d: Reg,
         c: f32,
-        b: u16,
+        b: Reg,
     },
     MulRR {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     MulRC {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f32,
     },
     DivRR {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     DivCR {
-        d: u16,
+        d: Reg,
         c: f32,
-        b: u16,
+        b: Reg,
     },
     LtRC {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f32,
     },
     GtRC {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f32,
     },
     Wrap {
-        d: u16,
-        x: u16,
+        d: Reg,
+        x: Reg,
     },
     CopyR {
-        d: u16,
-        s: u16,
+        d: Reg,
+        s: Reg,
     },
     CopyC {
-        d: u16,
+        d: Reg,
         c: f32,
     },
     Op2RR {
         op: Op2,
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     Op2RC {
         op: Op2,
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f32,
     },
     Op2CR {
         op: Op2,
-        d: u16,
+        d: Reg,
         c: f32,
-        b: u16,
+        b: Reg,
     },
     Op1 {
         op: Op1,
-        d: u16,
-        x: u16,
+        d: Reg,
+        x: Reg,
     },
     /// Skip ahead unless register `cond` is true.
     JumpUnless {
-        cond: u16,
+        cond: Reg,
         target: u32,
     },
     Jump {
@@ -386,7 +389,7 @@ enum Fast {
 /// Translate `instrs` for the interpreter, checking every register is below
 /// `regs` and every jump goes forward within the list.
 fn lower(instrs: &[Instr], regs: usize) -> Vec<Fast> {
-    let reg = |r: u16| {
+    let reg = |r: Reg| {
         assert!((r as usize) < regs, "register r{r} out of range");
         r
     };
@@ -475,11 +478,11 @@ pub struct Code {
     pub post: Vec<Instr>,
     pub regs: usize,
     /// Register loaded from each node input at the start of every tick.
-    pub input_regs: Vec<u16>,
+    pub input_regs: Vec<Reg>,
     /// What each output channel holds at the end of a tick.
     pub output: Vec<Operand>,
     /// Registers that are `state`, with their initial values.
-    pub state_init: Vec<(u16, f32)>,
+    pub state_init: Vec<(Reg, f32)>,
     pub events: Vec<EventCode>,
     /// The program's event declarations, for matching notes from sequences.
     pub decls: Vec<EventDecl>,
@@ -518,13 +521,13 @@ pub struct Code {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StateKeys {
     /// `state` registers.
-    pub regs: Vec<(String, u16)>,
+    pub regs: Vec<(String, u32)>,
     /// Delay lines, by index into [`Code::delays`].
-    pub delays: Vec<(String, u16)>,
+    pub delays: Vec<(String, u32)>,
     /// Noise generators, by index into [`Code::noises`].
-    pub noises: Vec<(String, u16)>,
+    pub noises: Vec<(String, u32)>,
     /// Voice pools, by index into [`Code::pools`].
-    pub pools: Vec<(String, u16)>,
+    pub pools: Vec<(String, u32)>,
 }
 
 /// What a handler handles.
@@ -553,7 +556,7 @@ pub struct EventCode {
     pub handles: Handles,
     /// Registers that receive the payload's values, in
     /// [`EventKind::fields`](crate::event::EventKind::fields) order.
-    pub payload: Vec<u16>,
+    pub payload: Vec<Reg>,
     pub instrs: Vec<Instr>,
     pub mode: Mode,
     /// The voice pool and copy of the rill instance it belongs to.
@@ -598,7 +601,7 @@ pub enum Source {
     /// Read once, when invoked.
     Now(Operand),
     /// A register, read every tick while playing.
-    Follow(u16),
+    Follow(Reg),
     /// Written every tick by [`Instr::SetSlot`] in [`Code::post`]; starts
     /// at `initial`.
     PerSlot { initial: Operand },
@@ -612,7 +615,7 @@ pub struct InvokeCall {
     /// For `trigger`: the step to start at, counting from 1.
     pub step: Option<Operand>,
     /// Receives the instance id.
-    pub dst: u16,
+    pub dst: Reg,
     /// Tempo, gate and velocity.
     pub settings: [Source; 3],
     pub repeat: Option<Operand>,
@@ -858,7 +861,7 @@ impl Program {
             .iter()
             .map(|e| lower(&e.instrs, code.regs))
             .collect();
-        let check = |r: u16| assert!((r as usize) < code.regs, "register r{r} out of range");
+        let check = |r: Reg| assert!((r as usize) < code.regs, "register r{r} out of range");
         for &r in code
             .input_regs
             .iter()
@@ -1399,8 +1402,8 @@ fn check_vector(block: &VectorBlock, regs: usize) {
     let n = usize::from(block.lanes);
     assert!(n > 0, "a vector block needs lanes");
     let arg = |a: VArg| match a {
-        VArg::Lanes(b) => assert!(usize::from(b) + n <= regs, "lane group r{b} out of range"),
-        VArg::Scalar(r) => assert!(usize::from(r) < regs, "register r{r} out of range"),
+        VArg::Lanes(b) => assert!((b as usize) + n <= regs, "lane group r{b} out of range"),
+        VArg::Scalar(r) => assert!((r as usize) < regs, "register r{r} out of range"),
         VArg::Const(_) => {}
     };
     for i in &block.instrs {
@@ -1459,15 +1462,15 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
     // same lane it reads, or to a different group.
     unsafe {
         let src = |a: VArg| match a {
-            VArg::Lanes(b) => Src::Lanes(p.add(usize::from(b))),
-            VArg::Scalar(r) => Src::Splat(*p.add(usize::from(r))),
+            VArg::Lanes(b) => Src::Lanes(p.add(b as usize)),
+            VArg::Scalar(r) => Src::Splat(*p.add(r as usize)),
             VArg::Const(c) => Src::Splat(c),
         };
         // Each loop has its operand shapes fixed and a single operation in
         // its body, so the compiler can turn it into SIMD.
         macro_rules! unary {
             ($d:expr, $x:expr, $f:expr) => {{
-                let d = p.add(usize::from($d));
+                let d = p.add($d as usize);
                 let f = $f;
                 match src($x) {
                     Src::Lanes(x) => {
@@ -1486,7 +1489,7 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
         }
         macro_rules! binary {
             ($d:expr, $a:expr, $b:expr, $f:expr) => {{
-                let d = p.add(usize::from($d));
+                let d = p.add($d as usize);
                 let f = $f;
                 match (src($a), src($b)) {
                     (Src::Lanes(a), Src::Lanes(b)) => {
@@ -1543,7 +1546,7 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
                 },
                 VInstr::Copy { d, s } => unary!(d, s, |v: f32| v),
                 VInstr::Select { d, cond, a, b } => {
-                    let dp = p.add(usize::from(d));
+                    let dp = p.add(d as usize);
                     match (src(cond), src(a), src(b)) {
                         (Src::Lanes(c), Src::Lanes(a), Src::Lanes(b)) => {
                             for k in 0..n {
@@ -1581,7 +1584,7 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
                     setting,
                     a4,
                 } => {
-                    let dp = p.add(usize::from(d));
+                    let dp = p.add(d as usize);
                     let at = |s: Src, k: usize| match s {
                         Src::Lanes(q) => *q.add(k),
                         Src::Splat(v) => v,
@@ -1987,11 +1990,11 @@ pub struct Keys {
 pub struct Takeover {
     /// `(old, new)` registers, delay lines, noise generators, voice pools
     /// and sequences.
-    pub regs: Vec<(u16, u16)>,
-    pub delays: Vec<(u16, u16)>,
-    pub noises: Vec<(u16, u16)>,
-    pub pools: Vec<(u16, u16)>,
-    pub seqs: Vec<(u16, u16)>,
+    pub regs: Vec<(u32, u32)>,
+    pub delays: Vec<(u32, u32)>,
+    pub noises: Vec<(u32, u32)>,
+    pub pools: Vec<(u32, u32)>,
+    pub seqs: Vec<(u32, u32)>,
     /// Pieces of state carried over, and new ones starting fresh.
     pub carried: usize,
     pub fresh: usize,
@@ -2012,7 +2015,7 @@ impl Takeover {
     /// renamed) pairs when everything below it has the same shape and no
     /// other candidate does.
     pub fn plan(old: &Keys, new: &Keys) -> Takeover {
-        let list = |k: &StateKeys| -> Vec<(Kind, String, u16)> {
+        let list = |k: &StateKeys| -> Vec<(Kind, String, u32)> {
             let mut out = Vec::new();
             for (kind, items) in [
                 (Kind::Reg, &k.regs),
@@ -2025,13 +2028,13 @@ impl Takeover {
             out
         };
         let (olds, news) = (list(&old.state), list(&new.state));
-        let mut pairs: Vec<(Kind, u16, u16)> = Vec::new();
-        let old_by: std::collections::HashMap<(Kind, &str), u16> = olds
+        let mut pairs: Vec<(Kind, u32, u32)> = Vec::new();
+        let old_by: std::collections::HashMap<(Kind, &str), u32> = olds
             .iter()
             .map(|(k, key, i)| ((*k, key.as_str()), *i))
             .collect();
-        let mut old_left: Vec<&(Kind, String, u16)> = Vec::new();
-        let mut new_left: Vec<&(Kind, String, u16)> = Vec::new();
+        let mut old_left: Vec<&(Kind, String, u32)> = Vec::new();
+        let mut new_left: Vec<&(Kind, String, u32)> = Vec::new();
         let new_keys: std::collections::HashSet<(Kind, &str)> =
             news.iter().map(|(k, key, _)| (*k, key.as_str())).collect();
         for n in &news {
@@ -2059,7 +2062,7 @@ impl Takeover {
         }
         for (j, name) in new.seqs.iter().enumerate() {
             if let Some(i) = old.seqs.iter().position(|o| o == name) {
-                t.seqs.push((i as u16, j as u16));
+                t.seqs.push((i as u32, j as u32));
             }
         }
         t.carried = t.regs.len() + t.delays.len() + t.noises.len() + t.pools.len();
@@ -2071,7 +2074,7 @@ impl Takeover {
 /// Pairs for keys renamed at one level: an old and a new prefix that differ
 /// only in their last name, where everything under each has the same kinds
 /// and the same rest of the key, and each is the other's only candidate.
-fn renamed(old: &[&(Kind, String, u16)], new: &[&(Kind, String, u16)]) -> Vec<(Kind, u16, u16)> {
+fn renamed(old: &[&(Kind, String, u32)], new: &[&(Kind, String, u32)]) -> Vec<(Kind, u32, u32)> {
     use std::collections::{BTreeMap, HashMap, HashSet};
     // A key's levels: `a/b/c.x` is `a`, `a/b`, `a/b/c.x`.
     let prefixes = |key: &str| -> Vec<usize> {
@@ -2080,8 +2083,8 @@ fn renamed(old: &[&(Kind, String, u16)], new: &[&(Kind, String, u16)]) -> Vec<(K
         ends
     };
     // Every prefix with what lies under it: (kind, rest of key, index).
-    type Under = Vec<(Kind, String, u16)>;
-    let subtrees = |keys: &[&(Kind, String, u16)]| -> BTreeMap<String, Under> {
+    type Under = Vec<(Kind, String, u32)>;
+    let subtrees = |keys: &[&(Kind, String, u32)]| -> BTreeMap<String, Under> {
         let mut map: BTreeMap<String, Under> = BTreeMap::new();
         for (kind, key, i) in keys.iter().map(|k| (k.0, &k.1, k.2)) {
             for end in prefixes(key) {
@@ -2102,8 +2105,8 @@ fn renamed(old: &[&(Kind, String, u16)], new: &[&(Kind, String, u16)]) -> Vec<(K
         |u: &Under| -> Vec<(Kind, String)> { u.iter().map(|(k, r, _)| (*k, r.clone())).collect() };
     let parent = |p: &str| p.rfind('/').map_or("", |i| &p[..i]).to_owned();
     // Candidates, shallowest first, so a renamed `let` pairs as a whole.
-    let mut used_old: HashSet<(Kind, u16)> = HashSet::new();
-    let mut used_new: HashSet<(Kind, u16)> = HashSet::new();
+    let mut used_old: HashSet<(Kind, u32)> = HashSet::new();
+    let mut used_new: HashSet<(Kind, u32)> = HashSet::new();
     let mut pairs = Vec::new();
     let mut by_depth: BTreeMap<usize, Vec<&String>> = BTreeMap::new();
     for p in olds.keys() {

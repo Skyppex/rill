@@ -1,0 +1,129 @@
+rill benchmarks
+
+date:     2026-10-12 15:18:14 +0200
+rill:     rill 0.1.0 (d30b30705fbf54fe7f3d4686b856fdc97b66a79d-dirty)
+binary:   /home/brage/dev/code/rill/target/bench/release/rill
+machine:  Qualcomm aarch64, 12 threads, Linux 6.6.87.2-microsoft-standard-WSL2
+settings: 10s of audio per run unless a benchmark says otherwise, seed 1, best of 3 runs, 1 at a time
+
+load:        time to render / length of the audio, on one core
+ns/sample:   nanoseconds per frame of output
+worst block: the slowest callback / the time it had
+over:        callbacks over their time / all callbacks
+instr/smp:   instructions per sample, after optimising
+
+bench            load  ns/sample  worst block ms      over  instr/smp  registers  build ms
+blocks           1.7%        359     0.528/0.333   2/30000         49        316       0.6
+branches        20.1%       4193     2.643/5.333    0/1875        258      20993       7.1
+build           50.5%      10519     3.338/5.333     0/188        136      74623      33.0
+delays          67.8%      14133    11.639/5.333    5/1875       5917       6426       5.0
+events           7.2%       1499     3.468/5.333    0/1875         16       1223       1.0
+feedback        26.5%       5523     2.627/5.333    0/1875       2076       2585       1.6
+filters         22.8%       4753     2.452/5.333    0/1875         39      22176       7.3
+frames          27.2%       5669     3.408/5.333    0/1875         16      12578       6.1
+maths           40.8%       8504     4.318/5.333    0/1875        258      17664       4.2
+memory          28.1%       5859     9.008/5.333    1/1875        834        834      14.8
+noise          121.4%      25301    15.118/5.333 1875/1875      12800      14848       4.6
+oscillators     31.3%       6522     4.052/5.333    0/1875       1025      67584      29.2
+song            19.8%       4127     2.626/5.333    0/1875        364       7701      15.2
+voices          13.8%       2866     3.832/5.333    0/1875         65      17409      13.2
+
+Details (the best run of each)
+
+── blocks (--block 16)
+/home/brage/dev/code/rill/bench/blocks.rill (release build)
+  program:  49 instructions per sample, 316 registers, 1 node(s); built in 0.6 ms
+  rendered: 10.00 s of audio in 0.173 s, 359 ns per sample
+  load:     1.7% of one core (58.0x faster than real time)
+  blocks:   worst 0.528 ms of a 0.333 ms budget (16 frames); 2 of 30000 over budget
+
+── branches
+/home/brage/dev/code/rill/bench/branches.rill (release build)
+  program:  258 instructions per sample, 20993 registers, 1 node(s); built in 7.1 ms
+  rendered: 10.00 s of audio in 2.013 s, 4193 ns per sample
+  load:     20.1% of one core (5.0x faster than real time)
+  blocks:   worst 2.643 ms of a 5.333 ms budget (256 frames); 0 of 1875 over budget
+
+── build (--seconds 1)
+/home/brage/dev/code/rill/bench/build.rill (release build)
+  program:  136 instructions per sample, 74623 registers, 1 node(s); built in 33.0 ms
+  rendered: 1.00 s of audio in 0.505 s, 10519 ns per sample
+  load:     50.5% of one core (2.0x faster than real time)
+  blocks:   worst 3.338 ms of a 5.333 ms budget (256 frames); 0 of 188 over budget
+
+── delays
+/home/brage/dev/code/rill/bench/delays.rill (release build)
+  program:  5917 instructions per sample, 6426 registers, 1 node(s); built in 5.0 ms
+  rendered: 10.00 s of audio in 6.784 s, 14133 ns per sample
+  load:     67.8% of one core (1.5x faster than real time)
+  blocks:   worst 11.639 ms of a 5.333 ms budget (256 frames); 5 of 1875 over budget
+
+── events
+/home/brage/dev/code/rill/bench/events.rill (release build)
+  program:  16 instructions per sample, 1223 registers, 1 node(s); built in 1.0 ms
+  rendered: 10.00 s of audio in 0.719 s, 1499 ns per sample
+  load:     7.2% of one core (13.9x faster than real time)
+  blocks:   worst 3.468 ms of a 5.333 ms budget (256 frames); 0 of 1875 over budget
+
+── feedback
+/home/brage/dev/code/rill/bench/feedback.rill (release build)
+  program:  2076 instructions per sample, 2585 registers, 1 node(s); built in 1.6 ms
+  rendered: 10.00 s of audio in 2.651 s, 5523 ns per sample
+  load:     26.5% of one core (3.8x faster than real time)
+  blocks:   worst 2.627 ms of a 5.333 ms budget (256 frames); 0 of 1875 over budget
+
+── filters
+/home/brage/dev/code/rill/bench/filters.rill (release build)
+  program:  39 instructions per sample, 22176 registers, 1 node(s); built in 7.3 ms
+  rendered: 10.00 s of audio in 2.281 s, 4753 ns per sample
+  load:     22.8% of one core (4.4x faster than real time)
+  blocks:   worst 2.452 ms of a 5.333 ms budget (256 frames); 0 of 1875 over budget
+
+── frames
+/home/brage/dev/code/rill/bench/frames.rill (release build)
+  program:  16 instructions per sample, 12578 registers, 1 node(s); built in 6.1 ms
+  rendered: 10.00 s of audio in 2.721 s, 5669 ns per sample
+  load:     27.2% of one core (3.7x faster than real time)
+  blocks:   worst 3.408 ms of a 5.333 ms budget (256 frames); 0 of 1875 over budget
+
+── maths
+/home/brage/dev/code/rill/bench/maths.rill (release build)
+  program:  258 instructions per sample, 17664 registers, 1 node(s); built in 4.2 ms
+  rendered: 10.00 s of audio in 4.082 s, 8504 ns per sample
+  load:     40.8% of one core (2.4x faster than real time)
+  blocks:   worst 4.318 ms of a 5.333 ms budget (256 frames); 0 of 1875 over budget
+
+── memory
+/home/brage/dev/code/rill/bench/memory.rill (release build)
+  program:  834 instructions per sample, 834 registers, 1 node(s); built in 14.8 ms
+  rendered: 10.00 s of audio in 2.812 s, 5859 ns per sample
+  load:     28.1% of one core (3.6x faster than real time)
+  blocks:   worst 9.008 ms of a 5.333 ms budget (256 frames); 1 of 1875 over budget
+
+── noise
+/home/brage/dev/code/rill/bench/noise.rill (release build)
+  program:  12800 instructions per sample, 14848 registers, 1 node(s); built in 4.6 ms
+  rendered: 10.00 s of audio in 12.145 s, 25301 ns per sample
+  load:     121.4% of one core (0.8x faster than real time)
+  blocks:   worst 15.118 ms of a 5.333 ms budget (256 frames); 1875 of 1875 over budget
+
+── oscillators
+/home/brage/dev/code/rill/bench/oscillators.rill (release build)
+  program:  1025 instructions per sample, 67584 registers, 1 node(s); built in 29.2 ms
+  rendered: 10.00 s of audio in 3.131 s, 6522 ns per sample
+  load:     31.3% of one core (3.2x faster than real time)
+  blocks:   worst 4.052 ms of a 5.333 ms budget (256 frames); 0 of 1875 over budget
+
+── song
+/home/brage/dev/code/rill/bench/song.rill (release build)
+  program:  364 instructions per sample, 7701 registers, 1 node(s); built in 15.2 ms
+  rendered: 10.00 s of audio in 1.981 s, 4127 ns per sample
+  load:     19.8% of one core (5.0x faster than real time)
+  blocks:   worst 2.626 ms of a 5.333 ms budget (256 frames); 0 of 1875 over budget
+
+── voices
+/home/brage/dev/code/rill/bench/voices.rill (release build)
+  program:  65 instructions per sample, 17409 registers, 1 node(s); built in 13.2 ms
+  rendered: 10.00 s of audio in 1.376 s, 2866 ns per sample
+  load:     13.8% of one core (7.3x faster than real time)
+  blocks:   worst 3.832 ms of a 5.333 ms budget (256 frames); 0 of 1875 over budget

@@ -12,8 +12,8 @@
 //! - Every path through a rill ends in exactly one `return`.
 //! - A `fn` is pure: it cannot call a rill. Anonymous fns are fns too: they
 //!   read what they capture but cannot change it.
-//! - Fns are values. A named fn fits a function type with fewer parameters
-//!   when the rest have defaults. Rills are not values.
+//! - Fns and rills are values. A named callable fits a callable type with
+//!   fewer parameters when the rest have defaults.
 //! - No recursion: the run stage has no unbounded loops and every rill
 //!   instance needs a fixed amount of state.
 //! - Defaults and `state` initial values are known before audio starts.
@@ -1557,10 +1557,10 @@ impl Checker {
             }
             TypeExpr::Frame { elem, size, span } => {
                 let elem_ty = self.resolve_type(elem, generics);
-                if matches!(elem_ty.leaf(), Type::Fn(..)) {
+                if elem_ty.leaf().is_callable() {
                     let e = self
-                        .error(*span, "frames cannot hold functions")
-                        .with_help("pass the functions separately");
+                        .error(*span, "frames cannot hold functions or rills")
+                        .with_help("pass the callables separately");
                     self.report(e);
                     return Type::Error;
                 }
@@ -1576,6 +1576,14 @@ impl Checker {
                     .collect();
                 let ret = self.resolve_type(ret, generics);
                 Type::Fn(params, Box::new(ret))
+            }
+            TypeExpr::Rill { params, ret, .. } => {
+                let params = params
+                    .iter()
+                    .map(|p| self.resolve_type(p, generics))
+                    .collect();
+                let ret = self.resolve_type(ret, generics);
+                Type::Rill(params, Box::new(ret))
             }
         }
     }
@@ -1842,10 +1850,10 @@ impl Checker {
                     }
                     None => t.settle(),
                 };
-                if matches!(bound, Type::Fn(..)) {
-                    let e = self.error(*span, "a function cannot be `state`").with_help(
-                        "state holds numbers that change between ticks; bind functions with `let`",
-                    );
+                if bound.is_callable() {
+                    let e = self
+                        .error(*span, "a function or rill cannot be `state`")
+                        .with_help("state holds numbers that change between ticks; bind callables with `let`");
                     self.report(e);
                 }
                 self.bind(name, bound, VarKind::State, span.end);
@@ -2459,11 +2467,17 @@ impl Checker {
     fn call(&mut self, span: Span, callee: &Ident, sizes: &[SizeExpr], args: &[Arg]) -> Type {
         let name = callee.name.as_str();
 
-        // A variable holding a function.
+        // A variable holding a callable.
         if let Some(var) = self.lookup(name).cloned() {
             self.resolve(callee.span, Resolution::Binding(var.id));
-            if let Type::Fn(params, ret) = &var.ty {
-                return self.call_value(span, callee, args, params, ret);
+            match &var.ty {
+                Type::Fn(params, ret) => {
+                    return self.call_value(span, callee, args, DefKind::Fn, params, ret);
+                }
+                Type::Rill(params, ret) => {
+                    return self.call_value(span, callee, args, DefKind::Rill, params, ret);
+                }
+                _ => {}
             }
             self.exprs(args);
             let d = self.error(
@@ -2643,7 +2657,7 @@ impl Checker {
                 .iter()
                 .position(|s| *s == Some(ai))
                 .map(|pi| &sig.params[pi].ty)
-                .filter(|t| matches!(t, Type::Fn(..)));
+                .filter(|t| t.is_callable());
             arg_types[ai] = self.expr_expect(&arg.value, expected);
         }
 
@@ -3094,10 +3108,10 @@ impl Checker {
             self.report(e);
             ok = false;
         }
-        if matches!(t, Type::Fn(..)) {
+        if t.is_callable() {
             let e = self
-                .error(c.span, "a `const` cannot hold a function")
-                .with_help("define it as a `fn`, or bind it with `let`");
+                .error(c.span, "a `const` cannot hold a function or rill")
+                .with_help("define it as a top-level item, or bind it with `let`");
             self.report(e);
             ok = false;
         }
@@ -3430,53 +3444,56 @@ impl Checker {
         }
     }
 
-    /// A call through a variable holding a function.
+    /// A call through a variable holding a function or rill.
     fn call_value(
         &mut self,
         span: Span,
         callee: &Ident,
         args: &[Arg],
+        kind: DefKind,
         params: &[Type],
         ret: &Type,
     ) -> Type {
         let name = &callee.name;
-        let mut ok = self.no_each(
-            args,
-            &format!("`{name}` is a function value, which never runs per element"),
-        );
+        if kind == DefKind::Rill && self.place == Place::Fn {
+            let d = if self.lambda_floor.is_some() {
+                self.error(callee.span, format!("an anonymous fn cannot call rill `{name}`"))
+                    .with_help("fns stay pure, including anonymous ones; call the rill outside and pass its value in")
+            } else {
+                let me = self.current.clone().unwrap_or_default();
+                self.error(callee.span, format!("fn `{me}` cannot call rill `{name}`"))
+                    .with_help(format!(
+                        "rills keep state between ticks, so fns must stay pure; make `{me}` a rill"
+                    ))
+            };
+            self.report(d);
+        }
+        let mut ok = true;
+        if kind != DefKind::Rill {
+            ok &= self.no_each(
+                args,
+                &format!("`{name}` is a function value, which never runs per element"),
+            );
+        }
+        let mut arg_types = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
-            let expected = params.get(i).filter(|t| matches!(t, Type::Fn(..)));
+            let expected = params.get(i).filter(|t| t.is_callable());
             let t = self.expr_expect(&a.value, expected);
             if let Some(id) = &a.name {
                 let d = self
                     .error(
                         id.span,
-                        format!("`{name}` is a function value, so its arguments have no names"),
+                        format!(
+                            "`{name}` is a {} value, so its arguments have no names",
+                            kind.word()
+                        ),
                     )
                     .with_help("pass the arguments in order");
                 self.report(d);
                 ok = false;
                 continue;
             }
-            let Some(p) = params.get(i) else { continue };
-            if t.is_wild() || coerces(&t, p) {
-                continue;
-            }
-            let d = if let (Type::Frame(elem, _), false) = (&t, matches!(p, Type::Frame(..)))
-                && coerces(elem, p)
-            {
-                self.error(a.value.span, format!("`{name}` takes one value, not a frame (`{t}`)"))
-                    .with_help("function values never run per channel; call it once per channel, or from a rill")
-            } else {
-                mismatch(
-                    a.value.span,
-                    &format!("argument {} of `{name}`", i + 1),
-                    p,
-                    &t,
-                )
-            };
-            self.report(d);
-            ok = false;
+            arg_types.push(t);
         }
         if args.len() != params.len() {
             let d = self.error(
@@ -3490,13 +3507,134 @@ impl Checker {
             self.report(d);
             ok = false;
         }
-        if ok { ret.clone() } else { Type::Error }
+        let mut lifts: Vec<(Vec<Size>, Span)> = Vec::new();
+        for (i, (p, at)) in params.iter().zip(&arg_types).enumerate() {
+            let arg_span = args[i].value.span;
+            if at.is_wild() {
+                ok = false;
+                continue;
+            }
+            let each = args[i].each.is_some();
+            let mut peeled = Vec::new();
+            let mut inner = at;
+            while !coerces(inner, p) {
+                match inner {
+                    Type::Frame(elem, n) if kind == DefKind::Rill && !each => {
+                        peeled.push(n.clone());
+                        inner = elem;
+                    }
+                    _ => break,
+                }
+            }
+            if coerces(inner, p) {
+                if !peeled.is_empty() {
+                    lifts.push((peeled, arg_span));
+                }
+                continue;
+            }
+            let d = if let (Type::Frame(elem, _), false) = (&at, matches!(p, Type::Frame(..)))
+                && coerces(elem, p)
+            {
+                let help = if kind == DefKind::Rill {
+                    "rill values run per channel only when their type says so; use a `rill(...)` type"
+                } else {
+                    "function values never run per channel; call it once per channel, or from a rill"
+                };
+                self.error(
+                    arg_span,
+                    format!("`{name}` takes one value, not a frame (`{at}`)"),
+                )
+                .with_help(help)
+            } else {
+                mismatch(arg_span, &format!("argument {} of `{name}`", i + 1), p, at)
+            };
+            self.report(d);
+            ok = false;
+        }
+        let lift = lifts
+            .iter()
+            .fold(None::<&Vec<Size>>, |best, (l, _)| match best {
+                Some(b) if b.len() >= l.len() => Some(b),
+                _ => Some(l),
+            })
+            .cloned();
+        if let Some(longest) = &lift {
+            for (peeled, at) in &lifts {
+                let d = if peeled.len() == longest.len() {
+                    if peeled == longest {
+                        continue;
+                    }
+                    let msg = match (longest.as_slice(), peeled.as_slice()) {
+                        ([m], [n]) => format!(
+                            "channel counts differ: this has {n} channels, another argument has {m}"
+                        ),
+                        _ => format!(
+                            "this runs `{name}` over shape `{}`, another argument over shape `{}`",
+                            shape(peeled),
+                            shape(longest)
+                        ),
+                    };
+                    self.error(*at, msg)
+                        .with_help("arguments that run per element need the same layers, or fewer that line up")
+                } else {
+                    match align(longest, peeled) {
+                        Align::Outer | Align::Inner => continue,
+                        Align::Both => self
+                            .error(
+                                *at,
+                                format!(
+                                    "shape `{}` could line up with the outer or the inner layers of shape `{}`",
+                                    shape(peeled),
+                                    shape(longest)
+                                ),
+                            )
+                            .with_help(ambiguous_help(longest)),
+                        Align::Neither => self
+                            .error(
+                                *at,
+                                format!(
+                                    "this runs `{name}` over shape `{}`, another argument over shape `{}`",
+                                    shape(peeled),
+                                    shape(longest)
+                                ),
+                            )
+                            .with_help(ALIGN_HELP),
+                    }
+                };
+                self.report(d);
+                ok = false;
+            }
+        }
+        if kind == DefKind::Rill {
+            for arg in args {
+                let Some(at) = arg.each else { continue };
+                if lift.is_some() {
+                    continue;
+                }
+                let d = self
+                    .error(at, format!("`each` needs copies, but `{name}` runs once here"))
+                    .with_help("`each` makes a value for every copy of a rill that runs per element; remove it");
+                self.report(d);
+                ok = false;
+            }
+        }
+        if !ok {
+            return Type::Error;
+        }
+        match lift {
+            None => ret.clone(),
+            Some(_) if *ret == Type::Unit => Type::Unit,
+            Some(layers) => layers
+                .into_iter()
+                .rev()
+                .fold(ret.clone(), |t, n| Type::Frame(Box::new(t), n)),
+        }
     }
 
-    /// Check `e`, letting an anonymous fn or the name of a fn take its types
-    /// from `expected` when that is a function type.
+    /// Check `e`, letting an anonymous fn or the name of a callable take its
+    /// types from `expected` when that is a callable type.
     fn expr_expect(&mut self, e: &Expr, expected: Option<&Type>) -> Type {
-        let expected = expected.filter(|t| matches!(t, Type::Fn(..)));
+        let expected = expected.filter(|t| t.is_callable());
         let t = match (&e.kind, expected) {
             (ExprKind::Fn { params, ret, body }, _) => {
                 self.lambda(e, params, ret.as_ref(), body, expected)
@@ -3513,8 +3651,8 @@ impl Checker {
         t
     }
 
-    /// The type of `name` (a fn or prelude function, not a variable) used as a
-    /// value, fitted to `expected` if given.
+    /// The type of `name` (a fn, rill or prelude function, not a variable)
+    /// used as a value, fitted to `expected` if given.
     fn fn_value(&mut self, name: &str, span: Span, expected: Option<&Type>) -> Type {
         let sigs = match self.def_named(name) {
             Some(i) => vec![self.signatures[i].clone()],
@@ -3538,22 +3676,24 @@ impl Checker {
             self.report(d);
             return Type::Error;
         }
-        if kind == DefKind::Rill {
-            let d = self
-                .error(span, format!("rill `{name}` cannot be used as a value"))
-                .with_help(format!(
-                    "only fns can be passed around; call it, as in `{name}(x)` or `x |> {name}`"
-                ));
-            self.report(d);
-            return Type::Error;
-        }
-        if kind == DefKind::Fn {
+        if kind != DefKind::Prelude {
             self.note_use(name, span);
         }
 
-        if let Some(Type::Fn(eps, eret)) = expected {
+        if let Some(expected) = expected {
+            let Some((eps, eret, expected_kind)) = callable_parts(expected) else {
+                return Type::Error;
+            };
+            if (kind == DefKind::Fn && expected_kind != DefKind::Fn)
+                || (kind == DefKind::Rill && expected_kind != DefKind::Rill)
+                || (kind == DefKind::Prelude && expected_kind != DefKind::Fn)
+            {
+                let d = self.error(span, format!("`{name}` does not fit `{expected}`"));
+                self.report(d);
+                return Type::Error;
+            }
             if sigs.iter().any(|s| fits(s, eps, eret)) {
-                return expected.cloned().unwrap();
+                return expected.clone();
             }
             let shown = sigs
                 .iter()
@@ -3561,10 +3701,7 @@ impl Checker {
                 .collect::<Vec<_>>()
                 .join(" or ");
             let d = self
-                .error(
-                    span,
-                    format!("`{name}` does not fit `{}`", expected.unwrap()),
-                )
+                .error(span, format!("`{name}` does not fit `{expected}`"))
                 .with_help(format!("`{name}` is {shown}"));
             self.report(d);
             return Type::Error;
@@ -3589,10 +3726,12 @@ impl Checker {
             self.report(d);
             return Type::Error;
         }
-        Type::Fn(
-            sig.params.iter().map(|p| p.ty.clone()).collect(),
-            Box::new(sig.ret.clone()),
-        )
+        let params = sig.params.iter().map(|p| p.ty.clone()).collect();
+        let ret = Box::new(sig.ret.clone());
+        match kind {
+            DefKind::Rill => Type::Rill(params, ret),
+            _ => Type::Fn(params, ret),
+        }
     }
 
     /// An anonymous fn. Parameter types come from annotations or, failing
@@ -3957,12 +4096,20 @@ fn fits(sig: &Signature, params: &[Type], ret: &Type) -> bool {
     !matches!(actual, Type::Error) && coerces(&actual, ret)
 }
 
+fn callable_parts(t: &Type) -> Option<(&[Type], &Type, DefKind)> {
+    match t {
+        Type::Fn(params, ret) => Some((params, ret, DefKind::Fn)),
+        Type::Rill(params, ret) => Some((params, ret, DefKind::Rill)),
+        _ => None,
+    }
+}
+
 /// Does `t` mention a prelude type parameter?
 fn contains_param(t: &Type) -> bool {
     match t {
         Type::Param(_) => true,
         Type::Frame(e, _) => contains_param(e),
-        Type::Fn(ps, r) => ps.iter().any(contains_param) || contains_param(r),
+        Type::Fn(ps, r) | Type::Rill(ps, r) => ps.iter().any(contains_param) || contains_param(r),
         _ => false,
     }
 }
@@ -3971,7 +4118,7 @@ fn mentions_size(t: &Type, name: &str) -> bool {
     match t {
         Type::Frame(elem, Size::Var(v)) => v == name || mentions_size(elem, name),
         Type::Frame(elem, _) => mentions_size(elem, name),
-        Type::Fn(params, ret) => {
+        Type::Fn(params, ret) | Type::Rill(params, ret) => {
             params.iter().any(|p| mentions_size(p, name)) || mentions_size(ret, name)
         }
         _ => false,
@@ -4162,6 +4309,14 @@ fn substitute(t: &Type, subst: &Subst) -> Type {
             };
             Type::Frame(Box::new(substitute(elem, subst)), size)
         }
+        Type::Fn(params, ret) => Type::Fn(
+            params.iter().map(|p| substitute(p, subst)).collect(),
+            Box::new(substitute(ret, subst)),
+        ),
+        Type::Rill(params, ret) => Type::Rill(
+            params.iter().map(|p| substitute(p, subst)).collect(),
+            Box::new(substitute(ret, subst)),
+        ),
         t => t.clone(),
     }
 }
@@ -4681,11 +4836,11 @@ pub fn check_entry(
         );
     }
     for (p, ps) in def.params.iter().zip(&sig.params) {
-        if matches!(ps.ty, Type::Fn(..)) {
+        if ps.ty.is_callable() {
             errors.push(
                 Diagnostic::error(
                     p.name.span,
-                    format!("`{}` cannot be a function", p.name.name),
+                    format!("`{}` cannot be a function or rill", p.name.name),
                 )
                 .with_help("the entry rill's parameters are live controls, so they hold numbers"),
             );

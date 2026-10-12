@@ -133,6 +133,7 @@ pub struct Defs<'a> {
     /// up by where they are, as the same name can mean different things in
     /// different files.
     resolved: HashMap<Span, &'a Resolution>,
+    bindings: &'a [super::check::Binding],
     /// The kind of every event, by id.
     events: Vec<Option<EventKind>>,
     decls: Vec<Declared>,
@@ -220,6 +221,7 @@ impl<'a> Defs<'a> {
         Defs {
             events,
             resolved: checked.resolutions.iter().map(|(s, r)| (*s, r)).collect(),
+            bindings: &checked.bindings,
             decls: checked.events.iter().flatten().cloned().collect(),
             seqs: Vec::new(),
             vectorize: true,
@@ -1090,7 +1092,9 @@ impl<'a> Compiler<'a> {
                 let elem = self.zero_for_type(elem)?;
                 Ok(CVal::Frame((0..n).map(|_| elem.clone()).collect()))
             }
-            TypeExpr::Fn { span, .. } => Err(internal(*span, "cannot zero-initialize a function")),
+            TypeExpr::Fn { span, .. } | TypeExpr::Rill { span, .. } => {
+                Err(internal(*span, "cannot zero-initialize a callable"))
+            }
         }
     }
 
@@ -1946,7 +1950,7 @@ impl<'a> Compiler<'a> {
             };
         }
 
-        if matches!(self.types[e.id as usize], Type::Fn(..)) {
+        if self.types[e.id as usize].is_callable() {
             return self.choose_fn(c, then, els);
         }
 
@@ -2066,8 +2070,36 @@ impl<'a> Compiler<'a> {
             if !sizes.is_empty() {
                 return Err(Diagnostic::error(
                     callee.span,
-                    "function values do not take explicit size arguments",
+                    "callable values do not take explicit size arguments",
                 ));
+            }
+            if let Some(Type::Rill(params, _)) = self.binding_type(callee.span).cloned() {
+                let each: Vec<Option<&Expr>> = args
+                    .iter()
+                    .map(|a| a.each.is_some().then_some(&a.value))
+                    .collect();
+                let mut vals = Vec::new();
+                for a in args {
+                    vals.push(if a.each.is_some() {
+                        CVal::unit()
+                    } else {
+                        self.expr(&a.value)?
+                    });
+                }
+                let shapes: Vec<Vec<Size>> = args
+                    .iter()
+                    .zip(&params)
+                    .map(|(arg, p)| {
+                        if arg.each.is_some() {
+                            Vec::new()
+                        } else {
+                            let shape = frame_shape(&self.types[arg.value.id as usize]);
+                            let extra = shape.len().saturating_sub(type_depth(p));
+                            shape[..extra].to_vec()
+                        }
+                    })
+                    .collect();
+                return self.call_rill_value(&f, vals, &shapes, &each, e.span);
             }
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
@@ -2118,6 +2150,13 @@ impl<'a> Compiler<'a> {
             ));
         }
         self.call_builtin(e.span, name, args)
+    }
+
+    fn binding_type(&self, span: Span) -> Option<&Type> {
+        let Resolution::Binding(id) = self.defs.resolution(span)? else {
+            return None;
+        };
+        self.defs.bindings.get(*id).map(|b| &b.ty)
     }
 
     /// Complete `vals` (one per parameter) with defaults. Defaults are
@@ -2217,6 +2256,72 @@ impl<'a> Compiler<'a> {
                 self.copy_into(&mut result, &b)?;
                 self.patch(skip_else);
                 Ok(result.unwrap_or_else(CVal::unit))
+            }
+        }
+    }
+
+    /// Call a rill value, preserving rill lifting and per-call state.
+    fn call_rill_value(
+        &mut self,
+        f: &FnVal,
+        args: Vec<CVal>,
+        shapes: &[Vec<Size>],
+        each: &[Option<&Expr>],
+        span: Span,
+    ) -> CResult<CVal> {
+        let longest = shapes.iter().map(Vec::len).max().unwrap_or(0);
+        let longest = shapes
+            .iter()
+            .find(|s| s.len() == longest)
+            .cloned()
+            .unwrap_or_default();
+        let extra: Vec<usize> = shapes.iter().map(Vec::len).collect();
+        let skip: Vec<usize> = shapes
+            .iter()
+            .map(|s| match align(&longest, s) {
+                Align::Inner => longest.len() - s.len(),
+                _ => 0,
+            })
+            .collect();
+        self.lift(&extra, &skip, &args, &mut |s, mut args| {
+            for (arg, e) in args.iter_mut().zip(each) {
+                if let Some(e) = e {
+                    *arg = s.expr(e)?;
+                }
+            }
+            s.call_rill_value_once(f, args, span)
+        })
+    }
+
+    fn call_rill_value_once(&mut self, f: &FnVal, vals: Vec<CVal>, span: Span) -> CResult<CVal> {
+        match f {
+            FnVal::Def(i) => {
+                let (def, sig) = self.defs.def(*i);
+                if sig.rate != (1, 1) {
+                    return Err(rate_unsupported(span, &sig.name));
+                }
+                let mut slots: Vec<Option<CVal>> = vals.into_iter().map(Some).collect();
+                slots.resize(sig.params.len(), None);
+                let filled = self.fill_defaults(def, sig, slots, span)?;
+                self.inline(def, sig, filled, HashMap::new())
+            }
+            FnVal::Choice { cond, then, els } => {
+                let skip_then = self.emit(Instr::JumpUnless {
+                    cond: *cond,
+                    target: 0,
+                });
+                let mut result = None;
+                let a = self.branch(|s| s.call_rill_value_once(then, vals.clone(), span))?;
+                self.copy_into(&mut result, &a)?;
+                let skip_else = self.emit(Instr::Jump { target: 0 });
+                self.patch(skip_then);
+                let b = self.branch(|s| s.call_rill_value_once(els, vals, span))?;
+                self.copy_into(&mut result, &b)?;
+                self.patch(skip_else);
+                Ok(result.unwrap_or_else(CVal::unit))
+            }
+            FnVal::Named(_) | FnVal::Lambda { .. } => {
+                Err(internal(span, "rill value without a rill definition"))
             }
         }
     }

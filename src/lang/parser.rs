@@ -14,7 +14,7 @@
 //! def     := NAME ("<" NAME ("," NAME)* ">")? "(" params ")" type
 //!            ("@" "rate" (("*" | "/") INT)?)? block
 //! param   := NAME ":" type ("=" expr)?
-//! type    := NAME | "[" type ";" (INT | NAME) "]" | "fn" "(" types ")" type
+//! type    := NAME | "[" type ";" (INT | NAME) "]" | ("fn" | "rill") "(" types ")" type
 //! block   := "{" stmt* "}"
 //! stmt    := "let" NAME (":" type)? ("=" expr)?
 //!          | "state" NAME (":" type)? "=" expr
@@ -443,8 +443,17 @@ impl Parser<'_> {
     }
 
     fn ty(&mut self) -> PResult<TypeExpr> {
-        if let Some(start) = self.eat(TokenKind::Fn) {
-            self.expect(TokenKind::LParen, "after `fn` in a function type")?;
+        if self.at(TokenKind::Fn) || self.at(TokenKind::Rill) {
+            let kind = self.bump();
+            let word = match kind.kind {
+                TokenKind::Fn => "fn",
+                TokenKind::Rill => "rill",
+                _ => unreachable!(),
+            };
+            self.expect(
+                TokenKind::LParen,
+                &format!("after `{word}` in a callable type"),
+            )?;
             self.nest += 1;
             let mut params = Vec::new();
             while !self.at(TokenKind::RParen) {
@@ -455,12 +464,21 @@ impl Parser<'_> {
             }
             self.expect(TokenKind::RParen, "to close the parameter types")?;
             self.nest -= 1;
-            self.no_arrow("fn(Pitch) Freq")?;
+            self.no_arrow(&format!("{word}(Pitch) Freq"))?;
             let ret = self.ty()?;
-            return Ok(TypeExpr::Fn {
-                params,
-                ret: Box::new(ret),
-                span: self.span_from(start.span),
+            let span = self.span_from(kind.span);
+            return Ok(match kind.kind {
+                TokenKind::Fn => TypeExpr::Fn {
+                    params,
+                    ret: Box::new(ret),
+                    span,
+                },
+                TokenKind::Rill => TypeExpr::Rill {
+                    params,
+                    ret: Box::new(ret),
+                    span,
+                },
+                _ => unreachable!(),
             });
         }
         if let Some(open) = self.eat(TokenKind::LBracket) {

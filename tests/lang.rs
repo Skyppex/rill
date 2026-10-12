@@ -662,8 +662,8 @@ fn names_and_suggestions() {
     assert_eq!(help.as_deref(), Some("did you mean `level`?"));
 
     assert_eq!(
-        error(&with_sine("let x = sine")).0,
-        "rill `sine` cannot be used as a value"
+        type_of(&with_sine("let x = sine"), "x"),
+        Type::Rill(vec![Type::Freq], Box::new(Type::Sample))
     );
     assert_eq!(
         error(&body("let a = 1\nlet x = a(2)")).0,
@@ -862,7 +862,7 @@ fn functions_are_values() {
         ("let f = fn(p) { p }", "cannot tell the type of `p`"),
         (
             "let a = voice(E4, sine)",
-            "rill `sine` cannot be used as a value",
+            "`sine` does not fit `fn(Pitch) Freq`",
         ),
         ("let f = sin", "cannot tell which `sin` is meant here"),
         (
@@ -873,7 +873,7 @@ fn functions_are_values() {
             "let f = fn(x: Sample) Sample { sine(1Hz) }",
             "an anonymous fn cannot call rill `sine`",
         ),
-        ("state f = a432", "a function cannot be `state`"),
+        ("state f = a432", "a function or rill cannot be `state`"),
         (
             "let t = fn(p: Pitch) Freq { equal(p) }\nlet x = t(A4, B4)",
             "`t` takes 1 argument(s), but 2 were given",
@@ -905,7 +905,41 @@ fn functions_are_values() {
             "main"
         )[0]
         .0,
-        "`t` cannot be a function"
+        "`t` cannot be a function or rill"
+    );
+}
+
+#[test]
+fn rills_are_values() {
+    let src = format!(
+        "{SINE}
+         rill apply(f: rill(Freq) Sample, freq: Freq) Sample {{
+             return f(freq)
+         }}
+         rill main() Sample {{
+             let osc: rill(Freq) Sample = sine
+             let bank = osc([110Hz, 220Hz, 330Hz])
+             let x = apply(sine, 440Hz)
+             return sum(bank) + x
+         }}"
+    );
+    assert_ok(&src);
+    assert_eq!(
+        type_of(&src, "osc"),
+        Type::Rill(vec![Type::Freq], Box::new(Type::Sample))
+    );
+    assert_eq!(type_of(&src, "bank"), frame(Type::Sample, 3));
+
+    let (msg, help) = error(&format!(
+        "{SINE}
+         fn pure(f: rill(Freq) Sample) Sample {{
+             f(440Hz)
+         }}"
+    ));
+    assert_eq!(msg, "fn `pure` cannot call rill `f`");
+    assert_eq!(
+        help.as_deref(),
+        Some("rills keep state between ticks, so fns must stay pure; make `pure` a rill")
     );
 }
 
@@ -1078,7 +1112,7 @@ fn frames_nest() {
     );
     assert_eq!(
         errors(&body("let f: [fn(Sample) Sample; 2] = [sin, cos]"))[0],
-        "frames cannot hold functions"
+        "frames cannot hold functions or rills"
     );
 }
 
@@ -1951,7 +1985,7 @@ fn a_const_must_be_constant() {
     );
     assert_eq!(
         error(&body("const S: fn(Float) Float = sqrt")).0,
-        "a `const` cannot hold a function"
+        "a `const` cannot hold a function or rill"
     );
     assert_eq!(
         error("const X = Y + 1\nconst Y = X\nrill main() Sample { return 0 }").0,

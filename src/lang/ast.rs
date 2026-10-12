@@ -239,13 +239,21 @@ pub enum TypeExpr {
         ret: Box<TypeExpr>,
         span: Span,
     },
+    /// `rill(params) ret`
+    Rill {
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+        span: Span,
+    },
 }
 
 impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
             TypeExpr::Named(id) => id.span,
-            TypeExpr::Frame { span, .. } | TypeExpr::Fn { span, .. } => *span,
+            TypeExpr::Frame { span, .. }
+            | TypeExpr::Fn { span, .. }
+            | TypeExpr::Rill { span, .. } => *span,
         }
     }
 }

@@ -92,7 +92,8 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `Pitch`, `Interval` | Abstract musical values | Turned into `Freq` by a tuning (see Pitch) |
 | `Gain` | A level change, written in `dB` | Any plain number is an amplitude factor (see Levels) |
 | `Slope` | A level over an interval: `24dB / 1oct` | `Gain / Interval`; stored in dB per octave, so `6dB / 6st` is `12dB / 1oct`. Times an `Interval`, a `Gain` again |
-| `fn(A, B) R` | A function value | See Functions as values |
+| `fn(A, B) R` | A function value | Pure, takes exactly what it declares |
+| `rill(A, B) R` | A rill value | Stateful, lifts like a named rill |
 
 Plain numbers convert with `as`: `x as Float`, `x as Sample`, `x as Int` (which truncates toward zero). `as` binds tighter than arithmetic, so `a + b as Int` casts only `b`. Units and levels never disappear by a cast: `freq / 1Hz` gives a plain number, and `amp(g)` the factor of a level.
 
@@ -126,7 +127,7 @@ rill pad() [Sample; 2] {
 ```
 
 - **Where.** At the top level, a `const` belongs to its file and can be used in any order: `CHORD` above uses `ROOT` before it is written. A cycle (`const A = B`, `const B = A`) is an error. In a block, a `const` is scoped to the block, like `let`.
-- **The value** must be constant: numbers with units, pitches, chords and frames, arithmetic, prelude functions of constants (`random()` included), other `const`s, sequence fields and `RATE`. A `fn` or `rill` cannot be used, and a `const` cannot hold a function.
+- **The value** must be constant: numbers with units, pitches, chords and frames, arithmetic, prelude functions of constants (`random()` included), other `const`s, sequence fields and `RATE`. A `fn` or `rill` cannot be used, and a `const` cannot hold a function or rill.
 - **One value.** A top-level `const` is worked out once, so `DETUNE` is the same number everywhere it is used. A `const` in a rill is worked out once per instance: each of `[pad(); 4]` gets its own `random()`. It can use the rill's size parameters.
 - **Sizes.** A `const` holding a whole number of at least 1 is a size: `[Float; VOICES]`, `spread<VOICES>(...)`. One worked out from `RATE` or from a size parameter is not (yet).
 - A `const` cannot be assigned. A name in a block can shadow a top-level `const`; a top-level `const` cannot take the name of a definition, sequence, event, note (`A`, `C4`), prelude function or prelude constant.
@@ -379,9 +380,9 @@ rill lead() Sample {
 - A new note goes to a free copy; else the copy released longest ago; else the one that has held its note longest.
 - Plain `on` handlers run in every copy, as before. Outside a pool, `claim` and `release` behave like plain handlers.
 
-## Functions as values
+## Functions and rills as values
 
-Fns are values: they can be bound with `let`, passed to fns and rills, returned from fns, and chosen while playing. Anonymous fns use the named syntax without the name.
+Fns and rills are values: they can be bound with `let`, passed to fns and rills, returned from fns, and chosen while playing. Anonymous fns use the named syntax without the name; there are no anonymous rills.
 
 ```rill
 fn a432(p: Pitch) Freq { 432Hz * pow(2, (p - A4) / 12st) }
@@ -390,21 +391,26 @@ rill voice(pitch: Pitch, tune: fn(Pitch) Freq) Sample {
     return pitch |> tune |> sine
 }
 
+rill layer(osc: rill(Freq) Sample, root: Freq) Sample {
+    return sum(osc([root, root * 2]))
+}
+
 voice(E4, a432)                         // a named fn
 voice(E4, fn(p) { equal(p, 24) })       // anonymous; types come from `tune`
 voice(E4, equal)                        // extra parameters with defaults are fine
 voice(E4, if minor { just_c } else { equal })   // chosen while playing
+layer(sine, 220Hz)                      // a named rill
 ```
 
 Rules:
 
-- Function types are written `fn(A, B) R`. They cannot be `state`, frame elements, event fields or the entry rill's parameters.
+- Function types are written `fn(A, B) R`; rill types are written `rill(A, B) R`. They cannot be `state`, frame elements, event fields or the entry rill's parameters.
 - An anonymous fn's parameter and return types can be left out when the surroundings say what they are (a parameter of function type, an annotated `let`, a `return`, or a fn's declared return type). Otherwise they are required.
 - Anonymous fns capture what they use, by value, at the point they are made. They are fns, so they are pure: they read what they capture but cannot change it, and cannot call rills.
-- A named fn can be used where a function type with fewer parameters is expected, if its remaining parameters have defaults. A prelude function that works on several types (`sin`) needs an expected type to pick one.
-- Rills are not values: they carry state, and whether an unchosen rill keeps running is not decided yet.
-- Recursion is still not allowed, including through function values.
-- At build time every call of a function value is replaced by the function's body, so function values cost nothing while playing. A function chosen while playing becomes a branch between the candidates; only the chosen one runs.
+- A named fn or rill can be used where a callable type with fewer parameters is expected, if its remaining parameters have defaults. A prelude function that works on several types (`sin`) needs an expected type to pick one.
+- A rill value still behaves like a rill call: it can only be called from a rill, it lifts over extra frame layers, and every call site has its own state.
+- Recursion is still not allowed, including through callable values.
+- At build time every call of a callable value is replaced by the callable's body, so callable values cost nothing while playing. A callable chosen while playing becomes a branch between the candidates; only the chosen one runs.
 
 ## Modules
 

@@ -626,6 +626,30 @@ fn a_function_can_be_chosen_while_playing() {
 }
 
 #[test]
+fn a_rill_can_be_chosen_while_playing() {
+    let src = "
+        rill slow(freq: Freq) Sample {
+            state n: Sample = 0
+            n += 1
+            return n
+        }
+        rill fast(freq: Freq) Sample {
+            state n: Sample = 10
+            n += 10
+            return n
+        }
+        rill main() Sample {
+            state s: Sample = 1
+            s = -s
+            let f: rill(Freq) Sample = if s > 0 { slow } else { fast }
+            return sum(f([110Hz, 220Hz]))
+        }
+    ";
+    let out = render(src, 4);
+    assert_eq!(out, [40.0, 2.0, 60.0, 4.0]);
+}
+
+#[test]
 fn functions_are_inlined_where_they_are_called() {
     let src = format!(
         "{SINE}

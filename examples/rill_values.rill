@@ -1,0 +1,54 @@
+// First-class rills: a rill can be named as a value, passed to another rill,
+// chosen while playing, and still behaves like a rill when called.
+
+import "@gen/osc"
+import "@effects/filter"
+import "@mix/stereo"
+
+rill bright(freq: Freq, offset: Float = 0) Sample {
+    let a = saw(freq, offset)
+    let b = square(freq * 2, offset) * 0.35
+    return (a + b) * 0.6
+}
+
+rill mellow(freq: Freq, offset: Float = 0) Sample {
+    return sine(freq, offset)
+}
+
+rill slow_switch(rate: Freq) Bool {
+    state phase: Float = 0
+    phase = wrap(phase + rate / RATE)
+    return phase < 0.5
+}
+
+rill voice(
+    osc: rill(Freq, Float) Sample,
+    freq: Freq,
+    width: Interval,
+) [Sample; 2] {
+    let chord = [freq, freq + 7st, freq + 12st]
+    let detuned = [chord - width, chord, chord + width]
+
+    // Calling a rill value lifts just like calling a named rill. This makes
+    // nine oscillator instances, one per frequency, each with its own state.
+    let layer = osc(detuned, each random()) |> sum |> sum
+
+    return layer / 9 |> pan(sin(freq / 1kHz))
+}
+
+rill main(volume: Gain = -10dB) [Sample; 2] {
+    // The annotation fixes the callable type and lets `bright` drop its
+    // defaulted parameters not mentioned here.
+    let lead: rill(Freq, Float) Sample = if slow_switch(55Hz) {
+        bright
+    } else {
+        mellow
+    }
+
+    let bass: rill(Freq, Float) Sample = mellow
+
+    let top = voice(lead, 220Hz, 5cents)
+    let low = voice(bass, 110Hz, 2cents) * 0.45
+
+    return (top + low + volume) |> lowpass(2.5kHz)
+}

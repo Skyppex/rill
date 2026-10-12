@@ -36,6 +36,8 @@ pub enum Type {
     Range,
     /// A function value: `fn(params) ret`.
     Fn(Vec<Type>, Box<Type>),
+    /// A rill value: `rill(params) ret`.
+    Rill(Vec<Type>, Box<Type>),
     /// No value, e.g. `out(x)` or an `if` without `else`.
     Unit,
     /// The expression always `return`s, so it never produces a value.
@@ -128,6 +130,16 @@ impl fmt::Display for Type {
                 }
                 write!(f, ") {ret}")
             }
+            Type::Rill(params, ret) => {
+                f.write_str("rill(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{p}")?;
+                }
+                write!(f, ") {ret}")
+            }
             Type::Unit => f.write_str("()"),
             Type::Never => f.write_str("!"),
             Type::Param(p) => f.write_str(p),
@@ -194,6 +206,10 @@ impl Type {
         self.is_quantity() || *self == Type::Bool
     }
 
+    pub fn is_callable(&self) -> bool {
+        matches!(self, Type::Fn(..) | Type::Rill(..))
+    }
+
     /// Error or Never: anything goes, the problem is reported elsewhere or the
     /// value never exists.
     pub fn is_wild(&self) -> bool {
@@ -227,7 +243,7 @@ pub fn coerces(from: &Type, to: &Type) -> bool {
         (Type::Frame(a, n), Type::Frame(b, m)) => n == m && coerces(a, b),
         // A function fits where it can be called the same way: it accepts
         // what the expected type passes, and returns what it promises.
-        (Type::Fn(pa, ra), Type::Fn(pb, rb)) => {
+        (Type::Fn(pa, ra), Type::Fn(pb, rb)) | (Type::Rill(pa, ra), Type::Rill(pb, rb)) => {
             pa.len() == pb.len() && pa.iter().zip(pb).all(|(a, b)| coerces(b, a)) && coerces(ra, rb)
         }
         _ => false,

@@ -1454,6 +1454,10 @@ enum Src {
 }
 
 /// Run every instruction of `block` over all of its lanes.
+///
+/// The loops over lanes are small functions of their own, one per operation
+/// and shape of operands, kept out of this one: each is compiled on its own
+/// terms (SIMD, unrolling), however this function changes around them.
 fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
     let n = usize::from(block.lanes);
     let p = regs.as_mut_ptr();
@@ -1466,116 +1470,43 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
             VArg::Scalar(r) => Src::Splat(*p.add(r as usize)),
             VArg::Const(c) => Src::Splat(c),
         };
-        // Each loop has its operand shapes fixed and a single operation in
-        // its body, so the compiler can turn it into SIMD.
-        macro_rules! unary {
-            ($d:expr, $x:expr, $f:expr) => {{
-                let d = p.add($d as usize);
-                let f = $f;
-                match src($x) {
-                    Src::Lanes(x) => {
-                        for k in 0..n {
-                            *d.add(k) = f(*x.add(k));
-                        }
-                    }
-                    Src::Splat(x) => {
-                        let v = f(x);
-                        for k in 0..n {
-                            *d.add(k) = v;
-                        }
-                    }
-                }
-            }};
-        }
-        macro_rules! binary {
-            ($d:expr, $a:expr, $b:expr, $f:expr) => {{
-                let d = p.add($d as usize);
-                let f = $f;
-                match (src($a), src($b)) {
-                    (Src::Lanes(a), Src::Lanes(b)) => {
-                        for k in 0..n {
-                            *d.add(k) = f(*a.add(k), *b.add(k));
-                        }
-                    }
-                    (Src::Lanes(a), Src::Splat(y)) => {
-                        for k in 0..n {
-                            *d.add(k) = f(*a.add(k), y);
-                        }
-                    }
-                    (Src::Splat(x), Src::Lanes(b)) => {
-                        for k in 0..n {
-                            *d.add(k) = f(x, *b.add(k));
-                        }
-                    }
-                    (Src::Splat(x), Src::Splat(y)) => {
-                        let v = f(x, y);
-                        for k in 0..n {
-                            *d.add(k) = v;
-                        }
-                    }
-                }
-            }};
-        }
         let truth = |b: bool| if b { 1.0f32 } else { 0.0 };
         for i in &block.instrs {
             match *i {
-                VInstr::Op2 { op, d, a, b } => match op {
-                    Op2::Add => binary!(d, a, b, |x: f32, y: f32| x + y),
-                    Op2::Sub => binary!(d, a, b, |x: f32, y: f32| x - y),
-                    Op2::Mul => binary!(d, a, b, |x: f32, y: f32| x * y),
-                    Op2::Div => binary!(d, a, b, |x: f32, y: f32| x / y),
-                    Op2::Min => binary!(d, a, b, |x: f32, y: f32| x.min(y)),
-                    Op2::Max => binary!(d, a, b, |x: f32, y: f32| x.max(y)),
-                    Op2::Lt => binary!(d, a, b, |x: f32, y: f32| truth(x < y)),
-                    Op2::Le => binary!(d, a, b, |x: f32, y: f32| truth(x <= y)),
-                    Op2::Gt => binary!(d, a, b, |x: f32, y: f32| truth(x > y)),
-                    Op2::Ge => binary!(d, a, b, |x: f32, y: f32| truth(x >= y)),
-                    Op2::Eq => binary!(d, a, b, |x: f32, y: f32| truth(x == y)),
-                    Op2::Ne => binary!(d, a, b, |x: f32, y: f32| truth(x != y)),
-                    Op2::And => binary!(d, a, b, |x: f32, y: f32| truth(x != 0.0 && y != 0.0)),
-                    Op2::Or => binary!(d, a, b, |x: f32, y: f32| truth(x != 0.0 || y != 0.0)),
-                    op => binary!(d, a, b, |x: f32, y: f32| op.apply(x, y)),
-                },
-                VInstr::Op1 { op, d, x } => match op {
-                    Op1::Wrap => unary!(d, x, |v: f32| v - crate::ops::floor(v)),
-                    Op1::Floor => unary!(d, x, crate::ops::floor),
-                    Op1::Neg => unary!(d, x, |v: f32| -v),
-                    Op1::Abs => unary!(d, x, f32::abs),
-                    Op1::Not => unary!(d, x, |v: f32| truth(v == 0.0)),
-                    op => unary!(d, x, |v: f32| op.apply(v)),
-                },
-                VInstr::Copy { d, s } => unary!(d, s, |v: f32| v),
-                VInstr::Select { d, cond, a, b } => {
-                    let dp = p.add(d as usize);
-                    match (src(cond), src(a), src(b)) {
-                        (Src::Lanes(c), Src::Lanes(a), Src::Lanes(b)) => {
-                            for k in 0..n {
-                                let (x, y) = (*a.add(k), *b.add(k));
-                                *dp.add(k) = if *c.add(k) != 0.0 { x } else { y };
-                            }
-                        }
-                        (Src::Lanes(c), Src::Splat(x), Src::Lanes(b)) => {
-                            for k in 0..n {
-                                let y = *b.add(k);
-                                *dp.add(k) = if *c.add(k) != 0.0 { x } else { y };
-                            }
-                        }
-                        (Src::Lanes(c), Src::Lanes(a), Src::Splat(y)) => {
-                            for k in 0..n {
-                                let x = *a.add(k);
-                                *dp.add(k) = if *c.add(k) != 0.0 { x } else { y };
-                            }
-                        }
-                        (c, a, b) => {
-                            let at = |s: Src, k: usize| match s {
-                                Src::Lanes(q) => *q.add(k),
-                                Src::Splat(v) => v,
-                            };
-                            for k in 0..n {
-                                *dp.add(k) = if at(c, k) != 0.0 { at(a, k) } else { at(b, k) };
-                            }
-                        }
+                VInstr::Op2 { op, d, a, b } => {
+                    let (d, a, b) = (p.add(d as usize), src(a), src(b));
+                    match op {
+                        Op2::Add => lanes2(d, a, b, n, |x, y| x + y),
+                        Op2::Sub => lanes2(d, a, b, n, |x, y| x - y),
+                        Op2::Mul => lanes2(d, a, b, n, |x, y| x * y),
+                        Op2::Div => lanes2(d, a, b, n, |x, y| x / y),
+                        Op2::Min => lanes2(d, a, b, n, f32::min),
+                        Op2::Max => lanes2(d, a, b, n, f32::max),
+                        Op2::Lt => lanes2(d, a, b, n, |x, y| truth(x < y)),
+                        Op2::Le => lanes2(d, a, b, n, |x, y| truth(x <= y)),
+                        Op2::Gt => lanes2(d, a, b, n, |x, y| truth(x > y)),
+                        Op2::Ge => lanes2(d, a, b, n, |x, y| truth(x >= y)),
+                        Op2::Eq => lanes2(d, a, b, n, |x, y| truth(x == y)),
+                        Op2::Ne => lanes2(d, a, b, n, |x, y| truth(x != y)),
+                        Op2::And => lanes2(d, a, b, n, |x, y| truth(x != 0.0 && y != 0.0)),
+                        Op2::Or => lanes2(d, a, b, n, |x, y| truth(x != 0.0 || y != 0.0)),
+                        op => lanes2(d, a, b, n, |x, y| op.apply(x, y)),
                     }
+                }
+                VInstr::Op1 { op, d, x } => {
+                    let (d, x) = (p.add(d as usize), src(x));
+                    match op {
+                        Op1::Wrap => lanes1(d, x, n, |v| v - crate::ops::floor(v)),
+                        Op1::Floor => lanes1(d, x, n, crate::ops::floor),
+                        Op1::Neg => lanes1(d, x, n, |v| -v),
+                        Op1::Abs => lanes1(d, x, n, f32::abs),
+                        Op1::Not => lanes1(d, x, n, |v| truth(v == 0.0)),
+                        op => lanes1(d, x, n, |v| op.apply(v)),
+                    }
+                }
+                VInstr::Copy { d, s } => lanes1(p.add(d as usize), src(s), n, |v| v),
+                VInstr::Select { d, cond, a, b } => {
+                    select(p.add(d as usize), src(cond), src(a), src(b), n);
                 }
                 VInstr::Tune {
                     tuning,
@@ -1585,14 +1516,125 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
                     a4,
                 } => {
                     let dp = p.add(d as usize);
-                    let at = |s: Src, k: usize| match s {
-                        Src::Lanes(q) => *q.add(k),
-                        Src::Splat(v) => v,
-                    };
                     let (pi, se, a) = (src(pitch), src(setting), src(a4));
                     for k in 0..n {
-                        *dp.add(k) = tuning.frequency(at(pi, k), at(se, k), at(a, k));
+                        *dp.add(k) = tuning.frequency(pi.at(k), se.at(k), a.at(k));
                     }
+                }
+            }
+        }
+    }
+}
+
+impl Src {
+    /// Lane `k`'s value.
+    ///
+    /// # Safety
+    ///
+    /// For `Lanes`, lane `k` must be inside its group.
+    #[inline(always)]
+    unsafe fn at(self, k: usize) -> f32 {
+        match self {
+            // SAFETY: as the caller promises.
+            Src::Lanes(q) => unsafe { *q.add(k) },
+            Src::Splat(v) => v,
+        }
+    }
+}
+
+/// `d = f(x)` over `n` lanes. Each shape of operand has a loop of its own,
+/// with one operation in its body, so the compiler can turn it into SIMD.
+///
+/// # Safety
+///
+/// `d` and a `Lanes` operand must hold `n` lanes, and may only be the same
+/// group or not overlap at all.
+#[inline(never)]
+unsafe fn lanes1(d: *mut f32, x: Src, n: usize, f: impl Fn(f32) -> f32) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        match x {
+            Src::Lanes(x) => {
+                for k in 0..n {
+                    *d.add(k) = f(*x.add(k));
+                }
+            }
+            Src::Splat(x) => {
+                let v = f(x);
+                for k in 0..n {
+                    *d.add(k) = v;
+                }
+            }
+        }
+    }
+}
+
+/// `d = f(a, b)` over `n` lanes; see [`lanes1`].
+///
+/// # Safety
+///
+/// As for [`lanes1`].
+#[inline(never)]
+unsafe fn lanes2(d: *mut f32, a: Src, b: Src, n: usize, f: impl Fn(f32, f32) -> f32) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        match (a, b) {
+            (Src::Lanes(a), Src::Lanes(b)) => {
+                for k in 0..n {
+                    *d.add(k) = f(*a.add(k), *b.add(k));
+                }
+            }
+            (Src::Lanes(a), Src::Splat(y)) => {
+                for k in 0..n {
+                    *d.add(k) = f(*a.add(k), y);
+                }
+            }
+            (Src::Splat(x), Src::Lanes(b)) => {
+                for k in 0..n {
+                    *d.add(k) = f(x, *b.add(k));
+                }
+            }
+            (Src::Splat(x), Src::Splat(y)) => {
+                let v = f(x, y);
+                for k in 0..n {
+                    *d.add(k) = v;
+                }
+            }
+        }
+    }
+}
+
+/// `d = if cond { a } else { b }` over `n` lanes; see [`lanes1`].
+///
+/// # Safety
+///
+/// As for [`lanes1`].
+#[inline(never)]
+unsafe fn select(d: *mut f32, cond: Src, a: Src, b: Src, n: usize) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        match (cond, a, b) {
+            (Src::Lanes(c), Src::Lanes(a), Src::Lanes(b)) => {
+                for k in 0..n {
+                    let (x, y) = (*a.add(k), *b.add(k));
+                    *d.add(k) = if *c.add(k) != 0.0 { x } else { y };
+                }
+            }
+            (Src::Lanes(c), Src::Splat(x), Src::Lanes(b)) => {
+                for k in 0..n {
+                    let y = *b.add(k);
+                    *d.add(k) = if *c.add(k) != 0.0 { x } else { y };
+                }
+            }
+            (Src::Lanes(c), Src::Lanes(a), Src::Splat(y)) => {
+                for k in 0..n {
+                    let x = *a.add(k);
+                    *d.add(k) = if *c.add(k) != 0.0 { x } else { y };
+                }
+            }
+            (c, a, b) => {
+                for k in 0..n {
+                    *d.add(k) = if c.at(k) != 0.0 { a.at(k) } else { b.at(k) };
                 }
             }
         }

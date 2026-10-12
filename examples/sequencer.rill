@@ -15,6 +15,9 @@
 // tunes it into a frequency, and plays it.
 
 // Eighth notes at 120bpm in 4/4. `@` sets a step's velocity; `_` is a rest.
+
+import "@gen/osc"
+
 seq riff(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.6, velocity: 0.7) {
     C4, _, E4@0.4, _, [G4, B4]@1, E4, _, C5,
 }
@@ -24,12 +27,6 @@ seq bass(meter: 3/4, step: 1/4, tempo: 90bpm, gate: 0.9) { C2, G2@0.5, G2@0.5 }
 
 // A pad on host sender 2 restarts the riff from step 5.
 event pad note_on(sender: 2, channel: 10)
-
-rill sine(freq: Freq) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    return sin(phase * TAU)
-}
 
 // One voice for the riff. `claim` gives each new note to one voice of a
 // pool, and `release` gives its note-off to the voice holding it.

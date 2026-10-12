@@ -1,11 +1,7 @@
+import "@gen/osc"
+
 event press note_on
 event release note_off
-
-rill sine(freq: Freq) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    return sin(phase * TAU)
-}
 
 rill main() Sample {
     state pitch = A4

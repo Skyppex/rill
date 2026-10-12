@@ -1,6 +1,9 @@
 // The syntax sketch from design/design.md, filled in where it said `...`.
 
 // Pure function on one value. Auto-lifted over streams and channels.
+
+import "@gen/osc"
+
 fn abs(x: Sample) Sample {
     if x < 0 { -x } else { x }
 }
@@ -33,27 +36,6 @@ rill mix_down<N>(x: [Sample; N]) [Sample; 1] {
 // Rate-changing rill: the ratio is part of the signature.
 rill decimate(x: Sample) Sample @ rate / 2 {
     return x
-}
-
-// Generator: no audio input.
-rill sine(freq: Freq) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    return sin(phase * TAU)
-}
-
-// Generator: no audio input.
-rill saw(freq: Freq) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    return phase * 2 - 1
-}
-
-// Generator: no audio input.
-rill square(freq: Freq) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    return if phase < 0.5 { 1 } else { -1 }
 }
 
 // linear interpolation

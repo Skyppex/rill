@@ -3,15 +3,12 @@
 
 // Events, declared once: a name, a kind, and which senders and channels it
 // accepts. What the numbers mean is up to whoever sends the events.
+
+import "@gen/osc"
+
 event keys_press note_on(sender: 1)
 event keys_release note_off(sender: 1)
 event brightness control_change(sender: 1, channel: 74)
-
-rill sine(freq: Freq) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    return sin(phase * TAU)
-}
 
 rill main() Sample {
     return live_control()

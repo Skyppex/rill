@@ -1,13 +1,10 @@
 // Levels: a signal moves up or down with `+` or `-` and a level in dB.
 // The level always comes after the signal.
 
-rill sine(freq: Freq) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    return sin(phase * TAU)
-}
-
 // From `from` to `to` over `length`, then holds.
+
+import "@gen/osc"
+
 rill ramp(from: Float, to: Float, length: Time) Float {
     state elapsed = 0s
     let t = min(elapsed / length, 1)

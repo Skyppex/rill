@@ -2,13 +2,10 @@
 // runs once per note. A stereo voice turns three notes into three stereo
 // frames, and `sum` mixes them down to one.
 
-rill sine(freq: Freq) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    return sin(phase * TAU)
-}
-
 // Equal-power panning: 0 is hard left, 1 hard right.
+
+import "@gen/osc"
+
 rill pan(x: Sample, pos: Float) [Sample; 2] {
     let angle = pos * PI / 2
     return [x * cos(angle), x * sin(angle)]

@@ -178,6 +178,14 @@ pub enum VInstr {
         setting: VArg,
         a4: VArg,
     },
+    /// Lane `k` takes the next number from noise generator
+    /// `source + k * stride`: a copy with several generators has them in a
+    /// row, so the same generator of each copy is `stride` apart.
+    Noise {
+        d: Reg,
+        source: u16,
+        stride: u16,
+    },
 }
 
 /// The prelude's tunings, as run by [`Instr::Tune`].
@@ -879,7 +887,7 @@ impl Program {
             }
         }
         for block in &code.vectors {
-            check_vector(block, code.regs);
+            check_vector(block, code.regs, code.noises.len());
         }
         let claims = code
             .events
@@ -1387,7 +1395,9 @@ fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
                 }
             }
             Fast::Jump { target } => pc = target as usize,
-            Fast::Vector { block } => run_vector(&code.vectors[block as usize], regs),
+            Fast::Vector { block } => {
+                run_vector(&code.vectors[block as usize], regs, &mut run.noise);
+            }
             Fast::Slow { index } => {
                 if let Some(target) = step(&instrs[index as usize], code, run) {
                     pc = target;
@@ -1398,7 +1408,7 @@ fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
 }
 
 /// Check that every register a vector block uses exists.
-fn check_vector(block: &VectorBlock, regs: usize) {
+fn check_vector(block: &VectorBlock, regs: usize, noises: usize) {
     let n = usize::from(block.lanes);
     assert!(n > 0, "a vector block needs lanes");
     let arg = |a: VArg| match a {
@@ -1439,6 +1449,14 @@ fn check_vector(block: &VectorBlock, regs: usize) {
                 arg(a4);
                 d
             }
+            VInstr::Noise { d, source, stride } => {
+                assert!(stride > 0, "noise generators need a stride");
+                assert!(
+                    usize::from(source) + (n - 1) * usize::from(stride) < noises,
+                    "noise generators {source}.. out of range"
+                );
+                d
+            }
         };
         arg(VArg::Lanes(d));
     }
@@ -1458,7 +1476,7 @@ enum Src {
 /// The loops over lanes are small functions of their own, one per operation
 /// and shape of operands, kept out of this one: each is compiled on its own
 /// terms (SIMD, unrolling), however this function changes around them.
-fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
+fn run_vector(block: &VectorBlock, regs: &mut [f32], noise: &mut [u64]) {
     let n = usize::from(block.lanes);
     let p = regs.as_mut_ptr();
     // SAFETY: `check_vector` made sure every lane group and register is
@@ -1520,6 +1538,10 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
                     for k in 0..n {
                         *dp.add(k) = tuning.frequency(pi.at(k), se.at(k), a.at(k));
                     }
+                }
+                VInstr::Noise { d, source, stride } => {
+                    let states = &mut noise[usize::from(source)..];
+                    noise_lanes(p.add(d as usize), states, usize::from(stride), n);
                 }
             }
         }
@@ -1601,6 +1623,20 @@ unsafe fn lanes2(d: *mut f32, a: Src, b: Src, n: usize, f: impl Fn(f32, f32) -> 
                 }
             }
         }
+    }
+}
+
+/// Lane `k` of `d` = the next number from generator `states[k * stride]`,
+/// for `n` lanes.
+///
+/// # Safety
+///
+/// `d` must hold `n` lanes.
+#[inline(never)]
+unsafe fn noise_lanes(d: *mut f32, states: &mut [u64], stride: usize, n: usize) {
+    for (k, state) in states.iter_mut().step_by(stride).take(n).enumerate() {
+        // SAFETY: as the caller promises.
+        unsafe { *d.add(k) = next_noise(state) };
     }
 }
 
@@ -1722,7 +1758,9 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
             }
         }
         Instr::Jump { target } => return Some(target as usize),
-        Instr::Vector { block } => run_vector(&code.vectors[block as usize], regs),
+        Instr::Vector { block } => {
+            run_vector(&code.vectors[block as usize], regs, &mut run.noise);
+        }
         Instr::InvokeSeq { call } => invoke(call, code, run),
         Instr::InvokeEvent { event, values } => {
             let kind = code.decls[usize::from(event.0)].kind;

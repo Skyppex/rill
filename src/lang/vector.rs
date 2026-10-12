@@ -18,10 +18,15 @@
 //!   lane group: one register per copy, in a row. Everything in the program
 //!   that refers to those registers is renumbered to match. A constant that
 //!   differs per copy becomes a lane group set when the program loads.
+//! - **Noise runs per lane.** Each copy's `noise()` has its own generator;
+//!   lane `k` takes the next number from the `k`th copy's, so they must be
+//!   evenly spaced (a copy with three generators has them three apart).
+//!   Only noise that runs on every path can join: on a side not taken it
+//!   would still move its generator on.
 //!
-//! A pool is left as it is when anything does not fit: side effects in a
-//! copy, copies that differ in shape, or registers that would need two
-//! places.
+//! A pool is left as it is when anything does not fit: other side effects
+//! in a copy (delays, events), copies that differ in shape, or registers
+//! that would need two places.
 
 use std::collections::HashMap;
 
@@ -371,6 +376,35 @@ fn vectorize_pool(
                     a4,
                 }
             }
+            Instr::Noise { source, .. } => {
+                // Lane `k` takes generator `source + k * stride`: the copies'
+                // generators must be evenly spaced, in the order of the
+                // copies.
+                let sources: Vec<usize> = at
+                    .iter()
+                    .map(|i| match **i {
+                        Instr::Noise { source, .. } => Some(usize::from(source)),
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()?;
+                let stride = sources[1].checked_sub(sources[0]).filter(|&s| s > 0)?;
+                if sources
+                    .iter()
+                    .enumerate()
+                    .any(|(k, &s)| s != sources[0] + k * stride)
+                {
+                    return None;
+                }
+                let d = g.dst(&dsts(&|i| match *i {
+                    Instr::Noise { dst, .. } => dst,
+                    _ => unreachable!(),
+                }))?;
+                VInstr::Noise {
+                    d,
+                    source,
+                    stride: u16::try_from(stride).ok()?,
+                }
+            }
             _ => return None,
         };
         instrs.push(v);
@@ -397,7 +431,8 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
             | Instr::Op2 { .. }
             | Instr::Copy { .. }
             | Instr::Select { .. }
-            | Instr::Tune { .. } => {}
+            | Instr::Tune { .. }
+            | Instr::Noise { .. } => {}
             _ => return None,
         }
     }
@@ -531,6 +566,9 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
                 incoming[target_of(&copy[i])].push(pred);
                 cur = None;
             }
+            // Noise run on a path not taken would still move its generator
+            // on, so only noise that always runs can go in a block.
+            Instr::Noise { .. } if pred != one => return None,
             instr => {
                 let mut d: Reg = 0;
                 writes(&instr, &mut |r| d = r);
@@ -702,6 +740,7 @@ fn rename(code: &mut Code, map: &HashMap<Reg, Reg>) {
                 VInstr::Tune {
                     pitch, setting, a4, ..
                 } => vec![pitch, setting, a4],
+                VInstr::Noise { .. } => vec![],
             };
             for a in args {
                 if let VArg::Scalar(x) = a {

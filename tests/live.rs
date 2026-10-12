@@ -147,6 +147,21 @@ fn the_crossfade_has_no_jumps() {
 }
 
 #[test]
+fn noise_running_together_carries_on_exactly() {
+    // Noise in a pool runs as one vector block; a rebuild carries every
+    // generator over by its key, as it does one copy at a time.
+    let src = "
+import \"@gen/noise\"
+rill main() [Sample; 2] {
+    let x = sum([pink(); 32]) * 0.1
+    return [x, sum([noise(); 8]) * 0.1]
+}";
+    let (out, fresh) = swapped(src, src, 3_000, 10_000, 960);
+    assert_eq!(fresh, 0);
+    assert!(out == unswapped(src, 10_000));
+}
+
+#[test]
 fn a_broken_edit_keeps_the_old_program() {
     let (mut live, mut player) = start(SONG);
     let mut out = render(&mut player, 5_000);

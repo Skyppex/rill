@@ -2188,6 +2188,48 @@ fn consts_are_worked_out_when_building() {
 }
 
 #[test]
+fn noise_runs_together_and_picks_the_same_numbers() {
+    // White, pink and brown noise in pools: each copy keeps its own
+    // generator, and takes the same numbers in the same order as alone.
+    let src = "
+        import \"@gen/noise\"
+        // Three generators in each copy, so the copies' generators are
+        // three apart.
+        rill colours() Sample {
+            return noise() * 0.2 + pink() + brown()
+        }
+        rill main() [Sample; 2] {
+            let white = sum([noise(); 16])
+            let colours = sum([pink(); 16]) + sum([brown(); 16]) + sum([colours(); 16])
+            return [white * 0.05, colours * 0.05]
+        }
+    ";
+    let (lanes, scalar) = same_either_way(src, 2, 20_000, &[]);
+    assert!(
+        lanes * 4 < scalar,
+        "{lanes} vs {scalar}: the noise did not run together"
+    );
+}
+
+#[test]
+fn noise_on_one_side_of_a_branch_keeps_its_numbers() {
+    // A copy that takes noise only some of the time must not move its
+    // generator on when it does not, so it is not run with the others.
+    let src = "
+        rill sometimes(every: Int) Sample {
+            state n: Int = 0
+            n = n + 1
+            return if n % every == 0 { noise() } else { 0 }
+        }
+        rill main() [Sample; 2] {
+            let x = sum(sometimes([2, 3, 5, 7]))
+            return [x, x]
+        }
+    ";
+    same_either_way(src, 2, 5_000, &[]);
+}
+
+#[test]
 fn delays_and_noise_in_voices_run_the_same_as_lanes() {
     // Every voice has its own line and its own noise, whether the voices run
     // one at a time or together.

@@ -1,0 +1,32 @@
+// Dynamics: changing a signal's level by its own level.
+
+import "@effects/env"
+
+// Follows the level of `x` (rising in `attack`, falling in `release`) and
+// turns it up or down by how far it is from `threshold`, in dB:
+//
+// - above the threshold, every dB over becomes `above` dB over: 1 leaves it
+//   alone, 0.25 is 4:1 compression, 0 is a limiter;
+// - below it, every dB under becomes `below` dB under: 1 leaves it alone, 2
+//   is 1:2 expansion, 100 is a gate.
+//
+// So `dynamics(x, -18dB, above: 0.25)` compresses,
+// `dynamics(x, -1dB, above: 0, attack: 1ms)` limits, and
+// `dynamics(x, -50dB, below: 100)` gates. For a hard clip, use `clamp`; for
+// soft saturation, `tanh`.
+export rill dynamics(
+    x: Sample,
+    threshold: Gain,
+    above: Float = 1,
+    below: Float = 1,
+    attack: Time = 10ms,
+    release: Time = 100ms,
+) Sample {
+    let level = slew(abs(x), attack, release)
+    let to_db = 20 / log(10)
+    let at = log(max(level, 0.000001)) * to_db
+    let t = log(amp(threshold)) * to_db
+    let slope = if at > t { above } else { below }
+    let change = (at - t) * (slope - 1)
+    return x * exp(change / to_db)
+}

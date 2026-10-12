@@ -79,7 +79,14 @@ fn rendering_does_not_allocate() {
 
 #[test]
 fn compiled_rill_programs_do_not_allocate() {
-    for name in ["sketch", "stereo", "polyphony", "sequencer"] {
+    for name in [
+        "sketch",
+        "stereo",
+        "polyphony",
+        "sequencer",
+        "delay",
+        "subtractive",
+    ] {
         let path = format!("{}/examples/{name}.rill", env!("CARGO_MANIFEST_DIR"));
         let src = std::fs::read_to_string(path).unwrap();
         let config = Config {
@@ -241,4 +248,50 @@ fn every_sequence_event_without_allocating() {
     });
     assert_eq!(count, 0);
     assert!(out.chunks(2).any(|f| f[1] > 0.0));
+}
+
+/// Delays, noise and the core library built on them, in a pool of voices.
+const DELAYS: &str = "
+import \"@gen/osc\"
+import \"@gen/noise\"
+import \"@effects/delay\"
+import \"@effects/filter\"
+import \"@effects/env\"
+import \"@effects/dynamics\"
+rill voice(n: Float) Sample {
+    let gate = square(2Hz * n)
+    let string = comb(noise() * ahdsr(gate, 1ms, 2ms, 5ms, 0, 5ms), 1 / (110Hz * n), feedback: 0.98, tone: 3kHz, max: 50ms)
+    let wobble = phasor(0.3Hz * n) |> as_sine()
+    let taps = delay(string, [5ms + wobble * 2ms, 11ms], max: 20ms)
+    let tone = lowpass(saw(55Hz * n), 800Hz + wobble * 400Hz, resonance: 0.5)
+    return sum(taps) + tone * ahdsr(gate) + pink() * 0.01 + noise() * 0.01
+}
+rill main() [Sample; 2] {
+    let voices = [voice(1), voice(1.5), voice(2), voice(3)]
+    let dry = sum(voices)
+    let wet = dry + comb(dry, 250ms, feedback: 0.4, tone: 2kHz)
+    let out = dynamics(wet, -18dB, above: 0.25)
+    return [out, out * 0.5]
+}
+";
+
+#[test]
+fn delays_and_noise_do_not_allocate() {
+    let config = Config {
+        sample_rate: 48_000,
+        max_frames: 64,
+        out_channels: 2,
+    };
+    let (graph, _) = rill::lang::load(DELAYS, &config, "main").unwrap();
+    let mut engine = Engine::new(graph, config).unwrap();
+    let mut out = vec![0.0f32; 2 * 1000];
+    let count = allocations_during(|| {
+        for _ in 0..20 {
+            engine.render_interleaved(&mut out);
+        }
+        engine.reset();
+        engine.render_interleaved(&mut out);
+    });
+    assert_eq!(count, 0);
+    assert!(out.iter().any(|&x| x != 0.0));
 }

@@ -439,12 +439,39 @@ rill main() Sample { return pad(110Hz) + saw(55Hz) * 0.1 }
 
 Two libraries come with the compiler, so every program has them wherever it runs.
 
-**The prelude** is what cannot be written in Rill, or would be much slower in it: the constants `PI`, `TAU` and `RATE`; maths (`sin`, `cos`, `tan`, `tanh`, `exp`, `log`, `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `wrap`, `min`, `max`, `clamp`); `sum` over frames of any size; `random`; the tunings (`equal`, `just`, `pythagorean`, `meantone`); and `level` and `amp`. It is always there and never imported.
+**The prelude** is what cannot be written in Rill, or would be much slower in it: the constants `PI`, `TAU` and `RATE`; maths (`sin`, `cos`, `tan`, `tanh`, `exp`, `log`, `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `wrap`, `min`, `max`, `clamp`); `sum` over frames of any size; `random`; the tunings (`equal`, `just`, `pythagorean`, `meantone`); `level` and `amp`; and two that keep state, so only rills can use them: `noise()` and `delay`. It is always there and never imported.
+
+**`noise()`** is a new random number in [-1, 1) every sample. Every call has its own sequence, seeded from the build's seed, so voices never share one and `--seed` repeats it.
+
+**`delay(x, time, max)`** is what `x` was `time` ago:
+
+- A frame of times reads several taps from one buffer and gives a frame back: `delay(x, [10ms + lfo * 2ms, 25ms], max: 30ms)`. Every time is a stream, each tap its own, read between samples so a moving time does not crackle. A time is held between one sample and `max`.
+- `max` is the buffer's length, set aside when the program is built, so it must be a constant: the one thing about a delay that cannot move. It can be left out when every time is a constant. A rill can pass its own parameter as `max`; it then has to be a constant where that rill is called.
+- Every call has its own buffer, as every rill call has its own state; a frame of channels gets one per channel.
+- Feedback goes through `state`, and whatever sits between the delay and the `state` is in the loop (it adds one sample to the loop's length):
+
+```rill
+rill echo(x: Sample, time: Time, feedback: Float) Sample {
+    state back: Sample = 0
+    let wet = delay(x + back, time)
+    back = lowpass(wet, 3kHz) * feedback
+    return x + wet
+}
+```
+
+**Most powerful first.** Core keeps one function where one can express another: `slew` is the one-pole filter, the smoother and the envelope follower; `dynamics` is the compressor, limiter, expander and gate; `comb` is the echo, the comb filter and the allpass. A plain convenience on top (`sine` for `phasor |> as_sine()`) stays only where it reads much better.
 
 **`core`** is the standard library: ordinary Rill modules, imported with `@` and their folder: `import "@gen/osc"`. Only core paths start with `@`, so they never clash with a file next to yours. Their sources are the files under `core/` in the compiler's repository, built into the compiler, so `core` is the same everywhere and never read from disk. A program compiled from a string, with no file, can import core too. `rill core` lists the modules and what they export; `rill core @gen/osc` prints one.
 
 - **`@gen`**: generators. `@gen/osc` has oscillators in two halves: `phasor(freq, offset)`, a ramp from 0 to 1 per cycle that says where in the cycle you are (not meant to be heard), and the shapes `as_sine`, `as_saw` and `as_square`, which turn a phase into a wave (the saw and square band-limited with `poly_blep`, which is exported for custom shapes). `sine`, `saw` and `square` are the two together: `saw(f)` is `phasor(f) |> as_saw()`. Anything done to the phase in between works for every shape: `warp(phase, width)` moves the middle of the cycle, which is pulse width on a square and a brighter, squeezed wave on a sine or saw.
-- **`@effects`** (to come): envelopes, filters, delays, reverbs, dynamics.
+- **`@gen/noise`**: `pink()` and `brown()` (white is `noise()`). Instruments, such as a plucked string, are made from these parts, not kept in core (`examples/delay.rill` builds one).
+- **`@effects/env`**: `slew(x, rise, fall)` (smoothing, following, one-pole lowpass) and `ahdsr(gate, attack, hold, decay, sustain, release)` (with `hold: 0s`, the default, an ADSR). Envelopes follow a gate: a `Float` above 0 while a note is held.
+- **`@effects/filter`**: `lowpass`, `highpass`, `bandpass`, `notch`, each `(x, cutoff, resonance)`: one state-variable filter, stable under any modulation.
+- **`@effects/dynamics`**: `dynamics(x, threshold, above, below, attack, release)`; `above: 0.25` is 4:1 compression, `above: 0` a limiter, `below: 100` a gate.
+- **`@effects/delay`**: `comb(x, time, feedback, blend, tone, max)`: an echo, a pitched comb, or an allpass (`blend: -feedback`).
+- **`@mix/stereo`**: `pan(x, position)` (equal power, -1 to 1) and `width(x, amount)`.
+- **`@util/control`**: `map`, `rising`, `sample_hold`.
+- Next: reverb and modulation effects (chorus, flanger, phaser) on `delay` and `comb`.
 
 ## Execution model
 

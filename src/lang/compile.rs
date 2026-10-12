@@ -170,6 +170,12 @@ impl Random {
         // The top 24 bits, exactly representable as an `f32` below 1.
         (z >> 40) as f32 / (1u64 << 24) as f32
     }
+
+    /// A seed for something that makes numbers while playing, such as
+    /// `noise()`, drawn from the same sequence.
+    pub fn seed(&self) -> u64 {
+        u64::from(self.next().to_bits()) << 32 | u64::from(self.next().to_bits())
+    }
 }
 
 impl<'a> Defs<'a> {
@@ -396,6 +402,8 @@ pub fn compile_instance(
             .chain(c.loop_ranges.into_iter().map(Some))
             .collect(),
         vectors: Vec::new(),
+        noises: c.noises,
+        delays: c.delays,
     };
     super::opt::optimize(&mut code);
     if defs.vectorize {
@@ -601,6 +609,10 @@ struct Compiler<'a> {
     /// The operator being compiled lines a shorter frame up with the inner
     /// layers of the longer one, not the outer ones.
     align_inner: bool,
+    /// Per `noise()` call compiled, its seed.
+    noises: Vec<u64>,
+    /// Per `delay` line, its length in samples.
+    delays: Vec<u32>,
 }
 
 type CResult<T> = Result<T, Diagnostic>;
@@ -645,6 +657,8 @@ impl<'a> Compiler<'a> {
             in_lanes: 0,
             loop_ranges: Vec::new(),
             align_inner: false,
+            noises: Vec::new(),
+            delays: Vec::new(),
         }
     }
 
@@ -2249,6 +2263,9 @@ impl<'a> Compiler<'a> {
     /// A direct call of a prelude function: arguments by position or name, with
     /// defaults for the rest.
     fn call_builtin(&mut self, span: Span, name: &str, args: &[Arg]) -> CResult<CVal> {
+        if name == "delay" {
+            return self.delay(span, args);
+        }
         let sigs = super::prelude::lookup(name);
         // Overloads are picked by argument count, as the checker did.
         let sig = match sigs.as_slice() {
@@ -2288,6 +2305,68 @@ impl<'a> Compiler<'a> {
         self.builtin(span, name, vals)
     }
 
+    /// `delay(x, time, max)`: a line per channel of `x`, read once per
+    /// time (tap) before this tick's input is written.
+    fn delay(&mut self, span: Span, args: &[Arg]) -> CResult<CVal> {
+        let arg = |name: &str, at: usize| {
+            args.iter()
+                .find(|a| a.name.as_ref().is_some_and(|n| n.name == name))
+                .or_else(|| args.get(at).filter(|a| a.name.is_none()))
+        };
+        let (Some(x), Some(time)) = (arg("x", 0), arg("time", 1)) else {
+            return Err(internal(span, "delay without its input or time"));
+        };
+        let x = self.expr(&x.value)?;
+        let times = self.expr(&time.value)?;
+        let to_samples = CVal::Scalar(Operand::Const(self.sample_rate));
+        let samples = self.zip2(Op2::Mul, &times, &to_samples)?;
+        // The longest time the line must hold, in samples.
+        // Parameters are constants or not depending on the caller, so this
+        // is only certain now.
+        let longest = match arg("max", 2) {
+            Some(max) => {
+                let v = self.expr(&max.value)?;
+                match const_of(v.scalar()) {
+                    Some(m) => m * self.sample_rate,
+                    None => return Err(Diagnostic::error(max.value.span, "`max` must be a constant, but here it changes while playing")
+                        .with_help("it sets the size of the delay's memory when the program is built; pass a fixed time")),
+                }
+            }
+            None => match samples.operands().iter().map(|o| const_of(*o)).collect::<Option<Vec<f32>>>() {
+                Some(ts) => ts.into_iter().fold(1.0, f32::max),
+                None => return Err(Diagnostic::error(time.value.span, "a delay whose time changes needs `max`, the longest it can be")
+                    .with_help("its memory is set aside when the program is built; as in `delay(x, time, max: 2s)`")),
+            },
+        };
+        let len = (longest.max(1.0).ceil() as u32).saturating_add(3);
+        let channel = |c: &mut Self, input: &CVal| -> CResult<CVal> {
+            let line = u16::try_from(c.delays.len())
+                .map_err(|_| Diagnostic::error(span, "too many delays"))?;
+            c.delays.push(len);
+            let mut taps = Vec::new();
+            for t in samples.operands() {
+                let dst = c.reg()?;
+                c.emit(Instr::DelayRead { dst, line, time: t });
+                taps.push(Operand::Reg(dst));
+            }
+            c.emit(Instr::DelayWrite {
+                line,
+                x: input.scalar(),
+            });
+            Ok(samples.reshape(taps))
+        };
+        match &x {
+            CVal::Frame(chans) => {
+                let mut out = Vec::new();
+                for ch in chans {
+                    out.push(channel(self, ch)?);
+                }
+                Ok(CVal::Frame(out))
+            }
+            _ => channel(self, &x),
+        }
+    }
+
     /// A prelude function applied to its arguments, in parameter order.
     fn builtin(&mut self, span: Span, name: &str, vals: Vec<CVal>) -> CResult<CVal> {
         if let Some(op) = Op1::builtin(name) {
@@ -2305,6 +2384,14 @@ impl<'a> Compiler<'a> {
                 self.zip2(Op2::Max, &size, &CVal::Scalar(Operand::Const(1e-6)))
             }
             ("amp", [x]) => Ok(x.clone()),
+            ("noise", []) => {
+                let source = u16::try_from(self.noises.len())
+                    .map_err(|_| Diagnostic::error(span, "too many `noise()` calls"))?;
+                self.noises.push(self.defs.random.seed());
+                let dst = self.reg()?;
+                self.emit(Instr::Noise { dst, source });
+                Ok(CVal::Scalar(Operand::Reg(dst)))
+            }
             ("random", []) => Ok(CVal::Scalar(Operand::Const(self.defs.random.next()))),
             ("random", [lo, hi]) => {
                 let r = CVal::Scalar(Operand::Const(self.defs.random.next()));

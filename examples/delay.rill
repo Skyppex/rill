@@ -1,0 +1,97 @@
+// Delays: `delay` reads back what a signal was a moment ago, from as many
+// taps as you like, each its own stream. Feedback goes through `state`, and
+// whatever sits between the delay and the `state` is in the loop.
+
+import "@gen/osc"
+import "@effects/delay"
+import "@effects/filter"
+import "@mix/stereo"
+import "@util/control"
+
+// A plucked string (Karplus–Strong), built from core: a short burst of
+// noise ringing in a delay loop one period long, with a lowpass in the loop
+// so the top fades first, as on a real string. It plucks when `gate` rises,
+// falls by 60 dB over `decay`, and `brightness` (0 to 1) is how much of the
+// top it keeps.
+rill pluck(
+    freq: Freq,
+    gate: Float,
+    decay: Time = 2s,
+    brightness: Float = 0.5,
+) Sample {
+    // Samples of noise still to put into the string.
+    state left: Float = 0
+
+    if rising(gate) {
+        left = RATE / freq
+    }
+
+    let burst = if left > 0 { noise() } else { 0.0 }
+    left = left - 1
+
+    // Each time round loses as much as `decay` asks for.
+    let feedback = exp(log(0.001) / (decay * freq))
+    // The loop's lowpass, from 8 to 256 times the pitch. It holds the wave
+    // back a little (about √2 / (2π · tone)), which would flatten the
+    // pitch, so the loop is shortened to make up for it.
+    let tone = freq * pow(2, 3 + clamp(brightness, 0, 1) * 5)
+    let period = 1 / freq - sqrt(2.0) / (TAU * tone)
+    return comb(burst, period, feedback, tone: tone, max: 50ms)
+}
+
+seq riff(step: 1/8, tempo: 100bpm, loop: true) { E4, G4, B4, _, D5, _, B4, G4 }
+
+rill string() Sample {
+    state pitch: Pitch = E4
+    state gate: Float = 0
+
+    on riff_note_on(note) claim {
+        pitch = note.pitch
+        gate = 1
+    }
+
+    on riff_note_off release {
+        gate = 0
+    }
+
+    return pluck(pitch |> equal, gate, decay: 1.5s, brightness: 0.4)
+}
+
+// A delay written out: each repeat goes through a bandpass that drifts, so
+// the echoes wander in colour as they fade.
+rill drifting_echo(x: Sample, time: Time, feedback: Float) Sample {
+    state back: Sample = 0
+    let wet = delay(x + back, time)
+    let drift = (phasor(0.1Hz) |> as_sine()) * 600Hz
+    back = bandpass(wet, 1.2kHz + drift, resonance: 0.3) * feedback
+    return wet
+}
+
+rill main(volume: Gain = -12dB) [Sample; 2] {
+    on start {
+        invoke riff
+    }
+
+    let dry = sum([string(); 4])
+
+    // A chorus: three taps on one line, each moving at its own speed.
+    let a = phasor(0.31Hz) |> as_sine()
+    let b = phasor(0.47Hz) |> as_sine()
+    let c = phasor(0.23Hz) |> as_sine()
+
+    let voices = delay(
+        dry,
+        [12ms + a * 3ms, 17ms + b * 4ms, 9ms + c * 2ms],
+        max: 25ms,
+    )
+
+    let chorus = pan(voices[0], -0.7) + pan(voices[1], 0.7) + pan(voices[2], 0)
+
+    // An echo a dotted eighth apart, darker with every repeat, on the left,
+    // and the drifting one a quarter apart on the right.
+    let left = comb(dry, 450ms, feedback: 0.45, tone: 2.5kHz)
+    let right = drifting_echo(dry, 600ms, 0.5)
+
+    let wet = chorus * 0.4 + [left, right] * 0.5
+    return [dry, dry] * 0.6 + wet + volume
+}

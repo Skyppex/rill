@@ -148,3 +148,292 @@ fn copies_keep_their_own_phase() {
     let same = render(&osc("saw(1kHz) - saw(1kHz)"), 48);
     assert!(same.iter().all(|&x| x == 0.0));
 }
+
+// ---- the intrinsics -------------------------------------------------------
+
+/// `main` returning `expr`, with the core modules `imports` imported.
+fn with(imports: &[&str], expr: &str) -> String {
+    let imports: String = imports
+        .iter()
+        .map(|m| format!("import \"{m}\"\n"))
+        .collect();
+    format!("{imports}rill main() Sample {{\n    return {expr}\n}}")
+}
+
+/// A one on the first sample, then zeros.
+const IMPULSE: &str = "
+rill impulse() Sample {
+    state first: Bool = true
+    let y = if first { 1 } else { 0 }
+    first = false
+    return y
+}
+";
+
+fn rms(out: &[f32]) -> f32 {
+    (out.iter().map(|x| x * x).sum::<f32>() / out.len() as f32).sqrt()
+}
+
+/// The level of a sine at `freq` after `filter` (an expression using `x`),
+/// relative to the sine, in dB, once it has settled.
+fn response(imports: &[&str], filter: &str, freq: f32) -> f32 {
+    let src = format!(
+        "{}\nrill main() Sample {{\n    let x = sine({freq}Hz)\n    return {filter}\n}}",
+        with(imports, "0").replace("rill main() Sample {\n    return 0\n}", "")
+    );
+    let src = format!("import \"@gen/osc\"\n{src}");
+    let out = render(&src, 48_000);
+    let tail = &out[24_000..];
+    20.0 * (rms(tail) / std::f32::consts::FRAC_1_SQRT_2).log10()
+}
+
+#[test]
+fn delay_reads_back_each_tap() {
+    let src = format!(
+        "{IMPULSE}\nrill main() Sample {{\n    let taps = delay(impulse(), [3 / RATE, 5.5 / RATE])\n    return taps[0] * 10 + taps[1]\n}}"
+    );
+    let out = render(&src, 8);
+    assert_eq!(out, [0.0, 0.0, 0.0, 10.0, 0.0, 0.5, 0.5, 0.0]);
+}
+
+#[test]
+fn every_delay_has_its_own_memory() {
+    // Two calls, two lines; a stereo input, a line per channel.
+    let src = format!(
+        "{IMPULSE}\nrill main() Sample {{\n    let a = delay(impulse(), 2 / RATE)\n    let b = delay(impulse() * 3, 2 / RATE)\n    let s = delay([impulse(), impulse() * 5], 1 / RATE)\n    return a + b * 10 + s[1] * 100\n}}"
+    );
+    assert_eq!(render(&src, 4), [0.0, 500.0, 31.0, 0.0]);
+}
+
+#[test]
+fn moving_delays_need_a_constant_max() {
+    let errs = |body: &str| {
+        lang::compile(&format!("rill main() Sample {{\n    {body}\n}}"))
+            .err()
+            .map(|d| d[0].message.clone())
+    };
+    assert_eq!(
+        errs("return delay(1, 10ms + noise() * 1ms)").as_deref(),
+        Some("a delay whose time changes needs `max`, the longest it can be")
+    );
+    assert_eq!(
+        errs("return delay(1, 10ms, max: noise() * 1s)").as_deref(),
+        Some("`max` must be a constant")
+    );
+    assert_eq!(
+        errs("return delay(1, 10ms + noise() * 1ms, max: 20ms)"),
+        None
+    );
+    // A rill passing its parameter on is fine when its caller passes a
+    // constant, and an error at build time otherwise.
+    let pass = "rill d(x: Sample, m: Time) Sample { return delay(x, 1ms, max: m) }\n";
+    assert!(lang::compile(&format!("{pass}rill main() Sample {{ return d(1, 5ms) }}")).is_ok());
+    let config = rill::Config {
+        sample_rate: 48_000,
+        max_frames: 64,
+        out_channels: 1,
+    };
+    let moving = format!("{pass}rill main() Sample {{ return d(1, 5ms + noise() * 1ms) }}");
+    let errs = lang::load(&moving, &config, "main").err().unwrap();
+    assert!(
+        errs[0].message.starts_with("`max` must be a constant"),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn delays_keep_state_so_only_rills_use_them() {
+    let msg = |src: &str| lang::compile(src).unwrap_err()[0].message.clone();
+    assert_eq!(
+        msg("fn f(x: Float) Float { noise() }\nrill main() Sample { return 0 }"),
+        "`noise` keeps state between samples, so only a rill can use it"
+    );
+    assert_eq!(
+        msg("rill main() Sample {\n    let d = delay\n    return 0\n}"),
+        "`delay` keeps state between samples, so it cannot be used as a value"
+    );
+    assert_eq!(
+        msg("const N = noise()\nrill main() Sample { return 0 }"),
+        "the value of `N` must be a constant"
+    );
+}
+
+#[test]
+fn noise_is_new_every_sample() {
+    let out = render(&with(&[], "noise()"), 48_000);
+    assert!(out.iter().all(|x| (-1.0..1.0).contains(x)));
+    let mean = out.iter().sum::<f32>() / out.len() as f32;
+    assert!(mean.abs() < 0.01, "{mean}");
+    // Uniform in [-1, 1): an RMS of 1/√3.
+    assert!((rms(&out) - 0.577).abs() < 0.01, "{}", rms(&out));
+    // Two calls are two sequences.
+    let two = render(&with(&[], "noise() - noise()"), 100);
+    assert!(two.iter().any(|&x| x != 0.0));
+}
+
+// ---- the core modules -----------------------------------------------------
+
+#[test]
+fn noise_colours() {
+    for (name, lo, hi) in [("pink()", 0.05, 0.4), ("brown()", 0.05, 0.6)] {
+        let out = render(&with(&["@gen/noise"], name), 96_000);
+        let level = rms(&out[48_000..]);
+        assert!((lo..hi).contains(&level), "{name}: {level}");
+        assert!(out.iter().all(|x| x.abs() < 1.5), "{name}");
+    }
+}
+
+#[test]
+fn filters_respond_where_they_should() {
+    let f = &["@effects/filter"];
+    // 3 dB down at the cutoff, flat well below, falling 12 dB per octave
+    // well above.
+    let at = response(f, "lowpass(x, 1kHz)", 1000.0);
+    assert!((at + 3.0).abs() < 0.5, "{at}");
+    assert!(response(f, "lowpass(x, 1kHz)", 100.0).abs() < 0.2);
+    let above = response(f, "lowpass(x, 1kHz)", 8000.0);
+    assert!(above < -30.0, "{above}");
+    let high = response(f, "highpass(x, 1kHz)", 100.0);
+    assert!(high < -30.0, "{high}");
+    assert!(response(f, "highpass(x, 1kHz)", 10000.0).abs() < 0.5);
+    assert!(response(f, "notch(x, 1kHz, resonance: 0.5)", 1000.0) < -30.0);
+    // Resonance makes a peak.
+    assert!(response(f, "lowpass(x, 1kHz, resonance: 0.9)", 1000.0) > 10.0);
+}
+
+#[test]
+fn a_swept_resonant_filter_stays_finite() {
+    let src = "import \"@gen/osc\"\nimport \"@effects/filter\"\nrill main() Sample {\n    let sweep = phasor(30Hz) * 20000Hz\n    return lowpass(saw(110Hz), sweep, resonance: 1)\n}";
+    let out = render(src, 48_000);
+    assert!(out.iter().all(|x| x.is_finite() && x.abs() < 100.0));
+}
+
+#[test]
+fn envelopes_take_their_times() {
+    // A gate open for 0.5s: attack 10ms, decay to 0.5, release 100ms.
+    let src = "import \"@effects/env\"\nrill main() Sample {\n    state t: Float = 0\n    t = t + 1 / RATE / 1s\n    let gate = if t < 0.5 { 1.0 } else { 0.0 }\n    return ahdsr(gate, 10ms, 0s, 100ms, 0.5, 100ms)\n}";
+    let out = render(src, 36_000);
+    let reached = out.iter().position(|&x| x >= 1.0).unwrap();
+    assert!((470..=490).contains(&reached), "{reached}");
+    assert!((out[23_000] - 0.5).abs() < 0.01, "{}", out[23_000]);
+    // 60 dB below the sustain 100ms after the gate closes.
+    let after = out[24_000 + 4_800];
+    assert!((after - 0.0005).abs() < 0.0002, "{after}");
+    // A hold keeps it at 1 for 50ms before the decay starts.
+    let src =
+        "import \"@effects/env\"\nrill main() Sample { return ahdsr(1, 10ms, 50ms, 100ms, 0.5) }";
+    let out = render(src, 4_000);
+    let top = out.iter().position(|&x| x >= 1.0).unwrap();
+    assert!(out[top..top + 2_400].iter().all(|&x| x == 1.0));
+    assert!(out[top + 2_400 + 10] < 1.0);
+    // `slew` gets 99.9% of the way in its time.
+    let src = "import \"@effects/env\"\nrill main() Sample { return slew(1, 10ms, 10ms) }";
+    let out = render(src, 481);
+    assert!((out[479] - 0.999).abs() < 0.001, "{}", out[479]);
+}
+
+#[test]
+fn dynamics_move_levels() {
+    let d = &["@effects/dynamics"];
+    // 4:1 above -20dB: a sine at -2dB (18 dB over) comes out 4.5 dB over.
+    let level = response(d, "dynamics(x * amp(-2dB), -20dB, above: 0.25)", 440.0);
+    assert!((level + 15.5).abs() < 1.0, "{level}");
+    // A limiter holds the level at its threshold.
+    let level = response(d, "dynamics(x, -12dB, above: 0, attack: 1ms)", 440.0);
+    assert!((level + 12.0).abs() < 1.0, "{level}");
+    // A gate shuts out what is below its threshold.
+    let level = response(d, "dynamics(x * amp(-60dB), -40dB, below: 100)", 440.0);
+    assert!(level < -120.0, "{level}");
+    // Nothing changes with both slopes at 1.
+    let level = response(d, "dynamics(x, -20dB)", 440.0);
+    assert!(level.abs() < 0.1, "{level}");
+}
+
+#[test]
+fn echoes_repeat_and_fade() {
+    let src = format!(
+        "import \"@effects/delay\"\n{IMPULSE}\nrill main() Sample {{\n    return comb(impulse(), 10ms, feedback: 0.5)\n}}"
+    );
+    let out = render(&src, 2000);
+    // Repeats every 480 samples, each half the last.
+    assert_eq!(out[480], 1.0);
+    assert_eq!(out[960], 0.5);
+    assert_eq!(out[1440], 0.25);
+    assert_eq!(out[1920], 0.125);
+    // And nothing in between.
+    assert_eq!(out.iter().filter(|&&x| x != 0.0).count(), 4);
+}
+
+#[test]
+fn an_allpass_keeps_every_level() {
+    let level = response(
+        &["@effects/delay"],
+        "comb(x, 7ms, feedback: 0.6, blend: -0.6)",
+        300.0,
+    );
+    assert!(level.abs() < 0.2, "{level}");
+    let level = response(
+        &["@effects/delay"],
+        "comb(x, 7ms, feedback: 0.6, blend: -0.6)",
+        2777.0,
+    );
+    assert!(level.abs() < 0.2, "{level}");
+}
+
+/// The pitch of `out` (between 50Hz and 1kHz), from the lag at which it
+/// best matches itself, refined between samples.
+fn pitch(out: &[f32]) -> f32 {
+    let corr = |lag: usize| -> f32 { out.iter().zip(&out[lag..]).map(|(a, b)| a * b).sum() };
+    let (lo, hi) = ((RATE / 1000.0) as usize, (RATE / 50.0) as usize);
+    let best = (lo..hi)
+        .max_by(|&a, &b| corr(a).total_cmp(&corr(b)))
+        .unwrap();
+    let (a, b, c) = (corr(best - 1), corr(best), corr(best + 1));
+    let shift = 0.5 * (a - c) / (a - 2.0 * b + c);
+    RATE / (best as f32 + shift)
+}
+
+#[test]
+fn a_comb_rings_at_its_pitch() {
+    for freq in [110.0f32, 220.0, 440.0] {
+        let src = format!(
+            "import \"@effects/delay\"\n{IMPULSE}\nrill main() Sample {{\n    return comb(impulse(), 1 / {freq}Hz, feedback: 0.99)\n}}"
+        );
+        let out = render(&src, 24_000);
+        let p = pitch(&out[4_800..]);
+        let cents = 1200.0 * (p / freq).log2();
+        assert!(cents.abs() < 5.0, "{freq}: {p} ({cents} cents)");
+    }
+}
+
+#[test]
+fn pan_keeps_the_power() {
+    let src = |pos: f32| {
+        format!("import \"@mix/stereo\"\nrill main() [Sample; 2] {{\n    return pan(1, {pos})\n}}")
+    };
+    for pos in [-1.0f32, -0.3, 0.0, 0.5, 1.0] {
+        let config = rill::Config {
+            sample_rate: 48_000,
+            max_frames: 64,
+            out_channels: 2,
+        };
+        let (graph, _) = lang::load(&src(pos), &config, "main").unwrap();
+        let mut engine = Engine::new(graph, config).unwrap();
+        let out = offline::render(&mut engine, 1, &Blocks::Fixed(64));
+        assert!(
+            (out[0] * out[0] + out[1] * out[1] - 1.0).abs() < 1e-5,
+            "{pos}: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn control_helpers() {
+    let u = &["@util/control"];
+    assert_eq!(render(&with(u, "map(0.5, -1, 1, 0, 10)"), 1)[0], 7.5);
+    // `rising` once per rise; `sample_hold` keeps what it caught.
+    let src = "import \"@util/control\"\nimport \"@gen/osc\"\nrill main() Sample {\n    let clock = square(1kHz)\n    return sample_hold(phasor(100Hz), clock)\n}";
+    let out = render(src, 480);
+    let changes = out.windows(2).filter(|w| w[0] != w[1]).count();
+    assert!((9..=11).contains(&changes), "{changes}");
+}

@@ -1,0 +1,19 @@
+// Placing sound between two speakers.
+
+// `x` placed at `position`: -1 is hard left, 0 the middle, 1 hard right.
+// Equal power, so it sounds as loud wherever it is. `pan(1, position)` is
+// the pair of gains, to use on something already stereo. A frame of voices
+// gets a pair each: `voices |> pan([-0.5, 0, 0.5])`.
+export rill pan(x: Sample, position: Float = 0) [Sample; 2] {
+    let angle = (clamp(position, -1, 1) + 1) * PI / 4
+    return [x * cos(angle), x * sin(angle)]
+}
+
+// Makes a stereo signal wider or narrower: 0 is mono, 1 leaves it as it is,
+// 2 is twice as wide. Scales the difference between the channels and keeps
+// what they share.
+export rill width(x: [Sample; 2], amount: Float = 1) [Sample; 2] {
+    let mid = (x[0] + x[1]) * 0.5
+    let side = (x[0] - x[1]) * 0.5 * amount
+    return [mid + side, mid - side]
+}

@@ -1,0 +1,33 @@
+// A delay loop: the delay intrinsic with feedback, a filter in the loop, and
+// a blend of what goes in. One loop, many effects:
+//
+// - an echo: `x + comb(x, 375ms, feedback: 0.5, tone: 3kHz)`;
+// - a comb filter that rings at a pitch: `comb(x, 1 / 220Hz, feedback: 0.95)`;
+// - an allpass, the building block of reverbs and phasers:
+//   `comb(x, 7ms, feedback: g, blend: -g)`.
+//
+// For a delay without feedback, or with several taps, use `delay` itself.
+
+import "@effects/filter"
+
+// What went in `time` ago, fed back at `feedback` (each pass that much
+// quieter) through a lowpass at `tone`, plus `blend` times what goes in
+// now. `tone` at half the sample rate or above filters nothing (the
+// default). `max` is the longest `time` can be.
+export rill comb(
+    x: Sample,
+    time: Time,
+    feedback: Float = 0.5,
+    blend: Float = 0,
+    tone: Freq = 100kHz,
+    max: Time = 2s,
+) Sample {
+    // What went into the loop `time` ago.
+    state back: Sample = 0
+    let looped = if tone < RATE / 2 { lowpass(back, tone) } else { back }
+    let w = x + looped * feedback
+    let y = back + w * blend
+    // `back` is read on the next sample, so it is taken one sample early.
+    back = delay(w, time - 1 / RATE, max: max)
+    return y
+}

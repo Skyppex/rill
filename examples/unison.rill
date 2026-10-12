@@ -3,6 +3,8 @@
 // frames, and `sum` mixes them down to one.
 
 import "@gen/osc"
+import "@effects/filter"
+import "@mix/stereo"
 
 rill saw_no_blep(freq: Freq, phase_offset: Float = 0) Sample {
     state phase: Float = 0
@@ -21,17 +23,16 @@ rill bright(freq: Freq, phase_offset: Float = 0) Sample {
     )
 }
 
-// Equal-power panning: 0 is hard left, 1 hard right.
-rill pan(x: Sample, pos: Float) [Sample; 2] {
-    let angle = pos * PI / 2
-    return [x * cos(angle), x * sin(angle)]
-}
-
 rill unison_pan<N>(voices: [Sample; N]) [[Sample; 2]; N] {
     let out: [[Sample; 2]; N]
 
     for i in 0..N {
-        let pos = if N == 1 { 0.5 } else { i as Float / (N - 1) as Float }
+        let pos = if N == 1 {
+            0.0
+        } else {
+            i as Float / (N - 1) as Float * 2 - 1
+        }
+
         out[i] = pan(voices[i], pos)
     }
 
@@ -61,16 +62,6 @@ rill unison<N>(pitch: Freq, spread: Interval) [Freq; N] {
     }
 
     return pitches
-}
-
-rill lowpass(x: Sample, cutoff: Freq) Sample {
-    state y = 0.0
-
-    let alpha = 1.0 - exp(-2.0 * PI * cutoff / RATE)
-
-    y += alpha * (x - y)
-
-    return y
 }
 
 rill gain(x: Sample, gain: Gain) Sample {

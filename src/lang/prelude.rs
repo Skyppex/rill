@@ -91,6 +91,19 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         "amp" => vec![sig(&[("gain", Type::Gain)], Type::Float)],
         // A number picked when the program is built.
         "random" => vec![sig(&[], Type::Float), sig(&[("lo", s()), ("hi", s())], s())],
+        // A new number every sample.
+        "noise" => vec![sig(&[], Type::Sample)],
+        // As written for documentation; the checker gives `delay` its own
+        // rule, as `time` can be a frame of taps and `x` a frame of
+        // channels.
+        "delay" => vec![sig(
+            &[
+                ("x", Type::Sample),
+                ("time", Type::Time),
+                ("max", Type::Time),
+            ],
+            Type::Sample,
+        )],
         _ => Vec::new(),
     }
 }
@@ -100,8 +113,16 @@ pub fn default_value(name: &str, param: &str) -> Option<f32> {
     match (name, param) {
         ("equal", "steps") => Some(12.0),
         ("equal" | "just" | "pythagorean" | "meantone", "a4") => Some(440.0),
+        // Worked out from the times when they are constants.
+        ("delay", "max") => Some(0.0),
         _ => None,
     }
+}
+
+/// Prelude functions that keep something between samples, as a rill does:
+/// only rills can call them, and they are not values or constants.
+pub fn keeps_state(name: &str) -> bool {
+    matches!(name, "noise" | "delay")
 }
 
 /// Prelude functions that accept a frame in their first parameter and return one
@@ -162,6 +183,12 @@ pub fn doc(name: &str) -> Option<&'static str> {
             "The level of an amplitude, as a `Gain`: `level(1)` is 0dB. Silence is held at -120dB instead of -inf."
         }
         "amp" => "The amplitude factor of a level: `amp(-6dB)` is about 0.5.",
+        "noise" => {
+            "A new random number in [-1, 1) every sample: white noise. Every call has its own sequence, so two voices never share one; the same `--seed` plays the same noise."
+        }
+        "delay" => {
+            "What `x` was `time` ago. With a frame of times, several taps from one buffer, each its own stream: `delay(x, [10ms + lfo * 2ms, 25ms])`. Reads between samples are interpolated, so a moving time does not crackle. `max` is the longest any time can be, which sets the buffer's size when the program is built; it can be left out when the times are constants. A frame of channels gets a buffer each. Feed back through `state` for echoes and combs."
+        }
         "random" => {
             "A random number in [0, 1), or in [`lo`, `hi`) of any number type (levels are picked \
              evenly in dB). Each `random()` in the program picks its own number once, when the \
@@ -199,6 +226,8 @@ pub const FUNCTIONS: &[&str] = &[
     "pythagorean",
     "meantone",
     "random",
+    "noise",
+    "delay",
 ];
 
 #[cfg(test)]

@@ -1,0 +1,35 @@
+// Small tools for control signals: moving a range, catching an edge, and
+// holding a value.
+
+// `x` moved from the range `from_lo`..`from_hi` to `to_lo`..`to_hi`,
+// straight across. Turns -1..1 into 0..1 (`map(x, -1, 1, 0, 1)`), picks a
+// point between two values (`map(t, 0, 1, a, b)`), or anything in between.
+export fn map(
+    x: Float,
+    from_lo: Float,
+    from_hi: Float,
+    to_lo: Float,
+    to_hi: Float,
+) Float {
+    to_lo + (x - from_lo) / (from_hi - from_lo) * (to_hi - to_lo)
+}
+
+// True on the one sample where `x` goes from 0 or below to above 0: a note
+// starting, a gate opening, a clock ticking.
+export rill rising(x: Float) Bool {
+    state last: Float = 0
+    let rose = x > 0 && last <= 0
+    last = x
+    return rose
+}
+
+// `x` as it was when `trigger` last went above 0, held until it does again.
+export rill sample_hold(x: Float, trigger: Float) Float {
+    state held: Float = 0
+
+    if rising(trigger) {
+        held = x
+    }
+
+    return held
+}

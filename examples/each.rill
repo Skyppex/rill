@@ -11,6 +11,8 @@
 // printed at the start) to hear a run again.
 
 import "@gen/osc"
+import "@effects/filter"
+import "@mix/stereo"
 
 // A slow wave from 0 to 1.
 rill lfo(rate: Freq, offset: Float = 0) Float {
@@ -24,12 +26,6 @@ rill duck(x: Sample, depth: Float) Sample {
     return x * (1 - depth)
 }
 
-// Equal-power panning: 0 is hard left, 1 hard right.
-rill pan(x: Sample, pos: Float) [Sample; 2] {
-    let angle = pos * PI / 2
-    return [x * cos(angle), x * sin(angle)]
-}
-
 // `N` pitches spread evenly across `width`, centred on `pitch`.
 rill spread<N>(pitch: Freq, width: Interval) [Freq; N] {
     let pitches: [Freq; N]
@@ -40,13 +36,6 @@ rill spread<N>(pitch: Freq, width: Interval) [Freq; N] {
     }
 
     return pitches
-}
-
-rill lowpass(x: Sample, cutoff: Freq) Sample {
-    state y = 0.0
-    let alpha = 1.0 - exp(-2.0 * PI * cutoff / RATE)
-    y += alpha * (x - y)
-    return y
 }
 
 seq changes(meter: 4/4, step: 1/1, tempo: 120bpm, gate: 1, velocity: 1) {
@@ -97,7 +86,7 @@ rill pad() [Sample; 2] {
 
     // Every saw also gets its own place in the stereo field, making
     // `[[[Sample; 2]; 8]; 3]`.
-    let stereo = moving |> pan(each random(lo: 0.15, hi: 0.85))
+    let stereo = moving |> pan(each random(lo: -0.7, hi: 0.7))
 
     return (stereo |> sum) * level
 }
@@ -126,7 +115,7 @@ rill pluck() [Sample; 2] {
     let moving = shaped
         |> duck(each lfo(random(lo: 0.1Hz, hi: 0.4Hz), offset: random()) * 0.6)
 
-    let stereo = moving |> pan(each random(lo: 0.15, hi: 0.85))
+    let stereo = moving |> pan(each random(lo: -0.7, hi: 0.7))
 
     return (stereo |> sum) * level
 }

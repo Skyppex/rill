@@ -3,24 +3,16 @@
 // Pure function on one value. Auto-lifted over streams and channels.
 
 import "@gen/osc"
+import "@effects/env"
 
 fn abs(x: Sample) Sample {
     if x < 0 { -x } else { x }
 }
 
-// Stateful 1:1 rill. Body runs once per tick.
+// Stateful 1:1 rill. Body runs once per tick. Jumps up to the level of `x`
+// and falls by 60 dB over `release`.
 rill peak(x: Sample, release: Time = 300ms) Sample {
-    state level: Sample = 0
-    let a = abs(x)
-
-    // Falls by 60 dB (to 0.001) over `release`.
-    level = if a > level {
-        a
-    } else {
-        level * exp(log(0.001) / (release * RATE))
-    }
-
-    return level
+    return slew(abs(x), 0s, release)
 }
 
 // Composition with pipes.

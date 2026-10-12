@@ -54,8 +54,11 @@ pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(u16)) {
         | Instr::Tune { dst, .. }
         | Instr::Copy { dst, .. }
         | Instr::Select { dst, .. }
-        | Instr::LoadCapture { dst, .. } => f(dst),
-        Instr::JumpUnless { .. }
+        | Instr::LoadCapture { dst, .. }
+        | Instr::Noise { dst, .. }
+        | Instr::DelayRead { dst, .. } => f(dst),
+        Instr::DelayWrite { .. }
+        | Instr::JumpUnless { .. }
         | Instr::Jump { .. }
         | Instr::InvokeSeq { .. }
         | Instr::InvokeEvent { .. }
@@ -95,9 +98,12 @@ pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(u16)) {
         Instr::InvokeEvent { values, .. } => values.into_iter().for_each(op),
         Instr::Halt { id, .. } => id.into_iter().for_each(op),
         Instr::SetSlot { value, .. } => op(value),
+        Instr::DelayRead { time, .. } => op(time),
+        Instr::DelayWrite { x, .. } => op(x),
         Instr::Jump { .. }
         | Instr::InvokeSeq { .. }
         | Instr::LoadCapture { .. }
+        | Instr::Noise { .. }
         | Instr::Vector { .. } => {}
     }
 }

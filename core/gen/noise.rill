@@ -1,0 +1,23 @@
+// Noise colours. White noise is `noise()` from the prelude: equal energy at
+// every frequency, a hiss. These take energy away from the top.
+
+// Pink noise: 3 dB less per octave, so every octave has the same energy;
+// a rain-like sound. Paul Kellet's three-pole approximation.
+export rill pink() Sample {
+    state b0: Float = 0
+    state b1: Float = 0
+    state b2: Float = 0
+    let w = noise()
+    b0 = 0.99765 * b0 + w * 0.099046
+    b1 = 0.963 * b1 + w * 0.2965164
+    b2 = 0.57 * b2 + w * 1.0526913
+    return (b0 + b1 + b2 + w * 0.1848) * 0.12
+}
+
+// Brown noise: 6 dB less per octave; a low rumble. White noise summed up,
+// leaking slowly back toward 0 so it never drifts away.
+export rill brown() Sample {
+    state y: Float = 0
+    y = (y + noise() * 0.02) / 1.02
+    return y * 3.5
+}

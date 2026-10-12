@@ -1,0 +1,49 @@
+// Filters, all one state-variable filter (Zavalishin's and Simper's
+// trapezoidal form): stable however fast `cutoff` and `resonance` move, so
+// they can be swept by envelopes and LFOs every sample.
+//
+// Each is 12 dB per octave. `resonance` goes from 0 (no peak: a lowpass is
+// 3 dB down at `cutoff`) to 1 (a sharp peak that rings). `cutoff` is kept
+// between 1Hz and just below half the sample rate.
+//
+// A gentler 6 dB lowpass is `slew` in `@effects/env`.
+
+// The filter's three outputs, `[lowpass, bandpass, highpass]`.
+rill svf(x: Sample, cutoff: Freq, resonance: Float) [Sample; 3] {
+    state ic1: Float = 0
+    state ic2: Float = 0
+    let f = clamp(cutoff, 1Hz, RATE * 0.49)
+    let g = tan(PI * f / RATE)
+    // Damping: √2 is flat (no peak), near 0 rings.
+    let k = sqrt(2.0) - (sqrt(2.0) - 0.01) * clamp(resonance, 0, 1)
+    let a1 = 1 / (1 + g * (g + k))
+    let a2 = g * a1
+    let a3 = g * a2
+    let v3 = x - ic2
+    let v1 = a1 * ic1 + a2 * v3
+    let v2 = ic2 + a2 * ic1 + a3 * v3
+    ic1 = 2 * v1 - ic1
+    ic2 = 2 * v2 - ic2
+    return [v2, v1, x - k * v1 - v2]
+}
+
+// Passes what is below `cutoff`.
+export rill lowpass(x: Sample, cutoff: Freq, resonance: Float = 0) Sample {
+    return svf(x, cutoff, resonance)[0]
+}
+
+// Passes what is above `cutoff`. At 10Hz it removes a constant offset.
+export rill highpass(x: Sample, cutoff: Freq, resonance: Float = 0) Sample {
+    return svf(x, cutoff, resonance)[2]
+}
+
+// Passes what is near `cutoff`; more resonance narrows it.
+export rill bandpass(x: Sample, cutoff: Freq, resonance: Float = 0) Sample {
+    return svf(x, cutoff, resonance)[1]
+}
+
+// Removes what is near `cutoff`; more resonance narrows the notch.
+export rill notch(x: Sample, cutoff: Freq, resonance: Float = 0) Sample {
+    let y = svf(x, cutoff, resonance)
+    return y[0] + y[2]
+}

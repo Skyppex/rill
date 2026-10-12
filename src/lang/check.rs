@@ -213,6 +213,7 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         exported,
         modules: program.modules.clone(),
         module: 0,
+        params_const: false,
         used_from: HashSet::new(),
         signatures: Vec::new(),
         types: vec![Type::Error; program.expr_count as usize],
@@ -409,6 +410,9 @@ struct Checker {
     modules: Modules,
     /// The module being checked.
     module: usize,
+    /// Count parameters as constants in [`Checker::is_const`]; see
+    /// [`Checker::could_be_const`].
+    params_const: bool,
     /// (user, declarer): a module uses something another module declares.
     used_from: HashSet<(usize, usize)>,
     signatures: Vec<Signature>,
@@ -2480,6 +2484,19 @@ impl Checker {
             },
         );
         let kind = sigs[0].kind;
+        let in_fn_body = self.current.is_some() || self.lambda_floor.is_some();
+        if def.is_none() && prelude::keeps_state(name) && self.place == Place::Fn && in_fn_body {
+            let d = self
+                .error(
+                    callee.span,
+                    format!("`{name}` keeps state between samples, so only a rill can use it"),
+                )
+                .with_help("fns are pure; make this a rill");
+            self.report(d);
+        }
+        if def.is_none() && name == "delay" {
+            return self.delay(span, args);
+        }
         if kind == DefKind::Rill && self.place == Place::Fn {
             let d = if self.lambda_floor.is_some() {
                 self.error(callee.span, format!("an anonymous fn cannot call rill `{name}`"))
@@ -3198,6 +3215,132 @@ impl Checker {
         }
     }
 
+    /// `delay(x, time, max)`: `x` a number or a frame of channels, `time` a
+    /// `Time` or a frame of taps, `max` a constant `Time` (needed when a
+    /// time moves). One sample back per tap, per channel.
+    fn delay(&mut self, span: Span, args: &[Arg]) -> Type {
+        self.no_each(args, "`delay` takes its frames as they are");
+        let names = ["x", "time", "max"];
+        let mut given: [Option<&Expr>; 3] = [None; 3];
+        for (i, a) in args.iter().enumerate() {
+            let slot = match &a.name {
+                Some(n) => match names.iter().position(|p| *p == n.name) {
+                    Some(k) => k,
+                    None => {
+                        let e = self
+                            .error(n.span, format!("`delay` has no parameter `{}`", n.name))
+                            .with_help("it takes `x`, `time` and `max`");
+                        self.report(e);
+                        self.expr(&a.value);
+                        continue;
+                    }
+                },
+                None if i < 3 => i,
+                None => {
+                    let e = self.error(a.value.span, "`delay` takes 3 arguments at most");
+                    self.report(e);
+                    self.expr(&a.value);
+                    continue;
+                }
+            };
+            if given[slot].replace(&a.value).is_some() {
+                let e = self.error(a.value.span, format!("`{}` is given twice", names[slot]));
+                self.report(e);
+            }
+        }
+        let (Some(x), Some(time)) = (given[0], given[1]) else {
+            for e in given.iter().flatten() {
+                self.expr(e);
+            }
+            let e = self
+                .error(span, "`delay` needs what to delay and how long")
+                .with_help("as in `delay(x, 250ms)`");
+            self.report(e);
+            return Type::Error;
+        };
+        let tx = self.expr(x);
+        let tt = self.expr(time);
+        let mut broken = tx.is_wild() || tt.is_wild();
+        // Channels of the input, and the type of one.
+        let (channels, elem) = match &tx {
+            Type::Frame(e, n) if e.is_plain() => (Some(n.clone()), (**e).clone()),
+            t if t.is_plain() => (None, t.clone()),
+            t if !t.is_wild() => {
+                let e = self
+                    .error(
+                        x.span,
+                        format!("`delay` delays numbers or a frame of them, not `{t}`"),
+                    )
+                    .with_help("delay each part on its own");
+                self.report(e);
+                broken = true;
+                (None, Type::Error)
+            }
+            _ => (None, Type::Error),
+        };
+        let elem = if elem == Type::Num {
+            Type::Sample
+        } else {
+            elem
+        };
+        // Taps.
+        let taps = match &tt {
+            Type::Time => None,
+            Type::Frame(e, n) if **e == Type::Time => Some(n.clone()),
+            t if !t.is_wild() => {
+                let e = self
+                    .error(time.span, format!("a delay time is a `Time`, or a frame of them for several taps, not `{t}`"))
+                    .with_help("as in `250ms`, or `[125ms, 250ms]`");
+                self.report(e);
+                broken = true;
+                None
+            }
+            _ => None,
+        };
+        match given[2] {
+            Some(max) => {
+                let tm = self.expr(max);
+                if !tm.is_wild() && tm != Type::Time {
+                    let e = mismatch(max.span, "`max`", &Type::Time, &tm);
+                    self.report(e);
+                } else if !self.could_be_const(max) {
+                    let e = self
+                        .error(max.span, "`max` must be a constant")
+                        .with_help("it sets the size of the delay's memory, which is fixed when the program is built; the times can move up to it");
+                    self.report(e);
+                }
+            }
+            None if !broken && !self.could_be_const(time) => {
+                let e = self
+                    .error(time.span, "a delay whose time changes needs `max`, the longest it can be")
+                    .with_help("its memory is set aside when the program is built, so it needs to know how long; as in `delay(x, time, max: 2s)`");
+                self.report(e);
+            }
+            None => {}
+        }
+        if broken {
+            return Type::Error;
+        }
+        let tapped = match taps {
+            Some(n) => Type::Frame(Box::new(elem), n),
+            None => elem,
+        };
+        match channels {
+            Some(n) => Type::Frame(Box::new(tapped), n),
+            None => tapped,
+        }
+    }
+
+    /// Constant, or made only of constants and parameters, which are
+    /// constants when the caller passes them: worked out for certain when
+    /// the program is built.
+    fn could_be_const(&mut self, e: &Expr) -> bool {
+        self.params_const = true;
+        let yes = self.is_const(e);
+        self.params_const = false;
+        yes
+    }
+
     /// Record that the current definition uses `name`, for the recursion
     /// check.
     fn note_use(&mut self, name: &str, at: Span) {
@@ -3307,6 +3450,18 @@ impl Checker {
         };
         self.resolve(span, r);
         let kind = sigs[0].kind;
+        if kind == DefKind::Prelude && prelude::keeps_state(name) {
+            let d = self
+                .error(
+                    span,
+                    format!(
+                        "`{name}` keeps state between samples, so it cannot be used as a value"
+                    ),
+                )
+                .with_help(format!("call it where it is needed, as in `{name}(...)`"));
+            self.report(d);
+            return Type::Error;
+        }
         if kind == DefKind::Rill {
             let d = self
                 .error(span, format!("rill `{name}` cannot be used as a value"))
@@ -3517,14 +3672,17 @@ impl Checker {
             ExprKind::Frame(xs) => xs.iter().all(|x| self.is_const(x)),
             ExprKind::Repeat(x, _) => self.is_const(x),
             ExprKind::Name(n) => match self.lookup(n) {
-                Some(v) => matches!(v.kind, VarKind::Size | VarKind::Const),
+                Some(v) => {
+                    matches!(v.kind, VarKind::Size | VarKind::Const)
+                        || (self.params_const && v.kind == VarKind::Param)
+                }
                 None => {
                     self.const_named(n).is_some()
                         || prelude::constant(n).is_some()
                         || pitch_literal(n).is_some()
                         // A named fn is a fixed value.
                         || self.def_named(n).is_some_and(|i| self.signatures[i].kind == DefKind::Fn)
-                        || !prelude::lookup(n).is_empty()
+                        || (!prelude::lookup(n).is_empty() && !prelude::keeps_state(n))
                 }
             },
             ExprKind::Call { callee, args, .. } => {
@@ -3532,6 +3690,7 @@ impl Checker {
                 self.lookup(name).is_none()
                     && self.def_named(name).is_none()
                     && !prelude::lookup(name).is_empty()
+                    && !prelude::keeps_state(name)
                     && args.iter().all(|a| self.is_const(&a.value))
             }
             ExprKind::Field(base, _) => self.seq_of(base).is_some(),

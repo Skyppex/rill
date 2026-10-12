@@ -95,6 +95,23 @@ pub enum Instr {
     Vector {
         block: u32,
     },
+    /// `dst` = the next number in [-1, 1) from noise generator `source`.
+    Noise {
+        dst: u16,
+        source: u16,
+    },
+    /// `dst` = what was written to delay line `line` `time` samples ago,
+    /// interpolated between samples. Reads come before the tick's write.
+    DelayRead {
+        dst: u16,
+        line: u16,
+        time: Operand,
+    },
+    /// Write this tick's input to delay line `line`, after its reads.
+    DelayWrite {
+        line: u16,
+        x: Operand,
+    },
 }
 
 /// The copies of a voice pool run together: each instruction does the same
@@ -469,6 +486,11 @@ pub struct Code {
     pub lane_ranges: Vec<Option<Vec<(u32, u32)>>>,
     /// Copies of pools that run together, by [`Instr::Vector`].
     pub vectors: Vec<VectorBlock>,
+    /// Per noise generator ([`Instr::Noise`]), its seed.
+    pub noises: Vec<u64>,
+    /// Per delay line ([`Instr::DelayRead`]), its length in samples,
+    /// allocated when the program is built.
+    pub delays: Vec<u32>,
 }
 
 /// What a handler handles.
@@ -653,6 +675,11 @@ fn list(s: &mut String, instrs: &[Instr]) {
                 op(value)
             ),
             Instr::Vector { block } => format!("vector block {block}"),
+            Instr::Noise { dst, source } => format!("r{dst} = noise {source}"),
+            Instr::DelayRead { dst, line, time } => {
+                format!("r{dst} = delay {line} read {}", op(time))
+            }
+            Instr::DelayWrite { line, x } => format!("delay {line} write {}", op(x)),
         };
         let _ = writeln!(s, "{pc:4}: {line}");
     }
@@ -756,6 +783,10 @@ struct Run {
     /// Per sequence, a bit per [`EventKind`] that some handler hears from
     /// it; the others are not delivered at all.
     wanted: Vec<u16>,
+    /// Per noise generator, its state.
+    noise: Vec<u64>,
+    /// Per delay line, its samples and where the next write goes.
+    delays: Vec<(Box<[f32]>, usize)>,
 }
 
 impl Run {
@@ -893,6 +924,12 @@ impl Program {
                 picks: vec![(0, None); code.pools.len()],
                 delivery: 0,
                 wanted,
+                noise: code.noises.clone(),
+                delays: code
+                    .delays
+                    .iter()
+                    .map(|&n| (vec![0.0; n.max(3) as usize].into_boxed_slice(), 0))
+                    .collect(),
             },
             code,
             tick,
@@ -1518,6 +1555,42 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
     }
 }
 
+/// The next noise sample, in [-1, 1): SplitMix64.
+fn next_noise(state: &mut u64) -> f32 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    // The top 24 bits, exactly representable as an `f32`.
+    (z >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+}
+
+/// What was written `t` samples before the next write at `at`, linearly
+/// interpolated. `t` is held between 1 and the line's length less one.
+fn read_delay(data: &[f32], at: usize, t: f32) -> f32 {
+    let len = data.len();
+    let t = if t.is_finite() {
+        t.clamp(1.0, (len - 2) as f32)
+    } else {
+        1.0
+    };
+    // A time a hair off a whole number of samples (as `10ms * RATE` can be
+    // in floating point) reads that sample exactly.
+    let t = if (t - t.round()).abs() < 1e-3 {
+        t.round()
+    } else {
+        t
+    };
+    let whole = t.floor();
+    let frac = t - whole;
+    let back = whole as usize;
+    let index = |back: usize| (at + len - back) % len;
+    let a = data[index(back)];
+    let b = data[index(back + 1)];
+    a + (b - a) * frac
+}
+
 /// Run one instruction the general way; a jump's target if it jumps.
 fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
     let regs = &mut run.regs[..];
@@ -1583,6 +1656,20 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
                 .get(usize::from(index))
                 .copied()
                 .unwrap_or(0.0);
+        }
+        Instr::Noise { dst, source } => {
+            regs[dst as usize] = next_noise(&mut run.noise[usize::from(source)]);
+        }
+        Instr::DelayRead { dst, line, time } => {
+            let t = val(regs, time);
+            let (data, at) = &run.delays[usize::from(line)];
+            regs[dst as usize] = read_delay(data, *at, t);
+        }
+        Instr::DelayWrite { line, x } => {
+            let x = val(regs, x);
+            let (data, at) = &mut run.delays[usize::from(line)];
+            data[*at] = x;
+            *at = if *at + 1 == data.len() { 0 } else { *at + 1 };
         }
         Instr::SetSlot {
             seq,
@@ -1774,6 +1861,11 @@ impl Node for Program {
         run.fresh = -1;
         run.picks.fill((0, None));
         run.delivery = 0;
+        run.noise.copy_from_slice(&self.code.noises);
+        for (line, at) in &mut run.delays {
+            line.fill(0.0);
+            *at = 0;
+        }
     }
 
     fn handle_event(

@@ -643,6 +643,12 @@ fn rename(code: &mut Code, map: &HashMap<u16, u16>) {
         }
         Instr::LoadCapture { dst, .. } => r(dst),
         Instr::SetSlot { value, .. } => op(value),
+        Instr::Noise { dst, .. } => r(dst),
+        Instr::DelayRead { dst, time, .. } => {
+            r(dst);
+            op(time);
+        }
+        Instr::DelayWrite { x, .. } => op(x),
         Instr::Jump { .. } | Instr::InvokeSeq { .. } | Instr::Vector { .. } => {}
     };
     for i in code

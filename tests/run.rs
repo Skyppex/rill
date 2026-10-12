@@ -2185,3 +2185,21 @@ fn consts_are_worked_out_when_building() {
     let want = RATE as f32 / 2.0 / 1000.0 + 440.0 + 880.0 + 1.0;
     close(&render(src, 2), &[want, want], 1e-3);
 }
+
+#[test]
+fn delays_and_noise_in_voices_run_the_same_as_lanes() {
+    // Every voice has its own line and its own noise, whether the voices run
+    // one at a time or together.
+    let src = "
+        import \"@effects/delay\"
+        rill voice(n: Float) Sample {
+            let d = delay(noise() * 0.1, [3ms * n, 7ms], max: 30ms)
+            return sum(d) + comb(noise() * 0.1, 1 / (110Hz * n), feedback: 0.9, tone: 2kHz, max: 50ms)
+        }
+        rill main() [Sample; 2] {
+            let v = [voice(1), voice(2), voice(3), voice(4)]
+            return [v[0] + v[1], v[2] - v[3]]
+        }
+    ";
+    same_either_way(src, 2, 4_000, &[]);
+}

@@ -205,24 +205,36 @@ fn every_delay_has_its_own_memory() {
     assert_eq!(render(&src, 4), [0.0, 500.0, 31.0, 0.0]);
 }
 
+/// The warnings from checking `src`.
+fn warnings(src: &str) -> Vec<String> {
+    match lang::compile(src) {
+        Ok((_, checked)) => checked.warnings.into_iter().map(|d| d.message).collect(),
+        Err(d) => panic!("{d:#?}"),
+    }
+}
+
 #[test]
-fn moving_delays_need_a_constant_max() {
-    let errs = |body: &str| {
-        lang::compile(&format!("rill main() Sample {{\n    {body}\n}}"))
-            .err()
-            .map(|d| d[0].message.clone())
-    };
+fn a_moving_delay_should_say_its_max() {
+    let main = |body: &str| format!("rill main() Sample {{\n    {body}\n}}");
     assert_eq!(
-        errs("return delay(1, 10ms + noise() * 1ms)").as_deref(),
-        Some("a delay whose time changes needs `max`, the longest it can be")
+        warnings(&main("return delay(1, 10ms + noise() * 1ms)")),
+        ["`time` changes while playing, but `max` is not given"]
     );
-    assert_eq!(
-        errs("return delay(1, 10ms, max: noise() * 1s)").as_deref(),
-        Some("`max` must be a constant")
+    assert!(warnings(&main("return delay(1, 10ms + noise() * 1ms, max: 20ms)")).is_empty());
+    assert!(warnings(&main("return delay(1, 10ms)")).is_empty());
+    // Without `max`, a moving delay still works, holding up to 2s.
+    let out = render(
+        &format!(
+            "{IMPULSE}\n{}",
+            main("return delay(impulse(), 1.5s + noise() * 0s)")
+        ),
+        72_001,
     );
+    assert_eq!(out[72_000], 1.0);
+    // `max` itself must be a constant.
     assert_eq!(
-        errs("return delay(1, 10ms + noise() * 1ms, max: 20ms)"),
-        None
+        lang::compile(&main("return delay(1, 10ms, max: noise() * 1s)")).unwrap_err()[0].message,
+        "`max` must be a constant"
     );
     // A rill passing its parameter on is fine when its caller passes a
     // constant, and an error at build time otherwise.
@@ -239,6 +251,83 @@ fn moving_delays_need_a_constant_max() {
         errs[0].message.starts_with("`max` must be a constant"),
         "{errs:?}"
     );
+}
+
+#[test]
+fn any_max_parameter_warns_the_same_way() {
+    // A rill of your own with a `max` gets the same warning.
+    let src = "rill wobble(x: Sample, time: Time, max: Time = 1s) Sample { return delay(x, time, max: max) }\nrill main() Sample { return wobble(1, 5ms + noise() * 1ms) }";
+    assert_eq!(
+        warnings(src),
+        ["`time` changes while playing, but `max` is not given"]
+    );
+    let src = "import \"@effects/filter\"\nrill main() Sample { return lowpass(noise(), 1kHz, slope: 24dB / 1oct + noise() * (12dB / 1oct)) }";
+    assert_eq!(
+        warnings(src),
+        ["`slope` changes while playing, but `max` is not given"]
+    );
+}
+
+#[test]
+fn slopes_are_levels_over_intervals() {
+    // 6dB over 6 semitones is 12 dB per octave.
+    let v = |e: &str| render(&with(&[], &format!("({e}) / (1dB / 1oct)")), 1)[0];
+    assert!((v("6dB / 6st") - 12.0).abs() < 1e-4, "{}", v("6dB / 6st"));
+    assert!((v("24dB / 1oct") - 24.0).abs() < 1e-4);
+    assert!((v("12dB / 1oct * 2 + 6dB / 1oct") - 30.0).abs() < 1e-4);
+    // A slope over an interval is a level again: 12 dB/oct over 2 octaves.
+    let g = render(&with(&[], "amp(12dB / 1oct * 2oct)"), 1)[0];
+    assert!((g - 10f32.powf(24.0 / 20.0)).abs() < 1e-3, "{g}");
+    // A plain number is not a slope.
+    let errs = lang::compile(
+        "import \"@effects/filter\"\nrill main() Sample { return lowpass(0, 1kHz, slope: 24) }",
+    )
+    .unwrap_err();
+    assert!(errs[0].message.contains("Slope"), "{errs:?}");
+}
+
+#[test]
+fn filters_fall_as_steeply_as_their_slope() {
+    let f = &["@effects/filter"];
+    for slope in [6.0f32, 12.0, 18.0, 24.0, 48.0] {
+        // Well above the cutoff (and well below half the sample rate,
+        // where the filter falls faster still), each octave falls by the
+        // slope.
+        let filter = format!("lowpass(x, 300Hz, slope: {slope}dB / 1oct)");
+        let one = response(f, &filter, 900.0);
+        let two = response(f, &filter, 1800.0);
+        let fall = one - two;
+        assert!((fall - slope).abs() < 1.5, "{slope}: {fall} dB per octave");
+        let high = format!("highpass(x, 3kHz, slope: {slope}dB / 1oct)");
+        let fall = response(f, &high, 1000.0) - response(f, &high, 500.0);
+        assert!(
+            (fall - slope).abs() < 1.5,
+            "highpass {slope}: {fall} dB per octave"
+        );
+    }
+    // Between whole poles, between their slopes.
+    let fall = |slope: f32| {
+        let filter = format!("lowpass(x, 300Hz, slope: {slope}dB / 1oct)");
+        response(f, &filter, 900.0) - response(f, &filter, 1800.0)
+    };
+    let mid = fall(21.0);
+    assert!(mid > fall(18.0) && mid < fall(24.0), "{mid}");
+    // Resonance rings at every slope from two poles up.
+    for slope in [12.0f32, 24.0, 48.0] {
+        let peak = response(
+            f,
+            &format!("lowpass(x, 1kHz, resonance: 0.9, slope: {slope}dB / 1oct)"),
+            1000.0,
+        );
+        assert!(peak > 6.0, "{slope}: {peak}");
+    }
+}
+
+#[test]
+fn a_moving_slope_stays_finite() {
+    let src = "import \"@gen/osc\"\nimport \"@effects/filter\"\nrill main() Sample {\n    let s = phasor(7Hz) * 96dB / 1oct\n    let c = 200Hz + phasor(3Hz) * 8kHz\n    return lowpass(saw(110Hz), c, resonance: 0.9, slope: s, max: 96dB / 1oct)\n}";
+    let out = render(src, 48_000);
+    assert!(out.iter().all(|x| x.is_finite() && x.abs() < 100.0));
 }
 
 #[test]

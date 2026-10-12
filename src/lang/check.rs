@@ -386,6 +386,10 @@ struct Var {
     ty: Type,
     kind: VarKind,
     id: BindingId,
+    /// A `let` holding something made of constants and parameters, never
+    /// assigned since: known when the program is built (see
+    /// [`Checker::could_be_const`]).
+    fixed: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1588,6 +1592,7 @@ impl Checker {
             "Time" => Type::Time,
             "Interval" => Type::Interval,
             "Gain" => Type::Gain,
+            "Slope" => Type::Slope,
             other => {
                 const KNOWN: [&str; 9] = [
                     "Sample", "Float", "Int", "Bool", "Freq", "Pitch", "Time", "Interval", "Gain",
@@ -1626,6 +1631,7 @@ impl Checker {
                     ty: Type::Num,
                     kind: VarKind::Size,
                     id,
+                    fixed: false,
                 },
             );
         }
@@ -1636,6 +1642,7 @@ impl Checker {
                     ty: p.ty.clone(),
                     kind: VarKind::Param,
                     id,
+                    fixed: false,
                 },
             );
         }
@@ -1731,7 +1738,15 @@ impl Checker {
         self.scopes
             .last_mut()
             .expect("a scope is always open")
-            .insert(name.name.clone(), Var { ty, kind, id });
+            .insert(
+                name.name.clone(),
+                Var {
+                    ty,
+                    kind,
+                    id,
+                    fixed: false,
+                },
+            );
     }
 
     fn lookup(&self, name: &str) -> Option<&Var> {
@@ -1770,7 +1785,13 @@ impl Checker {
                     }
                     None => t.clone(),
                 };
+                let fixed = value.as_ref().is_some_and(|v| self.could_be_const(v));
                 self.bind(name, bound, VarKind::Let, span.end);
+                if fixed
+                    && let Some(var) = self.scopes.last_mut().and_then(|s| s.get_mut(&name.name))
+                {
+                    var.fixed = true;
+                }
                 (Type::Unit, t == Type::Never)
             }
             Stmt::Const(decl) => {
@@ -1846,6 +1867,14 @@ impl Checker {
                 if let Some(var) = self.lookup(&name.name) {
                     let id = var.id;
                     self.resolve(name.span, Resolution::Binding(id));
+                }
+                if let Some(var) = self
+                    .scopes
+                    .iter_mut()
+                    .rev()
+                    .find_map(|s| s.get_mut(&name.name))
+                {
+                    var.fixed = false;
                 }
                 let captured = matches!(
                     (self.lambda_floor, self.lookup_depth(&name.name)),
@@ -2159,7 +2188,7 @@ impl Checker {
                         );
                         self.report(d);
                     }
-                    if !self.is_const(expr) {
+                    if !self.could_be_const(expr) {
                         let d = self
                             .error(
                                 expr.span,
@@ -2630,6 +2659,7 @@ impl Checker {
         if !ok {
             return Type::Error;
         }
+        self.warn_missing_max(name, &sig, args, &slots);
 
         // Unify argument types with parameter types. A rill whose parameter
         // receives a value with more frame layers runs once per element of
@@ -3311,9 +3341,8 @@ impl Checker {
                 }
             }
             None if !broken && !self.could_be_const(time) => {
-                let e = self
-                    .error(time.span, "a delay whose time changes needs `max`, the longest it can be")
-                    .with_help("its memory is set aside when the program is built, so it needs to know how long; as in `delay(x, time, max: 2s)`");
+                let e = Diagnostic::warning(time.span, "`time` changes while playing, but `max` is not given")
+                    .with_help("`max` is the most `time` will be, fixed when the program is built; without it, `delay` holds up to 2s");
                 self.report(e);
             }
             None => {}
@@ -3328,6 +3357,53 @@ impl Checker {
         match channels {
             Some(n) => Type::Frame(Box::new(tapped), n),
             None => tapped,
+        }
+    }
+
+    /// A parameter called `max` is the ceiling for the arguments of its type,
+    /// sizing something when the program is built (a delay's memory, a
+    /// filter's stages). When one of those arguments changes while playing
+    /// and `max` is left out, the call falls back on `max`'s default, which
+    /// the programmer should choose instead.
+    fn warn_missing_max(
+        &mut self,
+        name: &str,
+        sig: &Signature,
+        args: &[Arg],
+        slots: &[Option<usize>],
+    ) {
+        let Some(m) = sig.params.iter().position(|p| p.name == "max") else {
+            return;
+        };
+        if slots[m].is_some() {
+            return;
+        }
+        let leaf = |t: &Type| -> Type {
+            let mut t = t;
+            while let Type::Frame(e, _) = t {
+                t = e;
+            }
+            t.clone()
+        };
+        let ceiling = leaf(&sig.params[m].ty);
+        for (p, slot) in sig.params.iter().zip(slots) {
+            let Some(ai) = *slot else { continue };
+            if p.name == "max" || leaf(&p.ty) != ceiling {
+                continue;
+            }
+            let arg = &args[ai].value;
+            if !self.could_be_const(arg) {
+                let d = Diagnostic::warning(
+                    arg.span,
+                    format!("`{}` changes while playing, but `max` is not given", p.name),
+                )
+                .with_help(format!(
+                    "`max` is the most `{}` will be, fixed when the program is built; without it, `{name}` uses its default",
+                    p.name
+                ));
+                self.report(d);
+                return;
+            }
         }
     }
 
@@ -3579,6 +3655,7 @@ impl Checker {
                     ty: ty.clone(),
                     kind: VarKind::Param,
                     id,
+                    fixed: false,
                 },
             );
             param_types.push(ty);
@@ -3674,7 +3751,7 @@ impl Checker {
             ExprKind::Name(n) => match self.lookup(n) {
                 Some(v) => {
                     matches!(v.kind, VarKind::Size | VarKind::Const)
-                        || (self.params_const && v.kind == VarKind::Param)
+                        || (self.params_const && (v.kind == VarKind::Param || v.fixed))
                 }
                 None => {
                     self.const_named(n).is_some()
@@ -3685,6 +3762,15 @@ impl Checker {
                         || (!prelude::lookup(n).is_empty() && !prelude::keeps_state(n))
                 }
             },
+            ExprKind::Call { callee, args, .. }
+                if callee.name == "fixed"
+                    && self.lookup("fixed").is_none()
+                    && self.def_named("fixed").is_none() =>
+            {
+                // `x` if it is a constant, otherwise `otherwise`: constant
+                // whenever `otherwise` is.
+                args.get(1).is_some_and(|a| self.is_const(&a.value))
+            }
             ExprKind::Call { callee, args, .. } => {
                 let name = callee.name.as_str();
                 self.lookup(name).is_none()
@@ -3820,6 +3906,7 @@ fn unit_example(t: &Type) -> &'static str {
     match t {
         Type::Freq => "440Hz",
         Type::Time => "300ms",
+        Type::Slope => "24dB / 1oct",
         _ => "7st",
     }
 }
@@ -4216,6 +4303,15 @@ fn arith(op: BinOp, a: &Type, b: &Type) -> Result<Type, OpError> {
         return zip_types(a, b, inner, &|x, y| arith(op, x, y));
     }
 
+    // Levels over intervals: `12dB / 1oct` is a `Slope`, and a slope over
+    // an interval is a level again.
+    match (op, a, b) {
+        (BinOp::Div, Type::Gain, Type::Interval) => return Ok(Type::Slope),
+        (BinOp::Mul, Type::Slope, Type::Interval) | (BinOp::Mul, Type::Interval, Type::Slope) => {
+            return Ok(Type::Gain);
+        }
+        _ => {}
+    }
     if *a == Type::Gain || *b == Type::Gain {
         return gain_arith(op, a, b);
     }

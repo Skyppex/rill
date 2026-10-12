@@ -93,6 +93,7 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         "random" => vec![sig(&[], Type::Float), sig(&[("lo", s()), ("hi", s())], s())],
         // A new number every sample.
         "noise" => vec![sig(&[], Type::Sample)],
+        "fixed" => vec![sig(&[("x", s()), ("otherwise", s())], s())],
         // As written for documentation; the checker gives `delay` its own
         // rule, as `time` can be a frame of taps and `x` a frame of
         // channels.
@@ -183,6 +184,9 @@ pub fn doc(name: &str) -> Option<&'static str> {
             "The level of an amplitude, as a `Gain`: `level(1)` is 0dB. Silence is held at -120dB instead of -inf."
         }
         "amp" => "The amplitude factor of a level: `amp(-6dB)` is about 0.5.",
+        "fixed" => {
+            "`x` if it is a constant when the program is built, otherwise `otherwise` (which must be one): `fixed(slope, 48dB / 1oct)`. For sizing what has to exist before audio starts, such as a filter's stages, from a parameter that may or may not move."
+        }
         "noise" => {
             "A new random number in [-1, 1) every sample: white noise. Every call has its own sequence, so two voices never share one; the same `--seed` plays the same noise."
         }
@@ -226,6 +230,7 @@ pub const FUNCTIONS: &[&str] = &[
     "pythagorean",
     "meantone",
     "random",
+    "fixed",
     "noise",
     "delay",
 ];

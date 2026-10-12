@@ -76,7 +76,7 @@ rill main(depth: Freq = 20Hz) Sample {
 }
 ```
 
-Literals carry units: `440Hz`, `120bpm`, `300ms`, `2s`, `+7st`, `+50cents`, `-6dB`, `3/2`. A tempo is a frequency, so `120bpm` is `2Hz`. Units convert to samples using the host rate at build time.
+Literals carry units: `440Hz`, `120bpm`, `300ms`, `2s`, `+7st`, `+50cents`, `1oct` (`12st`), `-6dB`, `3/2`. A tempo is a frequency, so `120bpm` is `2Hz`. Units convert to samples using the host rate at build time.
 
 ## Type system
 
@@ -91,6 +91,7 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `Freq`, `Time` | Unit-carrying numbers | Convert to samples via the host rate |
 | `Pitch`, `Interval` | Abstract musical values | Turned into `Freq` by a tuning (see Pitch) |
 | `Gain` | A level change, written in `dB` | Any plain number is an amplitude factor (see Levels) |
+| `Slope` | A level over an interval: `24dB / 1oct` | `Gain / Interval`; stored in dB per octave, so `6dB / 6st` is `12dB / 1oct`. Times an `Interval`, a `Gain` again |
 | `fn(A, B) R` | A function value | See Functions as values |
 
 Plain numbers convert with `as`: `x as Float`, `x as Sample`, `x as Int` (which truncates toward zero). `as` binds tighter than arithmetic, so `a + b as Int` casts only `b`. Units and levels never disappear by a cast: `freq / 1Hz` gives a plain number, and `amp(g)` the factor of a level.
@@ -446,7 +447,7 @@ Two libraries come with the compiler, so every program has them wherever it runs
 **`delay(x, time, max)`** is what `x` was `time` ago:
 
 - A frame of times reads several taps from one buffer and gives a frame back: `delay(x, [10ms + lfo * 2ms, 25ms], max: 30ms)`. Every time is a stream, each tap its own, read between samples so a moving time does not crackle. A time is held between one sample and `max`.
-- `max` is the buffer's length, set aside when the program is built, so it must be a constant: the one thing about a delay that cannot move. It can be left out when every time is a constant. A rill can pass its own parameter as `max`; it then has to be a constant where that rill is called.
+- `max` is the buffer's length, set aside when the program is built, so it must be a constant: the one thing about a delay that cannot move. Constant times are their own `max`. Moving times without one are a warning, and the delay holds up to 2s. A rill can pass its own parameter as `max`; it then has to be a constant where that rill is called.
 - Every call has its own buffer, as every rill call has its own state; a frame of channels gets one per channel.
 - Feedback goes through `state`, and whatever sits between the delay and the `state` is in the loop (it adds one sample to the loop's length):
 
@@ -459,6 +460,8 @@ rill echo(x: Sample, time: Time, feedback: Float) Sample {
 }
 ```
 
+**A parameter called `max`** is the ceiling for the arguments of its type: what has to exist before audio starts (a delay's memory, a filter's stages) is sized for it. When an argument of that type changes while playing and `max` is left out, the checker warns, and the call uses `max`'s default. This holds for any rill, not only the prelude's and core's. `fixed(x, otherwise)` (prelude) is `x` when it is a constant once the program is built, otherwise `otherwise`: how a rill picks such a size from a parameter that may or may not move.
+
 **Most powerful first.** Core keeps one function where one can express another: `slew` is the one-pole filter, the smoother and the envelope follower; `dynamics` is the compressor, limiter, expander and gate; `comb` is the echo, the comb filter and the allpass. A plain convenience on top (`sine` for `phasor |> as_sine()`) stays only where it reads much better.
 
 **`core`** is the standard library: ordinary Rill modules, imported with `@` and their folder: `import "@gen/osc"`. Only core paths start with `@`, so they never clash with a file next to yours. Their sources are the files under `core/` in the compiler's repository, built into the compiler, so `core` is the same everywhere and never read from disk. A program compiled from a string, with no file, can import core too. `rill core` lists the modules and what they export; `rill core @gen/osc` prints one.
@@ -466,7 +469,7 @@ rill echo(x: Sample, time: Time, feedback: Float) Sample {
 - **`@gen`**: generators. `@gen/osc` has oscillators in two halves: `phasor(freq, offset)`, a ramp from 0 to 1 per cycle that says where in the cycle you are (not meant to be heard), and the shapes `as_sine`, `as_saw` and `as_square`, which turn a phase into a wave (the saw and square band-limited with `poly_blep`, which is exported for custom shapes). `sine`, `saw` and `square` are the two together: `saw(f)` is `phasor(f) |> as_saw()`. Anything done to the phase in between works for every shape: `warp(phase, width)` moves the middle of the cycle, which is pulse width on a square and a brighter, squeezed wave on a sine or saw.
 - **`@gen/noise`**: `pink()` and `brown()` (white is `noise()`). Instruments, such as a plucked string, are made from these parts, not kept in core (`examples/delay.rill` builds one).
 - **`@effects/env`**: `slew(x, rise, fall)` (smoothing, following, one-pole lowpass) and `ahdsr(gate, attack, hold, decay, sustain, release)` (with `hold: 0s`, the default, an ADSR). Envelopes follow a gate: a `Float` above 0 while a note is held.
-- **`@effects/filter`**: `lowpass`, `highpass`, `bandpass`, `notch`, each `(x, cutoff, resonance)`: one state-variable filter, stable under any modulation.
+- **`@effects/filter`**: `lowpass`, `highpass`, `bandpass`, `notch`, each `(x, cutoff, resonance, slope, max)`, built from state-variable stages that stay stable under any modulation. `slope` is a stream (`24dB / 1oct`; a slope between whole poles blends the two nearest); `max` is the steepest it will be, which sets how many stages are built.
 - **`@effects/dynamics`**: `dynamics(x, threshold, above, below, attack, release)`; `above: 0.25` is 4:1 compression, `above: 0` a limiter, `below: 100` a gate.
 - **`@effects/delay`**: `comb(x, time, feedback, blend, tone, max)`: an echo, a pitched comb, or an allpass (`blend: -feedback`).
 - **`@mix/stereo`**: `pan(x, position)` (equal power, -1 to 1) and `width(x, amount)`.

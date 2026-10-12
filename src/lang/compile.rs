@@ -835,10 +835,35 @@ impl<'a> Compiler<'a> {
         va: &CVal,
         vb: &CVal,
     ) -> CResult<CVal> {
-        let (ga, gb) = (
-            is_gain(&self.types[a.id as usize]),
-            is_gain(&self.types[b.id as usize]),
+        let (ta, tb, te) = (
+            &self.types[a.id as usize],
+            &self.types[b.id as usize],
+            &self.types[e.id as usize],
         );
+        // A slope is dB per octave; a gain is an amplitude factor and an
+        // interval is in semitones.
+        let db_per_ln = 20.0 / std::f32::consts::LN_10;
+        if leaf(te) == &Type::Slope && leaf(ta) == &Type::Gain {
+            // 20·log10(gain) / semitones · 12
+            let db = self.map1(Op1::Log, va)?;
+            let db = self.zip2(
+                Op2::Mul,
+                &db,
+                &CVal::Scalar(Operand::Const(db_per_ln * 12.0)),
+            )?;
+            return self.zip2(Op2::Div, &db, vb);
+        }
+        if leaf(te) == &Type::Gain && (leaf(ta) == &Type::Slope || leaf(tb) == &Type::Slope) {
+            // 10^(slope · semitones / 12 / 20)
+            let both = self.zip2(Op2::Mul, va, vb)?;
+            let ln = self.zip2(
+                Op2::Mul,
+                &both,
+                &CVal::Scalar(Operand::Const(1.0 / 12.0 / db_per_ln)),
+            )?;
+            return self.map1(Op1::Exp, &ln);
+        }
+        let (ga, gb) = (is_gain(ta), is_gain(tb));
         if ga || gb {
             return self.gain_binary(op, va, vb, ga, gb, &self.types[e.id as usize]);
         }
@@ -2332,10 +2357,16 @@ impl<'a> Compiler<'a> {
                         .with_help("it sets the size of the delay's memory when the program is built; pass a fixed time")),
                 }
             }
-            None => match samples.operands().iter().map(|o| const_of(*o)).collect::<Option<Vec<f32>>>() {
+            // Constant times are their own ceiling; moving ones without a
+            // `max` (a warning) get the default.
+            None => match samples
+                .operands()
+                .iter()
+                .map(|o| const_of(*o))
+                .collect::<Option<Vec<f32>>>()
+            {
                 Some(ts) => ts.into_iter().fold(1.0, f32::max),
-                None => return Err(Diagnostic::error(time.value.span, "a delay whose time changes needs `max`, the longest it can be")
-                    .with_help("its memory is set aside when the program is built; as in `delay(x, time, max: 2s)`")),
+                None => DEFAULT_DELAY_MAX * self.sample_rate,
             },
         };
         let len = (longest.max(1.0).ceil() as u32).saturating_add(3);
@@ -2384,6 +2415,15 @@ impl<'a> Compiler<'a> {
                 self.zip2(Op2::Max, &size, &CVal::Scalar(Operand::Const(1e-6)))
             }
             ("amp", [x]) => Ok(x.clone()),
+            // `x` when it is a constant now that the program is built,
+            // `otherwise` when it changes while playing.
+            ("fixed", [x, otherwise]) => {
+                if x.operands().iter().all(|o| const_of(*o).is_some()) {
+                    Ok(x.clone())
+                } else {
+                    Ok(otherwise.clone())
+                }
+            }
             ("noise", []) => {
                 let source = u16::try_from(self.noises.len())
                     .map_err(|_| Diagnostic::error(span, "too many `noise()` calls"))?;
@@ -2416,6 +2456,18 @@ impl<'a> Compiler<'a> {
         }
     }
 }
+
+/// The type of one element of `t`, however deep its frames.
+fn leaf(t: &Type) -> &Type {
+    match t {
+        Type::Frame(elem, _) => leaf(elem),
+        t => t,
+    }
+}
+
+/// How long a delay whose time moves can be when it is not given a `max`,
+/// in seconds.
+const DEFAULT_DELAY_MAX: f32 = 2.0;
 
 /// A `Gain`, or a frame of them.
 fn is_gain(t: &Type) -> bool {

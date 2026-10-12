@@ -1,21 +1,28 @@
-// Filters, all one state-variable filter (Zavalishin's and Simper's
-// trapezoidal form): stable however fast `cutoff` and `resonance` move, so
-// they can be swept by envelopes and LFOs every sample.
+// Filters with any slope, all built from state-variable stages (Zavalishin's
+// and Simper's trapezoidal form), which stay stable however fast `cutoff`,
+// `resonance` and `slope` move.
 //
-// Each is 12 dB per octave. `resonance` goes from 0 (no peak: a lowpass is
-// 3 dB down at `cutoff`) to 1 (a sharp peak that rings). `cutoff` is kept
-// between 1Hz and just below half the sample rate.
+// - `cutoff` is kept between 1Hz and just below half the sample rate.
+// - `resonance` goes from 0 (no peak) to 1 (a sharp peak that rings).
+// - `slope` is how steeply the filter falls, as in `24dB / 1oct`: each 6 dB
+//   per octave is one pole. It is a stream: a slope between whole poles
+//   blends the two nearest, so it can move smoothly.
+// - `max` is the steepest `slope` will be. The stages for it are built
+//   before audio starts, and they all run. With `max` left out, a constant
+//   `slope` is its own steepest; a moving one gets 48 dB per octave (and
+//   the checker warns).
 //
-// A gentler 6 dB lowpass is `slew` in `@effects/env`.
+// The default slope, 12 dB per octave, is one state-variable stage.
 
-// The filter's three outputs, `[lowpass, bandpass, highpass]`.
-rill svf(x: Sample, cutoff: Freq, resonance: Float) [Sample; 3] {
+// One pole: 6 dB per octave.
+const POLE: Slope = 6dB / 1oct
+
+// Two poles: `[lowpass, bandpass, highpass]`. `k` is the damping: √2 is
+// flat, near 0 rings.
+rill svf(x: Sample, cutoff: Freq, k: Float) [Sample; 3] {
     state ic1: Float = 0
     state ic2: Float = 0
-    let f = clamp(cutoff, 1Hz, RATE * 0.49)
-    let g = tan(PI * f / RATE)
-    // Damping: √2 is flat (no peak), near 0 rings.
-    let k = sqrt(2.0) - (sqrt(2.0) - 0.01) * clamp(resonance, 0, 1)
+    let g = tan(PI * clamp(cutoff, 1Hz, RATE * 0.49) / RATE)
     let a1 = 1 / (1 + g * (g + k))
     let a2 = g * a1
     let a3 = g * a2
@@ -27,23 +34,151 @@ rill svf(x: Sample, cutoff: Freq, resonance: Float) [Sample; 3] {
     return [v2, v1, x - k * v1 - v2]
 }
 
-// Passes what is below `cutoff`.
-export rill lowpass(x: Sample, cutoff: Freq, resonance: Float = 0) Sample {
-    return svf(x, cutoff, resonance)[0]
+// One pole: `[lowpass, highpass]`.
+rill one_pole(x: Sample, cutoff: Freq) [Sample; 2] {
+    state s: Float = 0
+    let g = tan(PI * clamp(cutoff, 1Hz, RATE * 0.49) / RATE)
+    let v = (x - s) * g / (1 + g)
+    let low = v + s
+    s = low + v
+    return [low, x - low]
 }
 
-// Passes what is above `cutoff`. At 10Hz it removes a constant offset.
-export rill highpass(x: Sample, cutoff: Freq, resonance: Float = 0) Sample {
-    return svf(x, cutoff, resonance)[2]
+// The damping of the first stage, which carries the resonance.
+fn damping(resonance: Float) Float {
+    sqrt(2.0) - (sqrt(2.0) - 0.01) * clamp(resonance, 0, 1)
 }
 
-// Passes what is near `cutoff`; more resonance narrows it.
-export rill bandpass(x: Sample, cutoff: Freq, resonance: Float = 0) Sample {
-    return svf(x, cutoff, resonance)[1]
+// Pairs of poles, with a pole after each pair for the odd counts; the output
+// at `slope` blends the two nearest counts. `high` picks the highpass side.
+rill pairs(
+    x: Sample,
+    cutoff: Freq,
+    resonance: Float,
+    slope: Slope,
+    ceiling: Slope,
+    high: Bool,
+) Sample {
+    // How many poles to build: as many as `ceiling` asks for, or `slope` if
+    // it is a constant, or 48 dB per octave's worth if it moves.
+    let most = ceil(
+        max(abs(ceiling / POLE), abs(fixed(slope, 48dB / 1oct) / POLE)),
+    )
+
+    let p = clamp(abs(slope / POLE), 0, most)
+    let lo = floor(p)
+    let blend = p - lo
+    let below = x
+    let above = x
+    let y = x
+
+    for j in 0..(ceil(most / 2) as Int) {
+        let before = (j * 2) as Float
+        let k = if j == 0 { damping(resonance) } else { sqrt(2.0) }
+        let two = svf(y, cutoff, k)
+        let one = one_pole(y, cutoff)
+        let odd = if high { one[1] } else { one[0] }
+        let even = if high { two[2] } else { two[0] }
+
+        below = if lo == before + 1 {
+            odd
+        } else if lo == before + 2 {
+            even
+        } else {
+            below
+        }
+
+        above = if lo + 1 == before + 1 {
+            odd
+        } else if lo + 1 == before + 2 {
+            even
+        } else {
+            above
+        }
+
+        y = even
+    }
+
+    return below + (above - below) * blend
 }
 
-// Removes what is near `cutoff`; more resonance narrows the notch.
-export rill notch(x: Sample, cutoff: Freq, resonance: Float = 0) Sample {
-    let y = svf(x, cutoff, resonance)
-    return y[0] + y[2]
+// Bandpass stages, each falling 6 dB per octave on both sides, with the peak
+// at 0 dB; the output at `slope` blends the two nearest counts.
+rill bands(
+    x: Sample,
+    cutoff: Freq,
+    resonance: Float,
+    slope: Slope,
+    ceiling: Slope,
+) Sample {
+    // How many poles to build: as many as `ceiling` asks for, or `slope` if
+    // it is a constant, or 48 dB per octave's worth if it moves.
+    let most = ceil(
+        max(abs(ceiling / POLE), abs(fixed(slope, 48dB / 1oct) / POLE)),
+    )
+
+    let p = clamp(abs(slope / POLE), 0, most)
+    let lo = floor(p)
+    let blend = p - lo
+    let below = x
+    let above = x
+    let y = x
+
+    for j in 0..(most as Int) {
+        let before = j as Float
+        let k = if j == 0 { damping(resonance) } else { sqrt(2.0) }
+        let band = svf(y, cutoff, k)[1] * k
+        below = if lo == before + 1 { band } else { below }
+        above = if lo + 1 == before + 1 { band } else { above }
+        y = band
+    }
+
+    return below + (above - below) * blend
+}
+
+// Passes what is below `cutoff`, falling `slope` above it.
+export rill lowpass(
+    x: Sample,
+    cutoff: Freq,
+    resonance: Float = 0,
+    slope: Slope = 12dB / 1oct,
+    max: Slope = 0dB / 1oct,
+) Sample {
+    return pairs(x, cutoff, resonance, slope, max, false)
+}
+
+// Passes what is above `cutoff`, falling `slope` below it. At 10Hz it
+// removes a constant offset.
+export rill highpass(
+    x: Sample,
+    cutoff: Freq,
+    resonance: Float = 0,
+    slope: Slope = 12dB / 1oct,
+    max: Slope = 0dB / 1oct,
+) Sample {
+    return pairs(x, cutoff, resonance, slope, max, true)
+}
+
+// Passes what is near `cutoff`, falling `slope` on each side; more
+// resonance narrows the peak.
+export rill bandpass(
+    x: Sample,
+    cutoff: Freq,
+    resonance: Float = 0,
+    slope: Slope = 6dB / 1oct,
+    max: Slope = 0dB / 1oct,
+) Sample {
+    return bands(x, cutoff, resonance, slope, max)
+}
+
+// Removes what is near `cutoff`: the input less the bandpass, so `slope`
+// makes the notch steeper and resonance narrows it.
+export rill notch(
+    x: Sample,
+    cutoff: Freq,
+    resonance: Float = 0,
+    slope: Slope = 6dB / 1oct,
+    max: Slope = 0dB / 1oct,
+) Sample {
+    return x - bands(x, cutoff, resonance, slope, max)
 }

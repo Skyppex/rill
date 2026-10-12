@@ -39,7 +39,10 @@ rill pluck(
     return comb(burst, period, feedback, tone: tone, max: 50ms)
 }
 
-seq riff(step: 1/8, tempo: 100bpm, loop: true) { E4, G4, B4, _, D5, _, B4, G4 }
+seq riff(step: 1/8, tempo: 100bpm, loop: true) {
+    E4, G4, B4, _, D5, _, B4, G4,
+    E4, G4, B4, _, C#5, _, B4, G4,
+}
 
 rill string() Sample {
     state pitch: Pitch = E4
@@ -90,7 +93,7 @@ rill main(volume: Gain = -12dB) [Sample; 2] {
     // An echo a dotted eighth apart, darker with every repeat, on the left,
     // and the drifting one a quarter apart on the right.
     let left = comb(dry, 450ms, feedback: 0.45, tone: 2.5kHz)
-    let right = drifting_echo(dry, 600ms, 0.5)
+    let right = drifting_echo(dry, 600ms, 0.9)
 
     let wet = chorus * 0.4 + [left, right] * 0.5
     return [dry, dry] * 0.6 + wet + volume

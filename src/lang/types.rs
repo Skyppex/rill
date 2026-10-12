@@ -21,6 +21,9 @@ pub enum Type {
     /// A level change, written in `dB`. Stored as an amplitude factor, so
     /// any plain number can be used where a `Gain` is expected.
     Gain,
+    /// How fast a level falls over an interval: `Gain / Interval`, as in
+    /// `12dB / 1oct`. Stored in dB per octave. Always a constant.
+    Slope,
     /// What an `on` handler of an event receives, as in `NoteOn` for a
     /// `note_on` event. Never `ControlChange`, whose payload is a `Float`.
     Event(crate::event::EventKind),
@@ -110,6 +113,7 @@ impl fmt::Display for Type {
             Type::Time => f.write_str("Time"),
             Type::Interval => f.write_str("Interval"),
             Type::Gain => f.write_str("Gain"),
+            Type::Slope => f.write_str("Slope"),
             Type::Event(kind) => f.write_str(kind.type_name()),
             Type::Num => f.write_str("number"),
             Type::Frame(elem, size) => write!(f, "[{elem}; {size}]"),
@@ -151,7 +155,7 @@ impl Type {
     /// `Pitch` is not one of them: it is a position, so only intervals can be
     /// added to it.
     pub fn is_dimensioned(&self) -> bool {
-        matches!(self, Type::Freq | Type::Time | Type::Interval)
+        matches!(self, Type::Freq | Type::Time | Type::Interval | Type::Slope)
     }
 
     /// Values that can be compared, ordered and put in a frame.

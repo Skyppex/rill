@@ -14,6 +14,8 @@ pub enum Unit {
     /// Semitones.
     St,
     Cents,
+    /// Octaves: `1oct` is `12st`.
+    Oct,
     /// Decibels, for a `Gain`.
     Db,
 }
@@ -28,7 +30,7 @@ pub enum Dimension {
 }
 
 impl Unit {
-    pub const ALL: [(&'static str, Unit); 8] = [
+    pub const ALL: [(&'static str, Unit); 9] = [
         ("Hz", Unit::Hz),
         ("kHz", Unit::KHz),
         ("bpm", Unit::Bpm),
@@ -36,6 +38,7 @@ impl Unit {
         ("s", Unit::S),
         ("st", Unit::St),
         ("cents", Unit::Cents),
+        ("oct", Unit::Oct),
         ("dB", Unit::Db),
     ];
 
@@ -43,7 +46,7 @@ impl Unit {
         match self {
             Unit::Hz | Unit::KHz | Unit::Bpm => Dimension::Frequency,
             Unit::Ms | Unit::S => Dimension::Time,
-            Unit::St | Unit::Cents => Dimension::Interval,
+            Unit::St | Unit::Cents | Unit::Oct => Dimension::Interval,
             Unit::Db => Dimension::Level,
         }
     }
@@ -57,6 +60,7 @@ impl Unit {
             Unit::Bpm => value / 60.0,
             Unit::Ms => value / 1000.0,
             Unit::Cents => value / 100.0,
+            Unit::Oct => value * 12.0,
             Unit::Db => 10f64.powf(value / 20.0),
         }
     }

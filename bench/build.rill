@@ -1,0 +1,42 @@
+// The compiler, not the audio: a program that is large once every call is
+// inlined (384 steep filters, nearly 2000 state-variable stages, through
+// loops, frames and nested rills), to time building, optimising and laying
+// out the program. Read `built in` first. It sits close to the limit of
+// 65536 registers a rill can use before optimising.
+
+// bench: --seconds 1
+
+import "@gen/osc"
+import "@effects/filter"
+
+rill layer(x: Sample, cutoff: Freq) Sample {
+    let y = x
+
+    for i in 0..4 {
+        y = lowpass(y, cutoff * (1 + i as Float * 0.1), slope: 48dB / 1oct)
+    }
+
+    return y
+}
+
+rill bank(x: Sample, root: Freq) Sample {
+    let cutoffs: [Freq; 16]
+
+    for i in 0..16 {
+        cutoffs[i] = root * (1 + i as Float * 0.2)
+    }
+
+    return sum(layer(x, cutoffs)) / 16
+}
+
+rill main() [Sample; 2] {
+    let x = saw(110Hz)
+    let roots: [Freq; 6]
+
+    for i in 0..6 {
+        roots[i] = 100Hz * (1 + i as Float)
+    }
+
+    let y = sum(bank(x, roots)) / 6
+    return [y, y]
+}

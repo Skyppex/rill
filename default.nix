@@ -3,6 +3,8 @@
   naersk,
   pkgs,
   release ? false,
+  # The commit being built, for `rill --version` (there is no `.git` here).
+  commit ? "unknown",
 }:
 naersk.buildPackage {
   name = "rill";
@@ -11,6 +13,7 @@ naersk.buildPackage {
   buildInputs = [pkgs.alsa-lib];
   propagatedBuildInputs = [pkgs.alsa-lib];
   doCheck = false;
+  RILL_COMMIT = commit;
 
   cargoBuildFlags = (
     ["--features=pulseaudio"]

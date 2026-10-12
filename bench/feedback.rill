@@ -1,0 +1,23 @@
+// A long chain where every stage needs the one before it, this sample: 512
+// one-pole filters in series, each with its own state. Nothing here can run
+// copies side by side, so this measures the cost of a single instruction.
+
+import "@gen/osc"
+
+const STAGES = 512
+
+rill smooth(x: Sample, k: Float) Sample {
+    state y: Float = 0
+    y = y + (x - y) * k
+    return y
+}
+
+rill main() [Sample; 2] {
+    let y = saw(110Hz)
+
+    for i in 0..STAGES {
+        y = smooth(y, 0.5 + (i % 7) as Float * 0.05)
+    }
+
+    return [y, y]
+}

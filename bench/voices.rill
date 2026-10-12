@@ -1,0 +1,51 @@
+// Voice allocation under pressure: a pool of 64 voices taking chords of 8
+// notes, 32 times a second, with short gates, so voices are claimed,
+// released and stolen all the time. Each voice is a saw, a filter and an
+// envelope, so idle voices still cost what playing ones do.
+
+import "@gen/osc"
+import "@effects/env"
+import "@effects/filter"
+
+seq chords(
+    meter: 4/4,
+    step: 1/32,
+    tempo: 240bpm,
+    gate: 0.5,
+    velocity: 0.8,
+    loop: true,
+) {
+    [C3, E3, G3, B3, D4, F#4, A4, C5],
+    [D3, F3, A3, C4, E4, G4, B4, D5],
+    [E3, G3, B3, D4, F#4, A4, C5, E5],
+    [F3, A3, C4, E4, G4, B4, D5, F5],
+}
+
+rill voice() Sample {
+    state pitch: Pitch = C4
+    state level: Float = 0
+    state gate: Float = 0
+
+    on chords_note_on(note) claim {
+        pitch = note.pitch
+        level = note.velocity
+        gate = 1
+    }
+
+    on chords_note_off release {
+        gate = 0
+    }
+
+    let env = ahdsr(gate, attack: 2ms, decay: 40ms, sustain: 0.5, release: 60ms)
+    let tone = saw(pitch |> equal)
+    return lowpass(tone, 300Hz + env * 3kHz, resonance: 0.2) * env * level
+}
+
+rill main() [Sample; 2] {
+    on start {
+        invoke chords
+    }
+
+    let x = sum([voice(); 64]) / 16
+    return [x, x]
+}

@@ -1,0 +1,124 @@
+// Events, not sound: eight sequences stepping at different, fast rates, so
+// almost every block is split many times at event boundaries, and many
+// handlers run per event. The sound itself is nearly free.
+
+seq a(step: 1/64, tempo: 300bpm, gate: 0.5, loop: true) { C4, D4, E4, _ }
+
+seq b(step: 1/48, tempo: 290bpm, gate: 0.3, loop: true) { G4, _, A4 }
+
+seq c(step: 1/40, tempo: 310bpm, gate: 0.7, loop: true) { C5, E5 }
+
+seq d(step: 1/56, tempo: 280bpm, gate: 0.2, loop: true) { F3, _, _, A3, C4 }
+
+seq e(step: 1/64, tempo: 333bpm, gate: 0.9, loop: true) { B3 }
+
+seq f(step: 1/36, tempo: 250bpm, gate: 0.4, loop: true) { D3, F3, A3 }
+
+seq g(step: 1/60, tempo: 270bpm, gate: 0.6, loop: true) { E2, _ }
+
+seq h(step: 1/44, tempo: 320bpm, gate: 0.5, loop: true) { A2, C3, E3, G3 }
+
+// Counts what it hears and turns it into a click level.
+rill listener() Sample {
+    state count: Float = 0
+    state level: Float = 0
+
+    on a_note_on(n) {
+        count = count + 1
+        level = n.velocity
+    }
+
+    on b_note_on(n) {
+        count = count + 1
+        level = n.velocity
+    }
+
+    on c_note_on(n) {
+        count = count + 1
+        level = n.velocity
+    }
+
+    on d_note_on(n) {
+        count = count + 1
+        level = n.velocity
+    }
+
+    on e_note_on(n) {
+        count = count + 1
+        level = n.velocity
+    }
+
+    on f_note_on(n) {
+        count = count + 1
+        level = n.velocity
+    }
+
+    on g_note_on(n) {
+        count = count + 1
+        level = n.velocity
+    }
+
+    on h_note_on(n) {
+        count = count + 1
+        level = n.velocity
+    }
+
+    on a_note_off {
+        level = 0
+    }
+
+    on b_note_off {
+        level = 0
+    }
+
+    on c_note_off {
+        level = 0
+    }
+
+    on d_note_off {
+        level = 0
+    }
+
+    on e_note_off {
+        level = 0
+    }
+
+    on f_note_off {
+        level = 0
+    }
+
+    on g_note_off {
+        level = 0
+    }
+
+    on h_note_off {
+        level = 0
+    }
+
+    on a_step {
+        count = count * 0.5
+    }
+
+    on h_beat {
+        count = 0
+    }
+
+    level = level * 0.999
+    return level * 0.01 + count * 0.0001
+}
+
+rill main() [Sample; 2] {
+    on start {
+        let _ = invoke a
+        let _ = invoke b
+        let _ = invoke c
+        let _ = invoke d
+        let _ = invoke e
+        let _ = invoke f
+        let _ = invoke g
+        let _ = invoke h
+    }
+
+    let x = sum([listener(); 16])
+    return [x, x]
+}

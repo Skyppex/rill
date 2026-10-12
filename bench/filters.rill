@@ -1,0 +1,22 @@
+// Steep filters whose cutoff moves every sample: 32 lowpasses at 96 dB per
+// octave (16 poles each, 8 state-variable stages and their one-poles), each
+// with its own sweeping cutoff. `tan` per stage per sample, and long chains
+// of state.
+
+import "@gen/osc"
+import "@effects/filter"
+
+const N = 32
+
+rill main() [Sample; 2] {
+    let rates: [Freq; N]
+
+    for i in 0..N {
+        rates[i] = 0.1Hz + i as Float * 0.07Hz
+    }
+
+    let sweep = 200Hz + (sine(rates) * 0.5 + 0.5) * 6kHz
+    let x = saw([110Hz; N], offset: each random())
+    let y = sum(lowpass(x, sweep, resonance: 0.3, slope: 96dB / 1oct)) / N
+    return [y, y]
+}

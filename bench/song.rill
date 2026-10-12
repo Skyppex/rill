@@ -1,0 +1,119 @@
+// Everything at once, at a size a real song might reach: a polyphonic pad
+// through filters, a sequenced bass, noise percussion, echoes and a
+// compressor on the mix. The number to watch for overall progress.
+
+import "@gen/osc"
+import "@gen/noise"
+import "@effects/env"
+import "@effects/filter"
+import "@effects/delay"
+import "@effects/dynamics"
+import "@mix/stereo"
+
+seq changes(
+    meter: 4/4,
+    step: 1/2,
+    tempo: 120bpm,
+    gate: 0.9,
+    velocity: 0.7,
+    loop: true,
+) {
+    [C3, G3, E4, B4],
+    [A2, E3, C4, G4],
+    [F2, C3, A3, E4],
+    [G2, D3, B3, F#4],
+}
+
+seq bass(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.6, loop: true) {
+    C2, C2, G2, C2, A1, A1, E2, A1,
+}
+
+seq hats(meter: 4/4, step: 1/16, tempo: 120bpm, gate: 0.2, loop: true) {
+    C4@0.8, C4@0.3, C4@0.5, C4@0.3,
+}
+
+rill pad() [Sample; 2] {
+    state pitch: Pitch = C4
+    state gate: Float = 0
+
+    on changes_note_on(note) claim {
+        pitch = note.pitch
+        gate = 1
+    }
+
+    on changes_note_off release {
+        gate = 0
+    }
+
+    let env = ahdsr(
+        gate,
+        attack: 200ms,
+        decay: 1s,
+        sustain: 0.6,
+        release: 800ms,
+    )
+
+    let freqs = [pitch |> equal; 6] * [0.995, 0.997, 0.999, 1.001, 1.003, 1.005]
+    let tone = saw(freqs, offset: each random())
+    let spread = pan(tone, [-0.8, -0.5, -0.2, 0.2, 0.5, 0.8])
+    let filtered = lowpass(sum(spread), 400Hz + env * 2kHz, slope: 24dB / 1oct)
+    return filtered * env * 0.1
+}
+
+rill bassline() Sample {
+    state pitch: Pitch = C2
+    state gate: Float = 0
+
+    on bass_note_on(note) {
+        pitch = note.pitch
+        gate = 1
+    }
+
+    on bass_note_off {
+        gate = 0
+    }
+
+    let env = ahdsr(
+        gate,
+        attack: 3ms,
+        decay: 150ms,
+        sustain: 0.3,
+        release: 80ms,
+    )
+
+    let tone = square(pitch |> equal) + saw(pitch |> equal, offset: 0.25)
+    return lowpass(tone, 120Hz + env * 900Hz, resonance: 0.4) * env * 0.3
+}
+
+rill hat() Sample {
+    state gate: Float = 0
+    state level: Float = 0
+
+    on hats_note_on(note) {
+        gate = 1
+        level = note.velocity
+    }
+
+    on hats_note_off {
+        gate = 0
+    }
+
+    let env = ahdsr(gate, attack: 1ms, decay: 30ms, sustain: 0, release: 20ms)
+    return highpass(noise(), 7kHz, slope: 24dB / 1oct) * env * level * 0.2
+}
+
+rill main() [Sample; 2] {
+    on start {
+        let _ = invoke changes
+        let _ = invoke bass
+        let _ = invoke hats
+    }
+
+    let pads = sum([pad(); 8])
+    let low = bassline()
+    let top = pan(hat(), 0.3) + pan(pink() * 0.01, -0.3)
+    let dry = pads + [low, low] + top
+    let wet = comb(dry, [375ms, 250ms], feedback: 0.4, tone: 4kHz)
+    let mix = dry + wet * 0.3
+    return dynamics(mix, -12dB, above: 0.25)
+}

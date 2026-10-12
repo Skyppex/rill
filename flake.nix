@@ -47,6 +47,7 @@
           naersk = naerskLib;
           inherit pkgs;
           inherit release;
+          commit = self.rev or self.dirtyRev or "unknown";
         };
 
       checks = import ./checks.nix {
@@ -57,6 +58,7 @@
 
       apps = import ./apps.nix {
         pkgs = pkgs;
+        rill = rillPackage {release = true;};
       };
     in {
       packages = rec {

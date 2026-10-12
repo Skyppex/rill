@@ -1,0 +1,14 @@
+// Small blocks: a modest program rendered 16 frames at a time, so the cost
+// of each callback (setting up, events, handing out the output) counts as
+// much as the sound. Compare with the same program at 256 in `song`.
+
+// bench: --block 16
+
+import "@gen/osc"
+import "@effects/filter"
+
+rill main() [Sample; 2] {
+    let x = sum(saw([110Hz, 165Hz, 220Hz, 330Hz], offset: each random()))
+    let y = lowpass(x, 800Hz + sine(0.3Hz) * 400Hz) * 0.2
+    return [y, y]
+}

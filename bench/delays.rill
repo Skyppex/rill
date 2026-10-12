@@ -1,0 +1,36 @@
+// Delay lines read at moving, fractional times: 64 lines, each with 8
+// taps whose times wobble every sample, and feedback through `state`.
+// Interpolated reads and writes, not maths, are the cost here.
+
+import "@gen/osc"
+
+const N = 64
+const TAPS = 8
+
+rill echoes(x: Sample, base: Time, rate: Freq) Sample {
+    state back: Sample = 0
+    let times: [Time; TAPS]
+
+    for t in 0..TAPS {
+        times[t] = base * (t + 1) as Float + sine(rate * (t + 1) as Float) * 1ms
+    }
+
+    let taps = delay(x + back, times, max: 400ms)
+    let out = sum(taps) / TAPS
+    back = out * 0.4
+    return out
+}
+
+rill main() [Sample; 2] {
+    let bases: [Time; N]
+    let rates: [Freq; N]
+
+    for i in 0..N {
+        bases[i] = 3ms + i as Float * 0.5ms
+        rates[i] = 0.2Hz + i as Float * 0.03Hz
+    }
+
+    let x = saw(220Hz) * 0.5
+    let y = sum(echoes(x, bases, rates)) / N
+    return [y, y]
+}

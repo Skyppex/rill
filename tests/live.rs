@@ -233,7 +233,9 @@ fn a_different_channel_count_is_refused() {
     let (mut live, mut player) = start(SONG);
     let mut out = render(&mut player, 5_000);
     let three = "import \"@gen/osc\"\nrill main() [Sample; 3] {\n    let x = sine(220Hz)\n    return [x, x, x]\n}";
-    let failed = live.reload_text(three).err().expect("refused");
+    let Err(failed) = live.reload_text(three) else {
+        panic!("a 3-channel program was swapped into a 2-channel stream");
+    };
     assert!(
         failed.errors[0].message.contains("returns 3 channels"),
         "{:?}",

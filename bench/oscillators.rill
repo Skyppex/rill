@@ -1,0 +1,18 @@
+// Many independent oscillators: 1024 band-limited saws in one frame. Every
+// copy does the same work, so this is the best case for running copies
+// together; it measures raw throughput per copy.
+
+import "@gen/osc"
+
+const N = 1024
+
+rill main() [Sample; 2] {
+    let freqs: [Freq; N]
+
+    for i in 0..N {
+        freqs[i] = 55Hz + i as Float * 3.7Hz
+    }
+
+    let x = sum(saw(freqs, offset: each random())) / N
+    return [x, x]
+}

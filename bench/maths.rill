@@ -1,0 +1,30 @@
+// The prelude's maths, one after another: trigonometry, exponentials,
+// logarithms, powers and roots on 256 copies. The functions themselves are
+// the cost here, not the program around them.
+
+import "@gen/osc"
+
+const N = 256
+
+rill shape(phase: Float) Sample {
+    let a = sin(phase * TAU)
+    let b = cos(phase * TAU + a)
+    let c = tanh(a * 3 + b)
+    let d = exp(c * 0.5) - 1
+    let e = log(1.001 + abs(d))
+    let f = pow(abs(e) + 0.01, 1.5)
+    let g = sqrt(abs(f - c))
+    let h = tan(clamp(g, -1.4, 1.4) * 0.5)
+    return (c + d + e - f + g * h) * 0.1
+}
+
+rill main() [Sample; 2] {
+    let freqs: [Freq; N]
+
+    for i in 0..N {
+        freqs[i] = 30Hz + i as Float * 7Hz
+    }
+
+    let x = sum(shape(phasor(freqs))) / N
+    return [x, x]
+}

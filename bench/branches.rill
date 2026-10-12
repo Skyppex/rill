@@ -1,0 +1,41 @@
+// Decisions that follow the signal: every copy picks a different path each
+// sample, depending on noise, so nothing about which way it goes is
+// predictable. `if` chains, comparisons and `state` that only changes on
+// some paths.
+
+const N = 256
+
+rill decide(x: Float, salt: Float) Sample {
+    state held: Float = 0
+    state run: Float = 0
+    let v = x + salt
+
+    let y = if v > 0.6 {
+        held = v
+        sin(v * 7)
+    } else if v > 0.2 {
+        run = run + 1
+        held * 0.5 - v
+    } else if v > -0.2 {
+        cos(held + run * 0.01)
+    } else if v > -0.6 {
+        run = 0
+        -held
+    } else {
+        v * v
+    }
+
+    held = if abs(held) > 4 { 0 } else { held }
+    return y * 0.01
+}
+
+rill main() [Sample; 2] {
+    let salts: [Float; N]
+
+    for i in 0..N {
+        salts[i] = (i % 13) as Float * 0.07 - 0.4
+    }
+
+    let x = sum(decide(noise(), salts)) / N
+    return [x, x]
+}

@@ -8,7 +8,10 @@ use rill::wav::{self, WavFormat};
 use rill::{Config, Engine, Graph, ParamEvent, RillEvent, patches};
 
 #[derive(Parser)]
-#[command(version, about = "Rill: a language for real-time audio")]
+#[command(
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RILL_COMMIT"), ")"),
+    about = "Rill: a language for real-time audio"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -270,6 +273,7 @@ impl From<&ScheduledRillEvent> for rill::device::ScheduledRillEvent {
     }
 }
 
+#[cfg(feature = "device")]
 fn validate_param_event_duration(
     events: &[ScheduledParamEvent],
     seconds: f32,
@@ -289,6 +293,7 @@ fn validate_param_event_duration(
     Ok(())
 }
 
+#[cfg(feature = "device")]
 fn validate_rill_event_duration(
     events: &[ScheduledRillEvent],
     seconds: f32,

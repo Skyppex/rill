@@ -1,0 +1,26 @@
+// Memory, not arithmetic: 32 delay lines of 10 seconds each (about 60 MB of
+// samples), read at random times every sample, so almost every read misses
+// the cache. Also how long it takes to set all of that aside when building.
+
+import "@gen/osc"
+
+const N = 32
+
+rill far(x: Sample, rate: Freq) Sample {
+    // Times anywhere in the line, new every sample.
+    let jump = (noise() * 0.5 + 0.5) * 9.9s
+    let drift = 5ms + (sine(rate) * 0.5 + 0.5) * 9.9s
+    return sum(delay(x, [jump, drift, 10s - jump], max: 10s)) / 3
+}
+
+rill main() [Sample; 2] {
+    let rates: [Freq; N]
+
+    for i in 0..N {
+        rates[i] = 0.13Hz + i as Float * 0.011Hz
+    }
+
+    let x = noise() * 0.5
+    let y = sum(far(x, rates)) / N
+    return [y, y]
+}

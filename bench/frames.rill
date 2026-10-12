@@ -1,0 +1,46 @@
+// Wide frames moved around: deep nesting (8 x 8 x 8 copies), channels
+// lifted through rills, picked apart by index and summed back together.
+// Copies, gathers and sums, more than maths.
+
+import "@gen/osc"
+import "@mix/stereo"
+
+rill cluster(root: Freq) [[Sample; 2]; 8] {
+    let freqs: [Freq; 8]
+    let positions: [Float; 8]
+
+    for i in 0..8 {
+        freqs[i] = root * (1 + i as Float * 0.003)
+        positions[i] = i as Float / 7 * 2 - 1
+    }
+
+    return pan(sine(freqs) * 0.1, positions)
+}
+
+rill group(root: Freq) [Sample; 2] {
+    let roots: [Freq; 8]
+
+    for i in 0..8 {
+        roots[i] = root * (1 + i as Float * 0.25)
+    }
+
+    let clusters = cluster(roots)
+    let out: [Sample; 2] = [0, 0]
+
+    for i in 0..8 {
+        out = out + sum(clusters[i]) * (if i % 2 == 0 { 1.0 } else { -0.5 })
+    }
+
+    return out
+}
+
+rill main() [Sample; 2] {
+    let roots: [Freq; 8]
+
+    for i in 0..8 {
+        roots[i] = 55Hz * (1 + i as Float * 0.5)
+    }
+
+    let all = group(roots)
+    return [sum(all)[0], sum(all)[1]] / 64
+}

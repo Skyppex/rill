@@ -1528,6 +1528,7 @@ fn same_either_way(
         let options = lang::build::Options {
             vectorize,
             seed: Some(7),
+            ..Default::default()
         };
         let (graph, _) = lang::load_with(src, &config(channels), "main", &options)
             .unwrap_or_else(|d| panic!("{d:#?}"));

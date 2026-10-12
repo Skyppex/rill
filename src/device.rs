@@ -15,7 +15,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
 use crate::engine::{Config, Engine};
 use crate::event::{Dispatch, parse_dispatch};
-use crate::graph::Graph;
+use crate::live::Player;
 
 /// If no PulseAudio cookie can be found, write an all-zero one to the temp
 /// directory and point `$PULSE_COOKIE` at it for this process.
@@ -115,12 +115,14 @@ fn host(name: Option<&str>) -> anyhow::Result<cpal::Host> {
     Ok(cpal::host_from_id(id)?)
 }
 
-/// Build a graph for the default output device and start playing it.
+/// Build a player for the default output device and start playing it.
 ///
-/// `make_graph` receives the device's configuration, since a graph depends on
-/// the sample rate and channel count it will run at.
+/// `make_player` receives the device's configuration, since a program
+/// depends on the sample rate and channel count it will run at. A
+/// [`Player`] from [`crate::live::Live`] can be given new builds while it
+/// plays; [`Player::new`] plays one engine as it is.
 pub fn play(
-    make_graph: impl FnOnce(&Config) -> anyhow::Result<Graph>,
+    make_player: impl FnOnce(&Config) -> anyhow::Result<Player>,
     options: &Options,
 ) -> anyhow::Result<Playback> {
     let host = host(options.host.as_deref())?;
@@ -152,72 +154,72 @@ pub fn play(
         max_frames: options.max_frames.unwrap_or(1024),
         out_channels: usize::from(stream_config.channels),
     };
-    let engine = Engine::new(make_graph(&config)?, config)?;
-    validate_param_events(&engine, &options.param_events)?;
+    let player = make_player(&config)?;
+    validate_param_events(player.engine(), &options.param_events)?;
     let scheduled_params = schedule_param_events(&config, &options.param_events);
-    let scheduled_rill = schedule_rill_events(&engine, &config, &options.events)?;
+    let scheduled_rill = schedule_rill_events(player.engine(), &config, &options.events)?;
 
     let stream = match format {
         SampleFormat::F32 => build::<f32>(
             &device,
             stream_config,
-            engine,
+            player,
             scheduled_params,
             scheduled_rill,
         ),
         SampleFormat::F64 => build::<f64>(
             &device,
             stream_config,
-            engine,
+            player,
             scheduled_params,
             scheduled_rill,
         ),
         SampleFormat::I8 => build::<i8>(
             &device,
             stream_config,
-            engine,
+            player,
             scheduled_params,
             scheduled_rill,
         ),
         SampleFormat::I16 => build::<i16>(
             &device,
             stream_config,
-            engine,
+            player,
             scheduled_params,
             scheduled_rill,
         ),
         SampleFormat::I24 => build::<cpal::I24>(
             &device,
             stream_config,
-            engine,
+            player,
             scheduled_params,
             scheduled_rill,
         ),
         SampleFormat::I32 => build::<i32>(
             &device,
             stream_config,
-            engine,
+            player,
             scheduled_params,
             scheduled_rill,
         ),
         SampleFormat::U8 => build::<u8>(
             &device,
             stream_config,
-            engine,
+            player,
             scheduled_params,
             scheduled_rill,
         ),
         SampleFormat::U16 => build::<u16>(
             &device,
             stream_config,
-            engine,
+            player,
             scheduled_params,
             scheduled_rill,
         ),
         SampleFormat::U32 => build::<u32>(
             &device,
             stream_config,
-            engine,
+            player,
             scheduled_params,
             scheduled_rill,
         ),
@@ -237,7 +239,7 @@ pub fn play(
 fn build<T>(
     device: &cpal::Device,
     config: StreamConfig,
-    mut engine: Engine,
+    mut engine: Player,
     scheduled: Vec<ScheduledParamEventAtFrame>,
     rill_events: Vec<ScheduledRillEventAtFrame>,
 ) -> anyhow::Result<cpal::Stream>

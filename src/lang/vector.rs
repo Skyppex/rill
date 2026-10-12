@@ -648,7 +648,7 @@ fn rename(code: &mut Code, map: &HashMap<u16, u16>) {
             r(dst);
             op(time);
         }
-        Instr::DelayWrite { x, .. } => op(x),
+        Instr::DelayWrite { x, .. } | Instr::Want { x, .. } => op(x),
         Instr::Jump { .. } | Instr::InvokeSeq { .. } | Instr::Vector { .. } => {}
     };
     for i in code
@@ -665,6 +665,9 @@ fn rename(code: &mut Code, map: &HashMap<u16, u16>) {
     code.input_regs.iter_mut().for_each(r);
     code.output.iter_mut().for_each(op);
     for (x, _) in &mut code.state_init {
+        r(x);
+    }
+    for (_, x) in &mut code.keys.regs {
         r(x);
     }
     for o in code.pools.iter_mut().flatten().flatten() {

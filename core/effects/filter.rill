@@ -7,10 +7,10 @@
 // - `slope` is how steeply the filter falls, as in `24dB / 1oct`: each 6 dB
 //   per octave is one pole. It is a stream: a slope between whole poles
 //   blends the two nearest, so it can move smoothly.
-// - `max` is the steepest `slope` will be. The stages for it are built
-//   before audio starts, and they all run. With `max` left out, a constant
-//   `slope` is its own steepest; a moving one gets 48 dB per octave (and
-//   the checker warns).
+// - `max` is the steepest a moving `slope` will be. The stages for it are
+//   built before audio starts, and they all run. A constant `slope` is its
+//   own steepest. A live program that finds `slope` going past `max` is
+//   rebuilt with room for more.
 //
 // The default slope, 12 dB per octave, is one state-variable stage.
 
@@ -56,14 +56,13 @@ rill pairs(
     cutoff: Freq,
     resonance: Float,
     slope: Slope,
-    ceiling: Slope,
+    steepest: Slope,
     high: Bool,
 ) Sample {
-    // How many poles to build: as many as `ceiling` asks for, or `slope` if
-    // it is a constant, or 48 dB per octave's worth if it moves.
-    let most = ceil(
-        max(abs(ceiling / POLE), abs(fixed(slope, 48dB / 1oct) / POLE)),
-    )
+    // How many poles to build: as many as `slope` asks for if it is a
+    // constant; if it moves, as many as `steepest` (and more if a live
+    // program finds it going further).
+    let most = ceil(ceiling(abs(slope / POLE), abs(steepest / POLE)))
 
     let p = clamp(abs(slope / POLE), 0, most)
     let lo = floor(p)
@@ -109,13 +108,12 @@ rill bands(
     cutoff: Freq,
     resonance: Float,
     slope: Slope,
-    ceiling: Slope,
+    steepest: Slope,
 ) Sample {
-    // How many poles to build: as many as `ceiling` asks for, or `slope` if
-    // it is a constant, or 48 dB per octave's worth if it moves.
-    let most = ceil(
-        max(abs(ceiling / POLE), abs(fixed(slope, 48dB / 1oct) / POLE)),
-    )
+    // How many poles to build: as many as `slope` asks for if it is a
+    // constant; if it moves, as many as `steepest` (and more if a live
+    // program finds it going further).
+    let most = ceil(ceiling(abs(slope / POLE), abs(steepest / POLE)))
 
     let p = clamp(abs(slope / POLE), 0, most)
     let lo = floor(p)
@@ -142,7 +140,7 @@ export rill lowpass(
     cutoff: Freq,
     resonance: Float = 0,
     slope: Slope = 12dB / 1oct,
-    max: Slope = 0dB / 1oct,
+    max: Slope = 48dB / 1oct,
 ) Sample {
     return pairs(x, cutoff, resonance, slope, max, false)
 }
@@ -154,7 +152,7 @@ export rill highpass(
     cutoff: Freq,
     resonance: Float = 0,
     slope: Slope = 12dB / 1oct,
-    max: Slope = 0dB / 1oct,
+    max: Slope = 48dB / 1oct,
 ) Sample {
     return pairs(x, cutoff, resonance, slope, max, true)
 }
@@ -166,7 +164,7 @@ export rill bandpass(
     cutoff: Freq,
     resonance: Float = 0,
     slope: Slope = 6dB / 1oct,
-    max: Slope = 0dB / 1oct,
+    max: Slope = 48dB / 1oct,
 ) Sample {
     return bands(x, cutoff, resonance, slope, max)
 }
@@ -178,7 +176,7 @@ export rill notch(
     cutoff: Freq,
     resonance: Float = 0,
     slope: Slope = 6dB / 1oct,
-    max: Slope = 0dB / 1oct,
+    max: Slope = 48dB / 1oct,
 ) Sample {
     return x - bands(x, cutoff, resonance, slope, max)
 }

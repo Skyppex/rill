@@ -64,6 +64,17 @@ impl Node for Param {
         self.remaining = 0;
     }
 
+    fn control_state(&self) -> Option<(f32, f32)> {
+        Some((self.current, self.target))
+    }
+
+    fn set_control_state(&mut self, current: f32, target: f32) {
+        self.current = current;
+        self.target = target;
+        self.step = 0.0;
+        self.remaining = 0;
+    }
+
     fn set_control_value(&mut self, value: f32, sample_rate: f32) -> bool {
         self.target = value;
         let frames = (sample_rate * self.smoothing_ms / 1000.0).round() as usize;

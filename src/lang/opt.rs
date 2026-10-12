@@ -58,6 +58,7 @@ pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(u16)) {
         | Instr::Noise { dst, .. }
         | Instr::DelayRead { dst, .. } => f(dst),
         Instr::DelayWrite { .. }
+        | Instr::Want { .. }
         | Instr::JumpUnless { .. }
         | Instr::Jump { .. }
         | Instr::InvokeSeq { .. }
@@ -105,6 +106,7 @@ pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(u16)) {
         | Instr::LoadCapture { .. }
         | Instr::Noise { .. }
         | Instr::Vector { .. } => {}
+        Instr::Want { x, .. } => op(x),
     }
 }
 

@@ -4,17 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["device", "pulseaudio"]
+default = ["device", "pulseaudio", "watch"]
 # Real-time output through the system audio device (cpal). Without it the
 # crate still builds the engine and the offline WAV renderer.
 device = ["dep:cpal", "dep:anyhow"]
 # Talk to PulseAudio directly instead of going through ALSA (useful on WSLg).
 pulseaudio = ["device", "cpal/pulseaudio"]
+# Reload a playing program when its files change (`rill play`, unless
+# `--no-watch`). Without it nothing watches files.
+watch = ["dep:notify"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
 clap = { version = "4.6.7", features = ["derive"] }
 cpal = { version = "0.18.2", optional = true }
+notify = { version = "8.2.0", optional = true }
 
 [dev-dependencies]
 hound = "3.5.1"

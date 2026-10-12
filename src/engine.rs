@@ -128,6 +128,36 @@ pub struct Engine {
     /// Declared events, indexed by [`EventId`].
     events: Vec<EventDecl>,
     position: u64,
+    /// How this engine takes over from the one it replaces, if it was
+    /// planned (see [`Engine::plan_takeover`]).
+    takeover: Option<EngineTakeover>,
+}
+
+/// What a running engine has, by name, for planning how a new build takes
+/// over from it.
+#[derive(Clone, Debug, Default)]
+pub struct EngineKeys {
+    /// The compiled program's node and its state's names.
+    program: Option<(usize, crate::lang::vm::Keys)>,
+    /// Live controls and their nodes.
+    controls: Vec<(String, usize)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EngineTakeover {
+    /// The old and new programs' nodes, and how state moves between them.
+    program: Option<(usize, usize, crate::lang::vm::Takeover)>,
+    /// Old and new nodes of live controls kept by name.
+    controls: Vec<(usize, usize)>,
+}
+
+/// What a planned takeover will carry over.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TakeoverReport {
+    /// Pieces of state found in both builds.
+    pub carried: usize,
+    /// Pieces of state that are new and start fresh.
+    pub fresh: usize,
 }
 
 impl Engine {
@@ -239,7 +269,88 @@ impl Engine {
             controls,
             events,
             position: 0,
+            takeover: None,
         })
+    }
+
+    /// The places the program sized when it was built (see
+    /// [`crate::lang::vm::Code::ceilings`]), and what they have been asked for
+    /// while playing.
+    pub fn ceilings(&self) -> Option<crate::lang::vm::Ceilings> {
+        self.nodes
+            .iter()
+            .find_map(|n| n.program().map(|p| p.ceilings()))
+    }
+
+    /// What this engine's state and controls are called, for
+    /// [`Engine::plan_takeover`] on the build that replaces it.
+    pub fn keys(&self) -> EngineKeys {
+        EngineKeys {
+            program: self
+                .nodes
+                .iter()
+                .enumerate()
+                .find_map(|(i, n)| n.program().map(|p| (i, p.keys()))),
+            controls: self.controls.clone(),
+        }
+    }
+
+    /// Work out how this engine takes over from the running one, whose keys
+    /// are `from`. Do this before handing the engine to the audio thread:
+    /// [`Engine::take_over`] then only copies.
+    pub fn plan_takeover(&mut self, from: &EngineKeys) -> TakeoverReport {
+        let mine = self.keys();
+        let program = match (&from.program, mine.program) {
+            (Some((old_node, old_keys)), Some((new_node, new_keys))) => {
+                let plan = crate::lang::vm::Takeover::plan(old_keys, &new_keys);
+                Some((*old_node, new_node, plan))
+            }
+            _ => None,
+        };
+        let controls = self
+            .controls
+            .iter()
+            .filter_map(|(name, new)| {
+                from.controls
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, old)| (*old, *new))
+            })
+            .collect();
+        let report = program
+            .as_ref()
+            .map_or_else(TakeoverReport::default, |(_, _, p)| TakeoverReport {
+                carried: p.carried,
+                fresh: p.fresh,
+            });
+        self.takeover = Some(EngineTakeover { program, controls });
+        report
+    }
+
+    /// Carry `old`'s state, controls and clock over into this engine, as
+    /// planned. Only copies: safe on the audio thread. Without a plan it
+    /// carries the clock only.
+    pub fn take_over(&mut self, old: &Engine) {
+        self.position = old.position;
+        let Some(plan) = &self.takeover else {
+            return;
+        };
+        for &(o, n) in &plan.controls {
+            if let (Some(state), Some(node)) = (
+                old.nodes.get(o).and_then(|n| n.control_state()),
+                self.nodes.get_mut(n),
+            ) {
+                node.set_control_state(state.0, state.1);
+            }
+        }
+        if let Some((o, n, takeover)) = &plan.program
+            && let (Some(old), Some(new)) = (
+                old.nodes.get(*o).and_then(|n| n.program()),
+                self.nodes.get_mut(*n).and_then(|n| n.program_mut()),
+            )
+        {
+            new.take_over(old, takeover);
+        }
     }
 
     pub fn config(&self) -> Config {

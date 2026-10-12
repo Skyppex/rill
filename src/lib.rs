@@ -13,6 +13,7 @@ pub mod event;
 pub mod format;
 pub mod graph;
 pub mod lang;
+pub mod live;
 pub mod node;
 pub mod nodes;
 pub mod offline;

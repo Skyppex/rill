@@ -331,6 +331,10 @@ enum Command {
         /// `keys@1s:pitch=A4,velocity=0.8`, goes straight to that event.
         #[arg(long = "event", value_name = "EVENT@TIME[:FIELD=VALUE,...]", value_parser = parse_rill_event)]
         events: Vec<ScheduledRillEvent>,
+        /// Do not reload the program when its files change. (Without the
+        /// `watch` feature, files are never watched.)
+        #[arg(long)]
+        no_watch: bool,
     },
     /// List audio hosts and output devices.
     #[cfg(feature = "device")]
@@ -416,6 +420,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             buffer,
             param_events,
             events,
+            no_watch,
         } => {
             if let Some(seconds) = seconds {
                 validate_param_event_duration(&param_events, seconds)?;
@@ -428,8 +433,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 param_events: param_events.iter().map(Into::into).collect(),
                 events: events.iter().map(Into::into).collect(),
             };
+            let mut live = None;
             let playback = rill::device::play(
-                |config| source.graph(config).map_err(anyhow::Error::msg),
+                |config| match &source.source {
+                    Some(path) => {
+                        let (l, player) = start_live(&source, path, config)?;
+                        live = Some(l);
+                        Ok(player)
+                    }
+                    None => {
+                        let graph = source.graph(config).map_err(anyhow::Error::msg)?;
+                        Ok(rill::live::Player::new(Engine::new(graph, *config)?))
+                    }
+                },
                 &options,
             )?;
             let buffer = match playback.buffer_frames {
@@ -444,13 +460,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 playback.config.out_channels,
                 playback.format
             );
-            match seconds {
-                Some(s) => std::thread::sleep(std::time::Duration::from_secs_f32(s)),
-                None => {
-                    println!("press Enter to stop");
-                    std::io::stdin().read_line(&mut String::new())?;
-                }
+            if seconds.is_none() {
+                println!("press Enter to stop");
             }
+            control(live.as_mut(), seconds, !no_watch)?;
             drop(playback);
         }
         Command::Core { module: None } => {
@@ -788,6 +801,208 @@ fn core_exports(src: &str) -> Vec<String> {
     }
     out.sort();
     out.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Build the program at `path` to play live: rebuilt when its files
+/// change, and when a value outgrows its `max`. Prints its diagnostics.
+#[cfg(feature = "device")]
+fn start_live(
+    source: &SourceArgs,
+    path: &std::path::Path,
+    config: &Config,
+) -> anyhow::Result<(rill::live::Live, rill::live::Player)> {
+    let seed = source
+        .seed
+        .unwrap_or_else(|| *PICKED_SEED.get_or_init(rill::lang::build::new_seed));
+    let options = rill::lang::build::Options {
+        seed: Some(seed),
+        ..Default::default()
+    };
+    match rill::live::Live::from_file(path, *config, &source.entry, options) {
+        Ok((live, player, built)) => {
+            for w in &built.warnings {
+                eprint!("{}", built.sources.render(w));
+            }
+            if source.seed.is_none() && built.random {
+                eprintln!("rill: random seed {seed} (repeat with --seed {seed})");
+            }
+            Ok((live, player))
+        }
+        Err(failed) => {
+            for d in &failed.errors {
+                eprint!("{}", failed.sources.render(d));
+            }
+            let errors = failed.errors.iter().filter(|d| d.is_error()).count();
+            anyhow::bail!("{}: {errors} error(s)", path.display())
+        }
+    }
+}
+
+/// While playing: reload when the program's files change (if `watch`),
+/// grow ceilings when values outgrow them, and stop after `seconds` or when
+/// Enter is pressed.
+#[cfg(feature = "device")]
+fn control(
+    mut live: Option<&mut rill::live::Live>,
+    seconds: Option<f32>,
+    watch: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    enum Message {
+        Stop,
+        #[cfg_attr(not(feature = "watch"), allow(dead_code))]
+        Changed(PathBuf),
+    }
+    impl From<PathBuf> for Message {
+        fn from(path: PathBuf) -> Message {
+            Message::Changed(path)
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let deadline = seconds.map(|s| Instant::now() + Duration::from_secs_f32(s));
+    if deadline.is_none() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = std::io::stdin().read_line(&mut String::new());
+            let _ = tx.send(Message::Stop);
+        });
+    }
+    #[cfg(feature = "watch")]
+    let mut watcher = match (&live, watch) {
+        (Some(live), true) => Some(Watcher::new(live.files(), tx.clone())?),
+        _ => None,
+    };
+    #[cfg(not(feature = "watch"))]
+    let _ = watch;
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(Message::Stop) => return Ok(()),
+            Ok(Message::Changed(path)) => {
+                let Some(live) = live.as_deref_mut() else {
+                    continue;
+                };
+                if !live.uses(&path) {
+                    continue;
+                }
+                // Editors often write a file in several steps; take changes
+                // close together as one.
+                std::thread::sleep(Duration::from_millis(50));
+                while let Ok(m) = rx.try_recv() {
+                    if let Message::Stop = m {
+                        return Ok(());
+                    }
+                }
+                match live.reload() {
+                    Ok(built) => {
+                        for w in &built.warnings {
+                            eprint!("{}", built.sources.render(w));
+                        }
+                        let name = built
+                            .sources
+                            .files
+                            .first()
+                            .map_or("", |f| f.display.as_str());
+                        println!(
+                            "reloaded {name} ({} states carried, {} new)",
+                            built.report.carried, built.report.fresh
+                        );
+                        #[cfg(feature = "watch")]
+                        if let Some(w) = &mut watcher {
+                            w.follow(live.files());
+                        }
+                    }
+                    Err(failed) => {
+                        for d in &failed.errors {
+                            eprint!("{}", failed.sources.render(d));
+                        }
+                        eprintln!("rill: still playing the last version that built");
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(());
+        }
+        if let Some(live) = live.as_deref_mut()
+            && let Some(grown) = live.grow()
+        {
+            match grown {
+                Ok(_) => println!("grew to fit: {}", describe_raised(live.raised())),
+                Err(failed) => {
+                    for d in &failed.errors {
+                        eprint!("{}", failed.sources.render(d));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The ceilings raised so far, briefly.
+#[cfg(feature = "device")]
+fn describe_raised(raised: &std::collections::HashMap<String, f32>) -> String {
+    let mut all: Vec<String> = raised.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+    all.sort();
+    all.join(", ")
+}
+
+/// Watches the folders of a program's files, sending the paths that change.
+#[cfg(all(feature = "device", feature = "watch"))]
+struct Watcher {
+    inner: notify::RecommendedWatcher,
+    folders: Vec<PathBuf>,
+}
+
+#[cfg(all(feature = "device", feature = "watch"))]
+impl Watcher {
+    fn new<M: From<PathBuf> + Send + 'static>(
+        files: &[PathBuf],
+        tx: std::sync::mpsc::Sender<M>,
+    ) -> notify::Result<Watcher> {
+        let inner = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            let Ok(event) = event else { return };
+            if matches!(
+                event.kind,
+                notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+            ) {
+                for path in event.paths {
+                    let _ = tx.send(M::from(path));
+                }
+            }
+        })?;
+        let mut w = Watcher {
+            inner,
+            folders: Vec::new(),
+        };
+        w.follow(files);
+        Ok(w)
+    }
+
+    /// Watch the folders of `files` (editors often replace a file rather than
+    /// write to it, so the folder is what sees it).
+    fn follow(&mut self, files: &[PathBuf]) {
+        use notify::Watcher as _;
+        for file in files {
+            let folder = file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."))
+                .to_owned();
+            if !self.folders.contains(&folder)
+                && self
+                    .inner
+                    .watch(&folder, notify::RecursiveMode::NonRecursive)
+                    .is_ok()
+            {
+                self.folders.push(folder);
+            }
+        }
+    }
 }
 
 /// Whether the root file of `program` exports anything.

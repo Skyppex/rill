@@ -29,6 +29,9 @@ pub struct Options {
     /// Where the numbers `random()` picks come from: the same seed picks the
     /// same numbers. `None` picks a new seed every build.
     pub seed: Option<u64>,
+    /// Ceilings raised while playing, by state key: a `max` that turned out
+    /// too small builds this big instead (see [`crate::live`]).
+    pub ceilings: std::collections::HashMap<String, f32>,
 }
 
 impl Default for Options {
@@ -36,6 +39,7 @@ impl Default for Options {
         Options {
             vectorize: true,
             seed: None,
+            ceilings: std::collections::HashMap::new(),
         }
     }
 }
@@ -69,6 +73,7 @@ pub fn build_with(
     let mut defs = Defs::new(program, checked);
     defs.vectorize = options.vectorize;
     defs.random = Random::new(options.seed.unwrap_or_else(new_seed));
+    defs.raised = options.ceilings.clone();
     const_table(
         &mut defs,
         program,

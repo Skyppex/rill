@@ -101,11 +101,20 @@ pub enum Instr {
         source: u16,
     },
     /// `dst` = what was written to delay line `line` `time` samples ago,
-    /// interpolated between samples. Reads come before the tick's write.
+    /// interpolated between samples. Reads come before the tick's write. A
+    /// time longer than the line is noted in ceiling `want`.
     DelayRead {
         dst: u16,
         line: u16,
         time: Operand,
+        want: u16,
+    },
+    /// Note in ceiling `slot` if `x` goes past `ceiling` (see
+    /// [`Code::ceilings`]).
+    Want {
+        slot: u16,
+        x: Operand,
+        ceiling: f32,
     },
     /// Write this tick's input to delay line `line`, after its reads.
     DelayWrite {
@@ -491,6 +500,31 @@ pub struct Code {
     /// Per delay line ([`Instr::DelayRead`]), its length in samples,
     /// allocated when the program is built.
     pub delays: Vec<u32>,
+    /// What every piece of state is called, so a new build of the program
+    /// can take it over (see [`StateKeys`]).
+    pub keys: StateKeys,
+    /// The places sized when the program is built (`ceiling()` calls and
+    /// delay lines), by state key, with the size they were given: in the
+    /// value's own units, seconds for a delay line. A value past one is
+    /// noted, so a new build can make it bigger.
+    pub ceilings: Vec<(String, f32)>,
+}
+
+/// Stable names for a program's state, so a rebuilt program can carry on
+/// where the running one is. A key is a path of names: the `let` (or
+/// `state`, assignment, `return` or handler) each call is in, then the
+/// callee and its count among the unnamed calls of that callee in that
+/// statement, as in `main#1/lead/saw#1/return/phasor#1.phase`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StateKeys {
+    /// `state` registers.
+    pub regs: Vec<(String, u16)>,
+    /// Delay lines, by index into [`Code::delays`].
+    pub delays: Vec<(String, u16)>,
+    /// Noise generators, by index into [`Code::noises`].
+    pub noises: Vec<(String, u16)>,
+    /// Voice pools, by index into [`Code::pools`].
+    pub pools: Vec<(String, u16)>,
 }
 
 /// What a handler handles.
@@ -676,9 +710,10 @@ fn list(s: &mut String, instrs: &[Instr]) {
             ),
             Instr::Vector { block } => format!("vector block {block}"),
             Instr::Noise { dst, source } => format!("r{dst} = noise {source}"),
-            Instr::DelayRead { dst, line, time } => {
-                format!("r{dst} = delay {line} read {}", op(time))
-            }
+            Instr::DelayRead {
+                dst, line, time, ..
+            } => format!("r{dst} = delay {line} read {}", op(time)),
+            Instr::Want { slot, x, ceiling } => format!("want {slot} {} past {ceiling}", op(x)),
             Instr::DelayWrite { line, x } => format!("delay {line} write {}", op(x)),
         };
         let _ = writeln!(s, "{pc:4}: {line}");
@@ -787,6 +822,9 @@ struct Run {
     noise: Vec<u64>,
     /// Per delay line, its samples and where the next write goes.
     delays: Vec<(Box<[f32]>, usize)>,
+    /// Per ceiling, the most a value has asked of it, as `f32` bits; read
+    /// by [`crate::live::Live`] on another thread.
+    wants: std::sync::Arc<[std::sync::atomic::AtomicU32]>,
 }
 
 impl Run {
@@ -925,6 +963,9 @@ impl Program {
                 delivery: 0,
                 wanted,
                 noise: code.noises.clone(),
+                wants: (0..code.ceilings.len())
+                    .map(|_| std::sync::atomic::AtomicU32::new(0))
+                    .collect(),
                 delays: code
                     .delays
                     .iter()
@@ -1555,6 +1596,17 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
     }
 }
 
+/// Note that ceiling `slot` was asked for `value`, if that is more than
+/// before. Only the audio thread writes, so a load and a store will do.
+fn note_want(wants: &[std::sync::atomic::AtomicU32], slot: u16, value: f32) {
+    use std::sync::atomic::Ordering;
+    if let Some(w) = wants.get(usize::from(slot))
+        && value > f32::from_bits(w.load(Ordering::Relaxed))
+    {
+        w.store(value.to_bits(), Ordering::Relaxed);
+    }
+}
+
 /// The next noise sample, in [-1, 1): SplitMix64.
 fn next_noise(state: &mut u64) -> f32 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -1660,10 +1712,24 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
         Instr::Noise { dst, source } => {
             regs[dst as usize] = next_noise(&mut run.noise[usize::from(source)]);
         }
-        Instr::DelayRead { dst, line, time } => {
+        Instr::DelayRead {
+            dst,
+            line,
+            time,
+            want,
+        } => {
             let t = val(regs, time);
             let (data, at) = &run.delays[usize::from(line)];
+            if t > (data.len() - 2) as f32 {
+                note_want(&run.wants, want, t / run.rate);
+            }
             regs[dst as usize] = read_delay(data, *at, t);
+        }
+        Instr::Want { slot, x, ceiling } => {
+            let x = val(regs, x);
+            if x > ceiling {
+                note_want(&run.wants, slot, x);
+            }
         }
         Instr::DelayWrite { line, x } => {
             let x = val(regs, x);
@@ -1798,6 +1864,14 @@ impl Node for Program {
         "rill"
     }
 
+    fn program(&self) -> Option<&Program> {
+        Some(self)
+    }
+
+    fn program_mut(&mut self) -> Option<&mut Program> {
+        Some(self)
+    }
+
     fn inputs(&self) -> usize {
         self.code.input_regs.len()
     }
@@ -1885,4 +1959,292 @@ impl Node for Program {
         self.deliver(Pending::To(event, *payload, from));
         handled
     }
+}
+
+// ---- taking over from another build -----------------------------------------
+
+/// The places a program sized when it was built, with their sizes, and a
+/// counter each for what it has asked of them while playing.
+pub type Ceilings = (
+    Vec<(String, f32)>,
+    std::sync::Arc<[std::sync::atomic::AtomicU32]>,
+);
+
+/// What a running program has, by name: its [`StateKeys`] and its
+/// sequences. Taken from the running program, to plan how a new build takes
+/// over from it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Keys {
+    pub state: StateKeys,
+    /// Sequence names, by index.
+    pub seqs: Vec<String>,
+}
+
+/// How a new build takes over the state of the running one: for each piece
+/// of state both have, where it was and where it is now. Worked out off the
+/// audio thread; [`Program::take_over`] then only copies.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Takeover {
+    /// `(old, new)` registers, delay lines, noise generators, voice pools
+    /// and sequences.
+    pub regs: Vec<(u16, u16)>,
+    pub delays: Vec<(u16, u16)>,
+    pub noises: Vec<(u16, u16)>,
+    pub pools: Vec<(u16, u16)>,
+    pub seqs: Vec<(u16, u16)>,
+    /// Pieces of state carried over, and new ones starting fresh.
+    pub carried: usize,
+    pub fresh: usize,
+}
+
+/// A kind of state, so keys of different kinds never pair up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Kind {
+    Reg,
+    Delay,
+    Noise,
+    Pool,
+}
+
+impl Takeover {
+    /// Pair `new`'s state with `old`'s: first by key; then, for keys left
+    /// on both sides, a level renamed (`lead` to `melody`, or a `state`
+    /// renamed) pairs when everything below it has the same shape and no
+    /// other candidate does.
+    pub fn plan(old: &Keys, new: &Keys) -> Takeover {
+        let list = |k: &StateKeys| -> Vec<(Kind, String, u16)> {
+            let mut out = Vec::new();
+            for (kind, items) in [
+                (Kind::Reg, &k.regs),
+                (Kind::Delay, &k.delays),
+                (Kind::Noise, &k.noises),
+                (Kind::Pool, &k.pools),
+            ] {
+                out.extend(items.iter().map(|(key, i)| (kind, key.clone(), *i)));
+            }
+            out
+        };
+        let (olds, news) = (list(&old.state), list(&new.state));
+        let mut pairs: Vec<(Kind, u16, u16)> = Vec::new();
+        let old_by: std::collections::HashMap<(Kind, &str), u16> = olds
+            .iter()
+            .map(|(k, key, i)| ((*k, key.as_str()), *i))
+            .collect();
+        let mut old_left: Vec<&(Kind, String, u16)> = Vec::new();
+        let mut new_left: Vec<&(Kind, String, u16)> = Vec::new();
+        let new_keys: std::collections::HashSet<(Kind, &str)> =
+            news.iter().map(|(k, key, _)| (*k, key.as_str())).collect();
+        for n in &news {
+            match old_by.get(&(n.0, n.1.as_str())) {
+                Some(&o) => pairs.push((n.0, o, n.2)),
+                None => new_left.push(n),
+            }
+        }
+        for o in &olds {
+            if !new_keys.contains(&(o.0, o.1.as_str())) {
+                old_left.push(o);
+            }
+        }
+        pairs.extend(renamed(&old_left, &new_left));
+
+        let mut t = Takeover::default();
+        for (kind, o, n) in pairs {
+            let list = match kind {
+                Kind::Reg => &mut t.regs,
+                Kind::Delay => &mut t.delays,
+                Kind::Noise => &mut t.noises,
+                Kind::Pool => &mut t.pools,
+            };
+            list.push((o, n));
+        }
+        for (j, name) in new.seqs.iter().enumerate() {
+            if let Some(i) = old.seqs.iter().position(|o| o == name) {
+                t.seqs.push((i as u16, j as u16));
+            }
+        }
+        t.carried = t.regs.len() + t.delays.len() + t.noises.len() + t.pools.len();
+        t.fresh = news.len() - t.carried;
+        t
+    }
+}
+
+/// Pairs for keys renamed at one level: an old and a new prefix that differ
+/// only in their last name, where everything under each has the same kinds
+/// and the same rest of the key, and each is the other's only candidate.
+fn renamed(old: &[&(Kind, String, u16)], new: &[&(Kind, String, u16)]) -> Vec<(Kind, u16, u16)> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    // A key's levels: `a/b/c.x` is `a`, `a/b`, `a/b/c.x`.
+    let prefixes = |key: &str| -> Vec<usize> {
+        let mut ends: Vec<usize> = key.match_indices('/').map(|(i, _)| i).collect();
+        ends.push(key.len());
+        ends
+    };
+    // Every prefix with what lies under it: (kind, rest of key, index).
+    type Under = Vec<(Kind, String, u16)>;
+    let subtrees = |keys: &[&(Kind, String, u16)]| -> BTreeMap<String, Under> {
+        let mut map: BTreeMap<String, Under> = BTreeMap::new();
+        for (kind, key, i) in keys.iter().map(|k| (k.0, &k.1, k.2)) {
+            for end in prefixes(key) {
+                map.entry(key[..end].to_owned()).or_default().push((
+                    kind,
+                    key[end..].to_owned(),
+                    i,
+                ));
+            }
+        }
+        for under in map.values_mut() {
+            under.sort();
+        }
+        map
+    };
+    let (olds, news) = (subtrees(old), subtrees(new));
+    let shape =
+        |u: &Under| -> Vec<(Kind, String)> { u.iter().map(|(k, r, _)| (*k, r.clone())).collect() };
+    let parent = |p: &str| p.rfind('/').map_or("", |i| &p[..i]).to_owned();
+    // Candidates, shallowest first, so a renamed `let` pairs as a whole.
+    let mut used_old: HashSet<(Kind, u16)> = HashSet::new();
+    let mut used_new: HashSet<(Kind, u16)> = HashSet::new();
+    let mut pairs = Vec::new();
+    let mut by_depth: BTreeMap<usize, Vec<&String>> = BTreeMap::new();
+    for p in olds.keys() {
+        by_depth.entry(p.matches('/').count()).or_default().push(p);
+    }
+    for (_, level) in by_depth {
+        let mut candidates: HashMap<&String, Vec<&String>> = HashMap::new();
+        let mut back: HashMap<&String, usize> = HashMap::new();
+        for p in level {
+            if news.contains_key(p) {
+                continue;
+            }
+            let ps = shape(&olds[p]);
+            for (q, under) in &news {
+                if olds.contains_key(q)
+                    || parent(p) != parent(q)
+                    || q.matches('/').count() != p.matches('/').count()
+                {
+                    continue;
+                }
+                if shape(under) == ps {
+                    candidates.entry(p).or_default().push(q);
+                    *back.entry(q).or_default() += 1;
+                }
+            }
+        }
+        for (p, qs) in candidates {
+            let [q] = qs.as_slice() else { continue };
+            if back[q] != 1 {
+                continue;
+            }
+            for (a, b) in olds[p].iter().zip(&news[*q]) {
+                if !used_old.contains(&(a.0, a.2)) && !used_new.contains(&(b.0, b.2)) {
+                    used_old.insert((a.0, a.2));
+                    used_new.insert((b.0, b.2));
+                    pairs.push((a.0, a.2, b.2));
+                }
+            }
+        }
+    }
+    pairs
+}
+
+impl Program {
+    /// The places sized when the program was built, with their sizes, and
+    /// what they have been asked for while playing, in the same order.
+    pub fn ceilings(&self) -> Ceilings {
+        (self.code.ceilings.clone(), self.run.wants.clone())
+    }
+
+    /// The names of this program's state, for planning a takeover.
+    pub fn keys(&self) -> Keys {
+        Keys {
+            state: self.code.keys.clone(),
+            seqs: self.code.seqs.iter().map(|s| s.name.clone()).collect(),
+        }
+    }
+
+    /// Carry `old`'s state over into this program, as `plan` says. Only
+    /// copies: safe on the audio thread.
+    pub fn take_over(&mut self, old: &Program, plan: &Takeover) {
+        let (run, from) = (&mut self.run, &old.run);
+        for &(o, n) in &plan.regs {
+            if let (Some(v), Some(slot)) = (from.regs.get(o as usize), run.regs.get_mut(n as usize))
+            {
+                *slot = *v;
+            }
+        }
+        for &(o, n) in &plan.delays {
+            let (Some((src, at)), Some((dst, dst_at))) =
+                (from.delays.get(o as usize), run.delays.get_mut(n as usize))
+            else {
+                continue;
+            };
+            // The most recent samples, as many as both hold, in order; the
+            // next write goes at 0.
+            let (sl, dl) = (src.len(), dst.len());
+            dst.fill(0.0);
+            for k in 1..sl.min(dl) {
+                dst[dl - k] = src[(at + sl - k) % sl];
+            }
+            *dst_at = 0;
+        }
+        for &(o, n) in &plan.noises {
+            if let (Some(v), Some(slot)) =
+                (from.noise.get(o as usize), run.noise.get_mut(n as usize))
+            {
+                *slot = *v;
+            }
+        }
+        for &(o, n) in &plan.pools {
+            if let (Some(src), Some(dst)) =
+                (from.voices.get(o as usize), run.voices.get_mut(n as usize))
+            {
+                for (d, s) in dst.iter_mut().zip(src) {
+                    *d = *s;
+                }
+            }
+        }
+        for &(o, n) in &plan.seqs {
+            let (Some(src), Some(dst)) =
+                (from.slots.get(o as usize), run.slots.get_mut(n as usize))
+            else {
+                continue;
+            };
+            for (d, s) in dst.iter_mut().zip(src) {
+                copy_slot(d, s);
+            }
+        }
+        run.now = from.now;
+        run.started = from.started;
+        run.fresh = from.fresh;
+    }
+}
+
+/// `src` into `dst` without allocating: what does not fit `dst`'s buffers is
+/// dropped.
+fn copy_slot(dst: &mut Slot, src: &Slot) {
+    dst.active = src.active;
+    dst.id = src.id;
+    // Calls are numbered per build; the instance keeps its settings as they
+    // are, but no longer follows the call that started it.
+    dst.call = u16::MAX;
+    dst.started = src.started;
+    dst.pos = src.pos;
+    dst.next = src.next;
+    dst.chord = src.chord;
+    dst.repeats = src.repeats;
+    dst.looping = src.looping;
+    dst.values = src.values;
+    dst.pass = src.pass;
+    dst.current = src.current;
+    dst.beat = src.beat;
+    dst.bar_sent = src.bar_sent;
+    dst.step_sent = src.step_sent;
+    dst.rest_sent = src.rest_sent;
+    dst.finishing = src.finishing;
+    dst.captures.clear();
+    let room = dst.captures.capacity();
+    dst.captures.extend(src.captures.iter().take(room));
+    dst.held.clear();
+    let room = dst.held.capacity();
+    dst.held.extend(src.held.iter().take(room));
 }

@@ -3763,12 +3763,12 @@ impl Checker {
                 }
             },
             ExprKind::Call { callee, args, .. }
-                if callee.name == "fixed"
-                    && self.lookup("fixed").is_none()
-                    && self.def_named("fixed").is_none() =>
+                if callee.name == "ceiling"
+                    && self.lookup("ceiling").is_none()
+                    && self.def_named("ceiling").is_none() =>
             {
-                // `x` if it is a constant, otherwise `otherwise`: constant
-                // whenever `otherwise` is.
+                // `x` if it is a constant, otherwise `start` (or what that
+                // was raised to): constant whenever `start` is.
                 args.get(1).is_some_and(|a| self.is_const(&a.value))
             }
             ExprKind::Call { callee, args, .. } => {

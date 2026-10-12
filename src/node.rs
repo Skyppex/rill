@@ -138,6 +138,24 @@ pub trait Node: Send {
         None
     }
 
+    /// A compiled program, for carrying its state into a new build.
+    fn program(&self) -> Option<&crate::lang::vm::Program> {
+        None
+    }
+
+    fn program_mut(&mut self) -> Option<&mut crate::lang::vm::Program> {
+        None
+    }
+
+    /// A live control's value now and where it is gliding to, for carrying
+    /// into a new build. `None` for nodes that are not controls.
+    fn control_state(&self) -> Option<(f32, f32)> {
+        None
+    }
+
+    /// Set a live control's value and target at once, without gliding.
+    fn set_control_state(&mut self, _current: f32, _target: f32) {}
+
     /// Update a live control value. Nodes that are not controls ignore it.
     fn set_control_value(&mut self, _value: f32, _sample_rate: f32) -> bool {
         false

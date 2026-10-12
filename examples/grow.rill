@@ -1,0 +1,27 @@
+// Ceilings that grow: a `max` is where a size starts, not a limit. Push a
+// value past it while playing and the program is rebuilt with room for it,
+// keeping its state; the terminal says `grew to fit: ...`.
+//
+// The delay: a blip on the left, its echo on the right. At 2s the echo
+// jumps from 10ms to half a second, far past the 20ms line:
+//
+//     rill play examples/grow.rill --param-event 'time=0.5@2s'
+//
+// The filter: quiet pink noise under a 300Hz lowpass. At 4s the slope goes
+// to 96 dB/oct, eight times what was built for, and the hiss drops away:
+//
+//     rill play examples/grow.rill --param-event 'slope=96@4s'
+//
+// Or both: add both `--param-event`s.
+
+import "@gen/osc"
+import "@gen/noise"
+import "@effects/filter"
+
+rill main(time: Time = 10ms, slope: Slope = 12dB / 1oct) [Sample; 2] {
+    let on = if phasor(1Hz) < 0.05 { 0.4 } else { 0.0 }
+    let blip = sine(880Hz) * on
+    let echo = delay(blip, time, max: 20ms)
+    let rumble = lowpass(pink(), 300Hz, slope: slope, max: 12dB / 1oct) * 0.3
+    return [blip + rumble, echo + rumble]
+}

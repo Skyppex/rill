@@ -16,7 +16,8 @@ use super::check::{Checked, Resolution, operand_alignment};
 use super::diag::{Diagnostic, Span};
 use super::types::{Align, Signature, Size, Type, align, frame_shape};
 use super::vm::{
-    Code, EventCode, Handles, Instr, InvokeCall, Mode, Operand, SeqStep, SeqTable, Source, Tuning,
+    Code, EventCode, Handles, Instr, InvokeCall, Mode, Operand, SeqStep, SeqTable, Source,
+    StateKeys, Tuning,
 };
 use crate::event::{EventDecl as Declared, EventId, EventKind};
 use crate::ops::{Op1, Op2};
@@ -142,6 +143,9 @@ pub struct Defs<'a> {
     pub vectorize: bool,
     /// Where `random()` draws its numbers from.
     pub random: Random,
+    /// Ceilings raised while playing, by state key (see
+    /// [`super::build::Options::ceilings`]).
+    pub raised: HashMap<String, f32>,
     /// Values the checker worked out: sequence fields and sizes written as
     /// expressions, by expression id.
     const_values: &'a HashMap<u32, f64>,
@@ -171,10 +175,25 @@ impl Random {
         (z >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    /// A seed for something that makes numbers while playing, such as
-    /// `noise()`, drawn from the same sequence.
-    pub fn seed(&self) -> u64 {
-        u64::from(self.next().to_bits()) << 32 | u64::from(self.next().to_bits())
+    /// A seed for whatever has the state key `key`: the same seed and key
+    /// always give the same, so a rebuilt program picks the same numbers
+    /// where its code did not change.
+    pub fn seed_at(&self, key: &str) -> u64 {
+        // FNV-1a over the key, mixed with the seed.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ self.0.get();
+        for b in key.bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+
+    /// The number `random()` picks for the state key `key`, in [0, 1).
+    pub fn at(&self, key: &str) -> f32 {
+        let mut z = self.seed_at(key).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        (z >> 40) as f32 / (1u64 << 24) as f32
     }
 }
 
@@ -205,6 +224,7 @@ impl<'a> Defs<'a> {
             seqs: Vec::new(),
             vectorize: true,
             random: Random::default(),
+            raised: HashMap::new(),
             const_values: &checked.const_values,
             consts: vec![None; program.consts.len()],
             list: defs.zip(&checked.signatures).collect(),
@@ -404,6 +424,8 @@ pub fn compile_instance(
         vectors: Vec::new(),
         noises: c.noises,
         delays: c.delays,
+        keys: c.keys,
+        ceilings: c.ceilings,
     };
     super::opt::optimize(&mut code);
     if defs.vectorize {
@@ -613,6 +635,17 @@ struct Compiler<'a> {
     noises: Vec<u64>,
     /// Per `delay` line, its length in samples.
     delays: Vec<u32>,
+    /// Where compiling is, for naming state: the names from the entry rill
+    /// down (see [`StateKeys`]).
+    path: Vec<String>,
+    /// Per body being compiled: where its names start in `path`, and how
+    /// many unnamed calls of each callee its current statement has made.
+    frames: Vec<(usize, HashMap<String, u32>)>,
+    keys: StateKeys,
+    /// Every key given out, to keep them apart.
+    taken: HashSet<String>,
+    /// See [`Code::ceilings`].
+    ceilings: Vec<(String, f32)>,
 }
 
 type CResult<T> = Result<T, Diagnostic>;
@@ -659,7 +692,63 @@ impl<'a> Compiler<'a> {
             align_inner: false,
             noises: Vec::new(),
             delays: Vec::new(),
+            path: Vec::new(),
+            frames: vec![(0, HashMap::new())],
+            keys: StateKeys::default(),
+            taken: HashSet::new(),
+            ceilings: Vec::new(),
         }
+    }
+
+    // ---- naming state -----------------------------------------------------
+
+    /// A statement starts: its name (a `let`'s, a `state`'s, ...) replaces
+    /// the last one in the path, and its unnamed calls count from 1.
+    fn statement(&mut self, name: &str) {
+        let (base, counts) = self.frames.last_mut().expect("a frame is open");
+        self.path.truncate(*base);
+        self.path.push(name.to_owned());
+        counts.clear();
+    }
+
+    /// The next unnamed use of `callee` in the current statement:
+    /// `saw#1`, `saw#2`, ...
+    fn segment(&mut self, callee: &str) -> String {
+        let (_, counts) = self.frames.last_mut().expect("a frame is open");
+        let n = counts.entry(callee.to_owned()).or_insert(0);
+        *n += 1;
+        format!("{callee}#{n}")
+    }
+
+    /// Go into a body (a rill, an anonymous fn, a handler, a copy, an
+    /// iteration) named `name`; its statements name the levels below.
+    fn enter_body(&mut self, name: String) {
+        self.path.push(name);
+        self.frames.push((self.path.len(), HashMap::new()));
+    }
+
+    fn leave_body(&mut self) {
+        let (base, _) = self.frames.pop().expect("entered");
+        self.path.truncate(base - 1);
+    }
+
+    /// The path so far and `leaf`, unique in this build.
+    fn key(&mut self, leaf: &str) -> String {
+        let base = format!("{}{leaf}", self.path.join("/"));
+        let mut key = base.clone();
+        let mut n = 1;
+        while !self.taken.insert(key.clone()) {
+            n += 1;
+            key = format!("{base}~{n}");
+        }
+        key
+    }
+
+    /// What `random()` picks here, by its state key.
+    fn pick(&mut self) -> f32 {
+        let segment = self.segment("random");
+        let key = self.key(&format!("/{segment}"));
+        self.defs.random.at(&key)
     }
 
     /// A constant scalar, folded at build time.
@@ -1075,7 +1164,10 @@ impl<'a> Compiler<'a> {
             &format!("{}@{}", def.name.name, def.span.start),
             def.name.span,
         )?;
+        let segment = self.segment(&def.name.name);
+        self.enter_body(segment);
         let result = self.inline_body(def, sig, args, sizes);
+        self.leave_body();
         self.inlining.pop();
         result
     }
@@ -1158,9 +1250,17 @@ impl<'a> Compiler<'a> {
     /// Returns the block's value, if it ends in an expression, and whether
     /// every path through it returned.
     fn block(&mut self, b: &Block) -> CResult<(Option<CVal>, bool)> {
+        // A block is no level of its own (moving code into an `if` keeps
+        // its names), but the statement it is in carries on after it.
+        let saved_path = self.path.clone();
+        let saved_counts = self.frames.last().map(|(_, c)| c.clone());
         self.scopes.push(HashMap::new());
         let result = self.block_in_current_scope(b);
         self.scopes.pop();
+        self.path = saved_path;
+        if let (Some(counts), Some((_, c))) = (saved_counts, self.frames.last_mut()) {
+            *c = counts;
+        }
         result
     }
 
@@ -1180,6 +1280,15 @@ impl<'a> Compiler<'a> {
     }
 
     fn stmt(&mut self, s: &Stmt) -> CResult<(Option<CVal>, bool)> {
+        let name = match s {
+            Stmt::Let { name, .. } | Stmt::State { name, .. } => name.name.clone(),
+            Stmt::Const(c) => c.name.name.clone(),
+            Stmt::Assign { target, .. } => target.name().name.clone(),
+            Stmt::Return { .. } => "return".to_owned(),
+            Stmt::For { .. } => "for".to_owned(),
+            Stmt::EventHandler { .. } | Stmt::Expr(_) => "do".to_owned(),
+        };
+        self.statement(&name);
         match s {
             Stmt::Let {
                 name, ty, value, ..
@@ -1213,6 +1322,16 @@ impl<'a> Compiler<'a> {
                     self.state_init.push((r, c));
                     self.state_regs.insert(r);
                     regs.push(Operand::Reg(r));
+                }
+                let n = regs.len();
+                for (i, r) in regs.iter().enumerate() {
+                    let Operand::Reg(r) = *r else { continue };
+                    let leaf = match n {
+                        1 => format!(".{}", name.name),
+                        _ => format!(".{}[{i}/{n}]", name.name),
+                    };
+                    let key = self.key(&leaf);
+                    self.keys.regs.push((key, r));
                 }
                 let v = v.reshape(regs);
                 self.bind(&name.name, v, true);
@@ -1285,7 +1404,8 @@ impl<'a> Compiler<'a> {
                 let values = self.loop_values(iter)?;
                 let mut returned = false;
                 let mut ranges = Vec::with_capacity(values.len());
-                for value in values {
+                for (i, value) in values.into_iter().enumerate() {
+                    self.enter_body(format!("[{i}]"));
                     self.scopes.push(HashMap::new());
                     self.bind(&name.name, value, false);
                     // Iterations, like pool copies, can run as lanes.
@@ -1298,6 +1418,7 @@ impl<'a> Compiler<'a> {
                     let (_, diverged) = block?;
                     ranges.push((start, self.code.len() as u32));
                     self.scopes.pop();
+                    self.leave_body();
                     if diverged {
                         returned = true;
                         break;
@@ -1498,6 +1619,10 @@ impl<'a> Compiler<'a> {
         let saved_scopes = self.scopes.clone();
         self.scopes.push(HashMap::new());
         let saved_handler = self.handler_scope.replace(self.scopes.len() - 1);
+        let saved_path = self.path.clone();
+        let base = self.frames.last().map_or(0, |(b, _)| *b);
+        self.path.truncate(base);
+        self.enter_body(format!("on {}", name.name));
         let (handles, kind) = if name.name == "start" {
             (Handles::Start, None)
         } else {
@@ -1536,6 +1661,8 @@ impl<'a> Compiler<'a> {
             }
         };
         let (_, diverged) = self.block(body)?;
+        self.leave_body();
+        self.path = saved_path;
         if diverged {
             return Err(internal(name.span, "event handlers cannot return"));
         }
@@ -1574,6 +1701,9 @@ impl<'a> Compiler<'a> {
     /// A new voice pool, whose copies come next.
     fn start_pool(&mut self) -> u16 {
         let pool = self.pools.len() as u16;
+        let segment = self.segment("pool");
+        let key = self.key(&format!("/{segment}"));
+        self.keys.pools.push((key, pool));
         self.pools.push(Vec::new());
         self.lane_ranges.push(self.main.then(Vec::new));
         pool
@@ -1582,6 +1712,7 @@ impl<'a> Compiler<'a> {
     /// Start compiling `copy` of `pool`; returns where its code starts.
     fn start_copy(&mut self, pool: u16, copy: u16) -> u32 {
         self.voice = Some((pool, copy));
+        self.enter_body(format!("[{copy}]"));
         // Each copy computes everything itself, so copies keep the same
         // instructions.
         self.cse.clear();
@@ -1590,6 +1721,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn end_copy(&mut self, pool: u16, start: u32, v: &CVal) {
+        self.leave_body();
         self.cse.clear();
         self.in_lanes -= 1;
         let end = self.code.len() as u32;
@@ -2101,6 +2233,21 @@ impl<'a> Compiler<'a> {
         };
         let key = format!("fn#{}", lambda.id);
         self.enter(&key, lambda.span)?;
+        let segment = self.segment("fn");
+        self.enter_body(segment);
+        let result = self.inline_lambda_body(lambda, params, body, captured, args);
+        self.leave_body();
+        result
+    }
+
+    fn inline_lambda_body(
+        &mut self,
+        lambda: &Expr,
+        params: &[FnParam],
+        body: &Block,
+        captured: Vec<HashMap<String, Binding>>,
+        args: Vec<CVal>,
+    ) -> CResult<CVal> {
         let saved_scopes = std::mem::replace(&mut self.scopes, captured);
         let saved_span = std::mem::replace(&mut self.span, lambda.span);
         self.scopes.push(HashMap::new());
@@ -2304,7 +2451,7 @@ impl<'a> Compiler<'a> {
         {
             let lo = self.expr(&lo.value)?;
             let hi = self.expr(&hi.value)?;
-            let r = CVal::Scalar(Operand::Const(self.defs.random.next()));
+            let r = CVal::Scalar(Operand::Const(self.pick()));
             let ratio = self.zip2(Op2::Div, &hi, &lo)?;
             let scale = self.zip2(Op2::Pow, &ratio, &r)?;
             return self.zip2(Op2::Mul, &lo, &scale);
@@ -2369,15 +2516,31 @@ impl<'a> Compiler<'a> {
                 None => DEFAULT_DELAY_MAX * self.sample_rate,
             },
         };
-        let len = (longest.max(1.0).ceil() as u32).saturating_add(3);
-        let channel = |c: &mut Self, input: &CVal| -> CResult<CVal> {
+        let segment = self.segment("delay");
+        let mut channel_index = 0;
+        let rate = self.sample_rate;
+        let mut channel = |c: &mut Self, input: &CVal| -> CResult<CVal> {
             let line = u16::try_from(c.delays.len())
                 .map_err(|_| Diagnostic::error(span, "too many delays"))?;
+            let key = c.key(&format!("/{segment}[{channel_index}]"));
+            channel_index += 1;
+            // Raised while playing: a time went past the line.
+            let raised = c.defs.raised.get(&key).copied().unwrap_or(0.0) * rate;
+            let len = (longest.max(raised).max(1.0).ceil() as u32).saturating_add(3);
             c.delays.push(len);
+            let want = u16::try_from(c.ceilings.len())
+                .map_err(|_| Diagnostic::error(span, "too many ceilings"))?;
+            c.ceilings.push((key.clone(), (len - 3) as f32 / rate));
+            c.keys.delays.push((key, line));
             let mut taps = Vec::new();
             for t in samples.operands() {
                 let dst = c.reg()?;
-                c.emit(Instr::DelayRead { dst, line, time: t });
+                c.emit(Instr::DelayRead {
+                    dst,
+                    line,
+                    time: t,
+                    want,
+                });
                 taps.push(Operand::Reg(dst));
             }
             c.emit(Instr::DelayWrite {
@@ -2415,26 +2578,48 @@ impl<'a> Compiler<'a> {
                 self.zip2(Op2::Max, &size, &CVal::Scalar(Operand::Const(1e-6)))
             }
             ("amp", [x]) => Ok(x.clone()),
-            // `x` when it is a constant now that the program is built,
-            // `otherwise` when it changes while playing.
-            ("fixed", [x, otherwise]) => {
-                if x.operands().iter().all(|o| const_of(*o).is_some()) {
-                    Ok(x.clone())
-                } else {
-                    Ok(otherwise.clone())
+            // A constant is its own ceiling. Otherwise `start`, or what it
+            // was raised to while playing, and `x` going past it is noted.
+            ("ceiling", [x, start]) => {
+                if let Some(c) = const_of(x.scalar()) {
+                    return Ok(CVal::Scalar(Operand::Const(c)));
                 }
+                let Some(start) = const_of(start.scalar()) else {
+                    return Err(Diagnostic::error(
+                        span,
+                        "the start of a `ceiling` must be a constant",
+                    ));
+                };
+                let segment = self.segment("ceiling");
+                let key = self.key(&format!("/{segment}"));
+                let value = start.max(self.defs.raised.get(&key).copied().unwrap_or(0.0));
+                let slot = u16::try_from(self.ceilings.len())
+                    .map_err(|_| Diagnostic::error(span, "too many ceilings"))?;
+                self.ceilings.push((key, value));
+                self.emit(Instr::Want {
+                    slot,
+                    x: x.scalar(),
+                    ceiling: value,
+                });
+                Ok(CVal::Scalar(Operand::Const(value)))
             }
             ("noise", []) => {
                 let source = u16::try_from(self.noises.len())
                     .map_err(|_| Diagnostic::error(span, "too many `noise()` calls"))?;
-                self.noises.push(self.defs.random.seed());
+                let segment = self.segment("noise");
+                let key = self.key(&format!("/{segment}"));
+                self.noises.push(self.defs.random.seed_at(&key));
+                self.keys.noises.push((key, source));
                 let dst = self.reg()?;
                 self.emit(Instr::Noise { dst, source });
                 Ok(CVal::Scalar(Operand::Reg(dst)))
             }
-            ("random", []) => Ok(CVal::Scalar(Operand::Const(self.defs.random.next()))),
+            ("random", []) => {
+                let r = self.pick();
+                Ok(CVal::Scalar(Operand::Const(r)))
+            }
             ("random", [lo, hi]) => {
-                let r = CVal::Scalar(Operand::Const(self.defs.random.next()));
+                let r = CVal::Scalar(Operand::Const(self.pick()));
                 let span = self.zip2(Op2::Sub, hi, lo)?;
                 let offset = self.zip2(Op2::Mul, &span, &r)?;
                 self.zip2(Op2::Add, lo, &offset)

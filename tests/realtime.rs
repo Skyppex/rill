@@ -295,3 +295,35 @@ fn delays_and_noise_do_not_allocate() {
     assert_eq!(count, 0);
     assert!(out.iter().any(|&x| x != 0.0));
 }
+
+#[test]
+fn swapping_programs_does_not_allocate() {
+    use rill::live::Live;
+    let config = Config {
+        sample_rate: 48_000,
+        max_frames: 64,
+        out_channels: 2,
+    };
+    let options = rill::lang::build::Options {
+        seed: Some(1),
+        ..Default::default()
+    };
+    let (mut live, mut player, _) = Live::from_text(DELAYS, config, "main", options).unwrap();
+    let mut out = vec![0.0f32; 2 * 1000];
+    player.render_interleaved(&mut out);
+    for round in 0..3 {
+        // Building happens on the control side; only the swap, the
+        // takeover, the crossfade and handing the old program back are
+        // measured.
+        let edited = DELAYS.replace("-18dB", &format!("-{}dB", 18 + round));
+        live.reload_text(&edited).unwrap();
+        let count = allocations_during(|| {
+            for _ in 0..4 {
+                player.render_interleaved(&mut out);
+            }
+        });
+        assert_eq!(count, 0, "round {round}");
+        live.collect();
+    }
+    assert!(out.iter().any(|&x| x != 0.0));
+}

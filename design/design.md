@@ -447,7 +447,7 @@ Two libraries come with the compiler, so every program has them wherever it runs
 **`delay(x, time, max)`** is what `x` was `time` ago:
 
 - A frame of times reads several taps from one buffer and gives a frame back: `delay(x, [10ms + lfo * 2ms, 25ms], max: 30ms)`. Every time is a stream, each tap its own, read between samples so a moving time does not crackle. A time is held between one sample and `max`.
-- `max` is the buffer's length, set aside when the program is built, so it must be a constant: the one thing about a delay that cannot move. Constant times are their own `max`. Moving times without one are a warning, and the delay holds up to 2s. A rill can pass its own parameter as `max`; it then has to be a constant where that rill is called.
+- `max` is the buffer's length, set aside when the program is built, so it must be a constant: the one thing about a delay that cannot move while it runs. Constant times are their own `max`. Moving times without one are a warning, and the delay holds 2s to start with. A rill can pass its own parameter as `max`; it then has to be a constant where that rill is called. A time past `max` is held at it until the line grows (see Live rebuilds).
 - Every call has its own buffer, as every rill call has its own state; a frame of channels gets one per channel.
 - Feedback goes through `state`, and whatever sits between the delay and the `state` is in the loop (it adds one sample to the loop's length):
 
@@ -460,7 +460,7 @@ rill echo(x: Sample, time: Time, feedback: Float) Sample {
 }
 ```
 
-**A parameter called `max`** is the ceiling for the arguments of its type: what has to exist before audio starts (a delay's memory, a filter's stages) is sized for it. When an argument of that type changes while playing and `max` is left out, the checker warns, and the call uses `max`'s default. This holds for any rill, not only the prelude's and core's. `fixed(x, otherwise)` (prelude) is `x` when it is a constant once the program is built, otherwise `otherwise`: how a rill picks such a size from a parameter that may or may not move.
+**A parameter called `max`** is the ceiling for the arguments of its type: what has to exist before audio starts (a delay's memory, a filter's stages) is sized for it. When an argument of that type changes while playing and `max` is left out, the checker warns, and the call uses `max`'s default. This holds for any rill, not only the prelude's and core's. A `max` is where a size starts, not a limit: a value that goes past it is held there for a few milliseconds while the program is rebuilt with room for it (see Live rebuilds). `ceiling(x, start)` (prelude) is how a rill picks such a size: `x` itself when it is a constant once the program is built; otherwise `start`, or what this place has grown to, and it notes when `x` goes past it.
 
 **Most powerful first.** Core keeps one function where one can express another: `slew` is the one-pole filter, the smoother and the envelope follower; `dynamics` is the compressor, limiter, expander and gate; `comb` is the echo, the comb filter and the allpass. A plain convenience on top (`sine` for `phasor |> as_sine()`) stays only where it reads much better.
 
@@ -469,7 +469,7 @@ rill echo(x: Sample, time: Time, feedback: Float) Sample {
 - **`@gen`**: generators. `@gen/osc` has oscillators in two halves: `phasor(freq, offset)`, a ramp from 0 to 1 per cycle that says where in the cycle you are (not meant to be heard), and the shapes `as_sine`, `as_saw` and `as_square`, which turn a phase into a wave (the saw and square band-limited with `poly_blep`, which is exported for custom shapes). `sine`, `saw` and `square` are the two together: `saw(f)` is `phasor(f) |> as_saw()`. Anything done to the phase in between works for every shape: `warp(phase, width)` moves the middle of the cycle, which is pulse width on a square and a brighter, squeezed wave on a sine or saw.
 - **`@gen/noise`**: `pink()` and `brown()` (white is `noise()`). Instruments, such as a plucked string, are made from these parts, not kept in core (`examples/delay.rill` builds one).
 - **`@effects/env`**: `slew(x, rise, fall)` (smoothing, following, one-pole lowpass) and `ahdsr(gate, attack, hold, decay, sustain, release)` (with `hold: 0s`, the default, an ADSR). Envelopes follow a gate: a `Float` above 0 while a note is held.
-- **`@effects/filter`**: `lowpass`, `highpass`, `bandpass`, `notch`, each `(x, cutoff, resonance, slope, max)`, built from state-variable stages that stay stable under any modulation. `slope` is a stream (`24dB / 1oct`; a slope between whole poles blends the two nearest); `max` is the steepest it will be, which sets how many stages are built.
+- **`@effects/filter`**: `lowpass`, `highpass`, `bandpass`, `notch`, each `(x, cutoff, resonance, slope, max)`, built from state-variable stages that stay stable under any modulation. `slope` is a stream (`24dB / 1oct`; a slope between whole poles blends the two nearest); `max` is the steepest it will be to start with (48 dB/oct when left out), which sets how many stages are built.
 - **`@effects/dynamics`**: `dynamics(x, threshold, above, below, attack, release)`; `above: 0.25` is 4:1 compression, `above: 0` a limiter, `below: 100` a gate.
 - **`@effects/delay`**: `comb(x, time, feedback, blend, tone, max)`: an echo, a pitched comb, or an allpass (`blend: -feedback`).
 - **`@mix/stereo`**: `pan(x, position)` (equal power, -1 to 1) and `width(x, amount)`.
@@ -490,7 +490,18 @@ Run-stage rules: no allocation, no locks, no syscalls, no unbounded loops; denor
 
 Per-callback inputs the runtime receives from the host: input buffer, output buffer, frame count (up to a declared maximum), channel counts, sample rate, frame position, and timestamped events. Buffers are planar internally; interleaved host buffers are converted at the boundary.
 
-Hot reload: build the new graph off the audio thread, swap it in with an atomic pointer, crossfade for a few milliseconds, and free the old graph off the audio thread.
+### Live rebuilds
+
+A running program can be replaced by a new build without a gap and without losing what it was doing: oscillators keep their phase, delays keep their echoes, envelopes, voices and playing sequences carry on. Two things rebuild it:
+
+- **Hot reload.** `rill play song.rill` watches every file in the program's tree and rebuilds when one changes (changes within 50ms of each other count as one), with the same seed. A build with errors is printed and the old program keeps playing; otherwise the terminal says `reloaded song.rill (12 states carried, 1 new)`. `--no-watch` turns this off, and a build without the `watch` cargo feature (on by default) leaves the watcher out entirely.
+- **Growing ceilings.** Every `max` is where a size starts. When a value goes past one (a host pushes a filter's slope past the stages built for it, or a delay's time past its line), the program holds it at the ceiling and notes how far it wanted to go. The control side rebuilds with that one place raised to 1.5 times what was asked, at most once per 50ms. Ceilings never shrink, and there is no upper size.
+
+**State is carried across by name.** Every piece of state (`state` registers, delay lines, noise, voice pools, sequences) has a key made of names, not positions: the `let`, `state`, assignment, `return` or handler each call is in, then the callee and its count among unnamed calls in that statement, as in `main#1/lead/saw#1/return/phasor#1.phase`. Copies and loop iterations add their index. So moving statements around, or editing one rill, never disturbs state elsewhere. Keys only on one side are then paired when they differ in one level and the state below has the same shape, so renaming a `let` keeps its state; two candidates pair neither. New keys start fresh, gone ones are dropped, and `random()` is seeded per key, so an edit only changes the picks of what it touched. Live controls keep their values.
+
+**Handing over.** The new program is built off the audio thread and passed over through an atomic slot. At the start of a block the audio thread copies state across, then runs both programs for 20ms, crossfading along half a cosine (the gains always add to 1), and passes the old one back to be freed. Events and controls reach both while they overlap. Nothing is allocated, locked or waited on by the audio thread. A build that arrives while one waits replaces it; one that arrives during a fade waits for it to end.
+
+In Rust, `rill::live::Live` is the control side (`reload`, `reload_text`, `grow`, `collect`) and `Player` the audio side (`render_*`, `set_param`, `dispatch`).
 
 Backends, in order of priority: per-block bytecode interpreter (first), compile-to-C for embedded (later), JIT via Cranelift (later).
 
@@ -547,5 +558,5 @@ The goal of the first milestone is hearing a sine wave from Rill source in real 
 - [x] **M5 — Pitch layer.** `Pitch`, `Interval`, chord literals, 12-TET and just tuning, constant folding.
 - [x] **M6 — Sequencing.** Time signatures, programmable sequences.
 - [x] **M7 — Module system.** Export/import, standard library.
-- [ ] **M8 — Hot reload.** Swap graphs with a crossfade while audio plays.
+- [x] **M8 — Hot reload.** Swap graphs with a crossfade while audio plays.
 - [ ] **M100 — Embedded spike.** Run a fixed patch on a microcontroller through the C API.

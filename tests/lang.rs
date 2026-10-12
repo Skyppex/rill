@@ -1033,6 +1033,18 @@ fn casts_with_as() {
     assert_eq!(t("let i = (sine(1Hz) * 10) as Int", "i"), Type::Int);
     assert_eq!(t("let f = 3 as Int as Float", "f"), Type::Float);
     assert_eq!(t("let s = 2.5 as Sample", "s"), Type::Sample);
+    assert_eq!(
+        t("let f = [1 as Sample, 2 as Sample, 3 as Sample] as Float", "f"),
+        frame(Type::Float, 3)
+    );
+    assert_eq!(
+        t("let f = [[1 as Sample; 3]; 8] as Float", "f"),
+        frame(frame(Type::Float, 3), 8)
+    );
+    assert_eq!(
+        t("let i = [[1.5 as Float; 3]; 8] as Int", "i"),
+        frame(frame(Type::Int, 3), 8)
+    );
     // A leading `-` binds tighter: this is `(-x) as Int`.
     let stmts = parse_body("let i = -x as Int").unwrap();
     let Stmt::Let {

@@ -3847,6 +3847,10 @@ impl Checker {
         if from.is_wild() || to.is_wild() {
             return Type::Error;
         }
+        if let Type::Frame(elem, size) = from {
+            let cast_elem = self.cast(span, elem, to);
+            return Type::Frame(Box::new(cast_elem), size.clone());
+        }
         if !matches!(to, Type::Sample | Type::Float | Type::Int) {
             let d = self
                 .error(span, format!("cannot cast to `{to}`"))
@@ -3867,7 +3871,6 @@ impl Checker {
             }
             Type::Gain => Some("use `amp(x)` for the amplitude factor of a level"),
             Type::Bool => Some("pick the numbers yourself, as in `if b { 1 } else { 0 }`"),
-            Type::Frame(..) => Some("cast the channels one at a time, as in `x[0] as Float`"),
             _ => None,
         };
         let mut d = self.error(span, format!("cannot cast `{from}` to `{to}`"));

@@ -6,16 +6,26 @@ import "@gen/osc"
 import "@mix/stereo"
 
 rill main(volume: Gain = -12dB) [Sample; 2] {
-    let voices = [C4, E4, G4]
+    let lfo = (
+        sine([random(), random(), random()] * 1Hz, offset: each random()) * 0.5
+        + 0.5
+    )
+
+    let lfo2 = (
+        sine([random(), random(), random()] * 1Hz, offset: each random()) * 0.5
+        + 0.5
+    )
+
+    let voices = [C2, G2, C3]
         |> just(C, 440Hz)
         // |> equal
         |> sine // [Sample; 3]
 
     // One position and one level per voice.
     let placed = voices
-        |> pan([-0.6, 0, 0.6]) // [[Sample; 2]; 3]
+        |> pan(lfo) // [[Sample; 2]; 3]
 
-    let shaped = placed + [0dB, -3dB, -6dB]
+    let shaped = placed + (lfo2 as Float * -24dB)
 
     return sum(shaped) + volume // [Sample; 2]
 }

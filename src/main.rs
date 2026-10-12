@@ -78,7 +78,7 @@ impl SourceArgs {
                 for w in &checked.warnings {
                     eprint!("{}", sources.render(w));
                 }
-                if self.seed.is_none() && checked.uses_builtin("random") {
+                if self.seed.is_none() && checked.uses_prelude("random") {
                     static SHOWN: std::sync::Once = std::sync::Once::new();
                     SHOWN.call_once(|| {
                         eprintln!("rill: random seed {seed} (repeat with --seed {seed})")
@@ -303,6 +303,12 @@ fn validate_rill_event_duration(
 
 #[derive(Subcommand)]
 enum Command {
+    /// List the core library's modules and what each exports, or print one
+    /// module's source, as in `rill core @gen/osc`.
+    Core {
+        /// A core module, as imported: `@gen/osc`.
+        module: Option<String>,
+    },
     /// Play a Rill file (or a built-in patch) on the default audio device.
     #[cfg(feature = "device")]
     Play {
@@ -446,6 +452,29 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             drop(playback);
+        }
+        Command::Core { module: None } => {
+            for (name, src) in rill::lang::core::FILES {
+                println!("@{name}");
+                for line in core_exports(src) {
+                    println!("  {line}");
+                }
+            }
+        }
+        Command::Core { module: Some(m) } => {
+            let name = m.strip_prefix('@').unwrap_or(&m);
+            let name = name.strip_suffix(".rill").unwrap_or(name);
+            match rill::lang::core::module(name) {
+                Some(src) => print!("{src}"),
+                None => {
+                    let names: Vec<String> = rill::lang::core::names().collect();
+                    return Err(format!(
+                        "there is no core module \"@{name}\"; there are {}",
+                        names.join(", ")
+                    )
+                    .into());
+                }
+            }
         }
         #[cfg(feature = "device")]
         Command::Devices => {
@@ -715,6 +744,50 @@ fn profile(
         frames.div_ceil(block)
     );
     Ok(())
+}
+
+/// What a core module exports, one line each: `rill saw(freq: Freq) Sample`.
+fn core_exports(src: &str) -> Vec<String> {
+    let Ok(program) = rill::lang::parse(src) else {
+        return Vec::new();
+    };
+    let text = |span: rill::lang::Span| &src[span.start as usize..span.end as usize];
+    let mut out: Vec<(u32, String)> = Vec::new();
+    for item in &program.items {
+        let d = item.def();
+        if d.export.is_some() {
+            // The signature: everything before the body, without `export`.
+            let head = text(rill::lang::Span {
+                start: d.span.start,
+                end: d.body.span.start,
+            });
+            let head = head.trim_start_matches("export").trim();
+            out.push((
+                d.span.start,
+                head.split_whitespace().collect::<Vec<_>>().join(" "),
+            ));
+        }
+    }
+    for c in program.consts.iter().filter(|c| c.export.is_some()) {
+        out.push((
+            c.span.start,
+            text(c.span).trim_start_matches("export").trim().to_owned(),
+        ));
+    }
+    for s in program.seqs.iter().filter(|s| s.export.is_some()) {
+        out.push((s.span.start, format!("seq {}", s.name.name)));
+    }
+    for e in program.events.iter().filter(|e| e.export.is_some()) {
+        out.push((
+            e.span.start,
+            text(e.span).trim_start_matches("export").trim().to_owned(),
+        ));
+    }
+    for i in program.imports.iter().filter(|i| i.export.is_some()) {
+        out.push((i.span.start, format!("everything from \"{}\"", i.path)));
+    }
+    out.sort();
+    out.into_iter().map(|(_, s)| s).collect()
 }
 
 /// Whether the root file of `program` exports anything.

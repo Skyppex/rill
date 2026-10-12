@@ -1,0 +1,43 @@
+// Oscillators in two halves: a phase, then a shape.
+//
+// - A phase is a ramp from 0 to 1 that starts again every cycle. How fast
+//   it goes round is the pitch: `phasor(220Hz)` goes round 220 times a
+//   second.
+// - A shape turns a phase into a wave: `as_sine`, `as_saw`, `as_square`.
+//   It has no frequency of its own; it hears whatever pitch the phase has.
+//
+// Anything done to the phase between the two works for every shape:
+// `warp` below gives pulse width to a square, and the same squeeze to a
+// sine or a saw.
+//
+// All of these come from the core library, which every program has.
+
+import "@gen/osc"
+
+rill main(volume: Gain = -18dB) [Sample; 2] {
+    // The same as `saw(110Hz)`, written out.
+    let plain = phasor(110Hz) |> as_saw()
+
+    // A slow wave from 0.1 to 0.9, made the same way: a phase at 0.2Hz,
+    // shaped into a sine.
+    let width = (phasor(0.2Hz) |> as_sine()) * 0.4 + 0.5
+
+    // Pulse width modulation on a square...
+    let pwm = phasor(165Hz) |> warp(width) |> as_square()
+
+    // ...and the same squeeze on a sine, which brightens it as it moves
+    // away from 0.5.
+    let bent = phasor(220Hz) |> warp(width) |> as_sine()
+
+    // Vibrato: a pitch that moves makes a phase that speeds up and slows
+    // down. The shape does not need to know.
+    let wobble = phasor(5Hz) |> as_sine()
+    let vibrato = phasor(330Hz + wobble * 4Hz) |> as_saw()
+
+    // Two saws a little apart in phase: one starts a quarter cycle later.
+    let left = saw(55Hz)
+    let right = saw(55Hz, offset: 0.25)
+
+    let mix = plain * 0.3 + pwm * 0.3 + bent * 0.4 + vibrato * 0.2
+    return [mix + left * 0.3, mix + right * 0.3] + volume
+}

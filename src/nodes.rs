@@ -237,14 +237,14 @@ impl Node for Unary {
         1
     }
 
-    fn process(&mut self, ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
-        let (op, rate) = (self.0, ctx.sample_rate);
+    fn process(&mut self, _: &Context, inputs: &Inputs, out: &mut Outputs) {
+        let op = self.0;
         let out = out.mono();
         match inputs.get(0) {
-            Signal::Const(x) => out.fill(op.apply(x, rate)),
+            Signal::Const(x) => out.fill(op.apply(x)),
             Signal::Buffer(x) => {
                 for (y, &x) in out.iter_mut().zip(x) {
-                    *y = op.apply(x, rate);
+                    *y = op.apply(x);
                 }
             }
         }

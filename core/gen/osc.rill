@@ -1,0 +1,86 @@
+// Oscillators, in two halves: a phase, then a shape.
+//
+// - A phase is a ramp from 0 to 1 that starts again every cycle; how fast
+//   it goes round is the pitch. It says where in the cycle you are, and is
+//   not meant to be heard.
+// - A shape turns a phase into a wave. It has no frequency of its own; it
+//   plays whatever pitch the phase has.
+//
+// Anything done to the phase between the two works for every shape: `warp`
+// gives pulse width to a square and the same squeeze to a sine or a saw.
+// `sine`, `saw` and `square` are the two halves put together.
+
+// A ramp from 0 to 1, `freq` times a second. `offset` starts it part of a
+// cycle later (0 to 1).
+export rill phasor(freq: Freq, offset: Float = 0) Float {
+    state phase: Float = 0
+    let out = wrap(phase + offset)
+    phase = wrap(phase + freq / RATE)
+    return out
+}
+
+// Moves the middle of the cycle to `width` (0 to 1): the first half of the
+// phase is squeezed into `width` of the cycle, the second half into the
+// rest. It never jumps, and 0.5 changes nothing. On a square this is pulse
+// width; on a sine or a saw it is the same squeeze, which brightens them.
+export fn warp(phase: Float, width: Float) Float {
+    let w = clamp(width, 0.01, 0.99)
+    if phase < w { phase / w * 0.5 } else { 0.5 + (phase - w) / (1 - w) * 0.5 }
+}
+
+// The correction a jump of 2 needs to remove most of its aliasing
+// (PolyBLEP). `t` is how far the phase is past the jump (0 to 1), and `dt`
+// how far it moves in one sample. Subtract it at a jump down, add it at a
+// jump up.
+export fn poly_blep(t: Float, dt: Float) Float {
+    if t < dt {
+        let x = t / dt
+        x + x - x * x - 1
+    } else if t > 1 - dt {
+        let x = (t - 1) / dt
+        x * x + x + x + 1
+    } else {
+        0
+    }
+}
+
+// A sine wave. It has no jumps, so it needs nothing but the phase.
+export fn as_sine(phase: Float) Sample {
+    sin(phase * TAU)
+}
+
+// A saw rising from -1 to 1, with its jump down where the phase starts
+// again. It measures how far the phase moved since the last sample, so the
+// correction is right however the phase was bent on the way.
+export rill as_saw(phase: Float) Sample {
+    state last: Float = 0
+    let dt = wrap(phase - last)
+    last = phase
+    return phase * 2 - 1 - poly_blep(phase, dt)
+}
+
+// 1 for the first half of the phase and -1 for the second: a jump up at 0
+// and a jump down at 0.5, each corrected.
+export rill as_square(phase: Float) Sample {
+    state last: Float = 0
+    let dt = wrap(phase - last)
+    last = phase
+    let naive = if phase < 0.5 { 1.0 } else { -1.0 }
+    return naive + poly_blep(phase, dt) - poly_blep(wrap(phase + 0.5), dt)
+}
+
+// A sine wave at `freq`.
+export rill sine(freq: Freq, offset: Float = 0) Sample {
+    return phasor(freq, offset) |> as_sine()
+}
+
+// A band-limited saw at `freq`, rising from -1 to 1.
+export rill saw(freq: Freq, offset: Float = 0) Sample {
+    return phasor(freq, offset) |> as_saw()
+}
+
+// A band-limited square at `freq`. For pulse width, warp the phase:
+// `phasor(freq) |> warp(width) |> as_square()`.
+export rill square(freq: Freq, offset: Float = 0) Sample {
+    return phasor(freq, offset) |> as_square()
+}

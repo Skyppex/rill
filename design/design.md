@@ -42,7 +42,8 @@ fn abs(x: Sample) Sample {
 rill peak(x: Sample, release: Time = 300ms) Sample {
     state level: Sample = 0
     let a = abs(x)
-    level = if a > level { a } else { level * decay(release) }
+    // Falls by 60 dB (to 0.001) over `release`.
+    level = if a > level { a } else { level * exp(log(0.001) / (release * RATE)) }
     return level
 }
 
@@ -124,10 +125,10 @@ rill pad() [Sample; 2] {
 ```
 
 - **Where.** At the top level, a `const` belongs to its file and can be used in any order: `CHORD` above uses `ROOT` before it is written. A cycle (`const A = B`, `const B = A`) is an error. In a block, a `const` is scoped to the block, like `let`.
-- **The value** must be constant: numbers with units, pitches, chords and frames, arithmetic, built-in functions of constants (`random()` included), other `const`s, sequence fields and `RATE`. A `fn` or `rill` cannot be used, and a `const` cannot hold a function.
+- **The value** must be constant: numbers with units, pitches, chords and frames, arithmetic, prelude functions of constants (`random()` included), other `const`s, sequence fields and `RATE`. A `fn` or `rill` cannot be used, and a `const` cannot hold a function.
 - **One value.** A top-level `const` is worked out once, so `DETUNE` is the same number everywhere it is used. A `const` in a rill is worked out once per instance: each of `[pad(); 4]` gets its own `random()`. It can use the rill's size parameters.
 - **Sizes.** A `const` holding a whole number of at least 1 is a size: `[Float; VOICES]`, `spread<VOICES>(...)`. One worked out from `RATE` or from a size parameter is not (yet).
-- A `const` cannot be assigned. A name in a block can shadow a top-level `const`; a top-level `const` cannot take the name of a definition, sequence, event, note (`A`, `C4`), built-in function or built-in constant.
+- A `const` cannot be assigned. A name in a block can shadow a top-level `const`; a top-level `const` cannot take the name of a definition, sequence, event, note (`A`, `C4`), prelude function or prelude constant.
 
 Rate rules:
 
@@ -167,7 +168,7 @@ sum([E4, F#4, B4] |> equal |> sine)     // a chord: three voices, mixed
 let tuning = fn(p: Pitch) Freq { pythagorean(p, D) }   // pick one, pass it around
 ```
 
-The built-in tunings take the pitch first, so pipes read naturally:
+The prelude's tunings take the pitch first, so pipes read naturally:
 
 ```rill
 equal(pitch: Pitch, steps: Int = 12, a4: Freq = 440Hz) Freq
@@ -181,7 +182,7 @@ Rules:
 - A `Pitch` is a position, not an amount: `Pitch ± Interval` gives a `Pitch` (the interval always comes after) and `Pitch - Pitch` gives the `Interval` between them. Pitches can be compared, but not scaled or added together.
 - `equal` places note names on the nearest of `steps` equal divisions of the octave. The scale tunings build twelve notes from ratios above their root and put A4 exactly on `a4`. In every tuning, fractions of a semitone (cents, bends) stay continuous.
 - A tuning's settings are ordinary arguments, so they can change while playing (`a4` from a live control, say). Your own tuning is any `fn(Pitch) Freq`.
-- Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Freq` and mixing on streams. The built-in tunings accept a chord and tune each pitch; passing the result to a rill that takes `Freq` lifts it to one voice per pitch.
+- Chords are frames of pitches, written with `[ ]` and commas, not `+`, because `+` already means addition on `Freq` and mixing on streams. The prelude's tunings accept a chord and tune each pitch; passing the result to a rill that takes `Freq` lifts it to one voice per pitch.
 - When every input is known at build time, tuning constant-folds to a number. Otherwise it is evaluated per tick.
 - Note events carry `pitch` as a `Pitch` and `velocity` (or `release`) in 0–1 (see Events). Velocity is linear; a curve such as `velocity * velocity` sounds more even, since a straight line is too loud at soft velocities.
 
@@ -399,7 +400,7 @@ Rules:
 - Function types are written `fn(A, B) R`. They cannot be `state`, frame elements, event fields or the entry rill's parameters.
 - An anonymous fn's parameter and return types can be left out when the surroundings say what they are (a parameter of function type, an annotated `let`, a `return`, or a fn's declared return type). Otherwise they are required.
 - Anonymous fns capture what they use, by value, at the point they are made. They are fns, so they are pure: they read what they capture but cannot change it, and cannot call rills.
-- A named fn can be used where a function type with fewer parameters is expected, if its remaining parameters have defaults. A built-in that works on several types (`sin`) needs an expected type to pick one.
+- A named fn can be used where a function type with fewer parameters is expected, if its remaining parameters have defaults. A prelude function that works on several types (`sin`) needs an expected type to pick one.
 - Rills are not values: they carry state, and whether an unchosen rill keeps running is not decided yet.
 - Recursion is still not allowed, including through function values.
 - At build time every call of a function value is replaced by the function's body, so function values cost nothing while playing. A function chosen while playing becomes a branch between the candidates; only the chosen one runs.
@@ -426,12 +427,24 @@ rill main() Sample { return pad(110Hz) + saw(55Hz) * 0.1 }
 
 - **Exports.** `export` goes before `fn`, `rill`, `const`, `event`, `seq` or `import`. Everything else is private to its file. Exporting a sequence exports the events it makes and its fields.
 - **Re-exports.** `export import "b"` passes on everything `b` exports, including what `b` passes on; `b` is imported in the file as well. Importing that file gives both.
+- **Core.** A path starting with `@` names a module of the core library (see Prelude and core), wherever the file is: `import "@gen/osc"`.
 - **Paths** are relative to the importing file, with `/` between folders and `..` for the folder above: `import "lib/osc"` reads `lib/osc.rill`. The extension is never written; `import "osc.rill"` is an error, and any other extension is not a Rill file. Every part of a path is a name as in code (a letter or `_`, then letters, digits or `_`, and not a keyword), so `my-osc.rill` cannot be imported: the `-` would read as minus. A file named that way can still be run.
 - **Names.** Imported names are used as they are: `saw`, not `osc.saw`. A file's own declaration wins over an imported one with the same name. Two imports exporting different things by one name is an error only where the name is used; one thing reached by two routes is not a clash.
 - **One program.** The program is every file reachable from the one being run, each loaded once. A file reached by two routes is one file: its sequences and `const`s exist once.
 - **Cycles** are allowed: files can import each other, and re-export each other. Recursion across files is still recursion.
 - **The entry** is looked up in the file being run, including what it imports. Every file can have its own private `main` to try it out alone. A file that exports something is a library, and `rill check` does not need it to have a `main`.
 - `import` and `export` are keywords, and only work at the top level of a file.
+
+## Prelude and core
+
+Two libraries come with the compiler, so every program has them wherever it runs.
+
+**The prelude** is what cannot be written in Rill, or would be much slower in it: the constants `PI`, `TAU` and `RATE`; maths (`sin`, `cos`, `tan`, `tanh`, `exp`, `log`, `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `wrap`, `min`, `max`, `clamp`); `sum` over frames of any size; `random`; the tunings (`equal`, `just`, `pythagorean`, `meantone`); and `level` and `amp`. It is always there and never imported.
+
+**`core`** is the standard library: ordinary Rill modules, imported with `@` and their folder: `import "@gen/osc"`. Only core paths start with `@`, so they never clash with a file next to yours. Their sources are the files under `core/` in the compiler's repository, built into the compiler, so `core` is the same everywhere and never read from disk. A program compiled from a string, with no file, can import core too. `rill core` lists the modules and what they export; `rill core @gen/osc` prints one.
+
+- **`@gen`**: generators. `@gen/osc` has oscillators in two halves: `phasor(freq, offset)`, a ramp from 0 to 1 per cycle that says where in the cycle you are (not meant to be heard), and the shapes `as_sine`, `as_saw` and `as_square`, which turn a phase into a wave (the saw and square band-limited with `poly_blep`, which is exported for custom shapes). `sine`, `saw` and `square` are the two together: `saw(f)` is `phasor(f) |> as_saw()`. Anything done to the phase in between works for every shape: `warp(phase, width)` moves the middle of the cycle, which is pulse width on a square and a brighter, squeezed wave on a sine or saw.
+- **`@effects`** (to come): envelopes, filters, delays, reverbs, dynamics.
 
 ## Execution model
 

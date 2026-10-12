@@ -51,12 +51,25 @@ fn strict_and_partial_agree_on_valid_programs() {
         if path.extension().is_none_or(|e| e != "rill") {
             continue;
         }
-        let src = std::fs::read_to_string(&path).unwrap();
-        let strict = rill::lang::parse(&src).unwrap();
-        let (program, checked, errors) = analyze(&src);
-        assert_eq!(program, strict, "{}", path.display());
+        // Whole programs, with what they import.
+        let load = |recover| rill::lang::module::load_tree(&path, None, &rill::lang::Disk, recover);
+        let (strict, partial) = (load(false), load(true));
+        assert!(
+            strict.diagnostics.is_empty(),
+            "{}: {:?}",
+            path.display(),
+            strict.diagnostics
+        );
+        assert!(
+            partial.diagnostics.is_empty(),
+            "{}: {:?}",
+            path.display(),
+            partial.diagnostics
+        );
+        assert_eq!(partial.program, strict.program, "{}", path.display());
+        let (checked, errors) = check_partial(&partial.program);
         assert!(errors.is_empty(), "{}: {errors:?}", path.display());
-        let expected = rill::lang::check::check(&strict).unwrap();
+        let expected = rill::lang::check::check(&strict.program).unwrap();
         assert_eq!(checked.types, expected.types);
     }
 }
@@ -178,9 +191,9 @@ rill f2(y: Sample) Sample { return y |> half }
     assert_eq!(r("N", 1), Resolution::Binding(binding("N")));
     assert_eq!(r("level", 1), Resolution::Binding(binding("level")));
     assert_eq!(r("half", 1), Resolution::Def(0));
-    assert_eq!(r("sum", 0), Resolution::Builtin("sum".into()));
+    assert_eq!(r("sum", 0), Resolution::Prelude("sum".into()));
     assert_eq!(r("A4", 0), Resolution::Note);
-    // A named argument resolves to the parameter it names; built-ins have
+    // A named argument resolves to the parameter it names; prelude functions have
     // no bindings for theirs.
     let a4 = nth(src, "a4", 0);
     assert!(checked.resolutions.iter().all(|(s, _)| *s != a4));

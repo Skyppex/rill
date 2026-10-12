@@ -13,7 +13,7 @@ rill sine(freq: Freq) Sample {
 rill peak(x: Sample, release: Time = 300ms) Sample {
     state level: Sample = 0
     let a = abs(x)
-    level = if a > level { a } else { level * decay(release) }
+    level = if a > level { a } else { level * exp(-6.9078 / (release * RATE)) }
     return level
 }
 rill mix_down<N>(x: [Sample; N]) [Sample; 1] {
@@ -376,7 +376,7 @@ fn fns_and_builtins_do_not_lift() {
     assert_eq!(msg, "`abs` takes one value, not a frame (`[number; 2]`)");
     assert!(
         help.unwrap()
-            .starts_with("built-in functions take one value")
+            .starts_with("prelude functions take one value")
     );
 
     // Saying so with a size parameter works.
@@ -879,8 +879,8 @@ fn functions_are_values() {
             "`t` takes 1 argument(s), but 2 were given",
         ),
         (
-            "let a = voice(E4, decay)",
-            "`decay` does not fit `fn(Pitch) Freq`",
+            "let a = voice(E4, wrap)",
+            "`wrap` does not fit `fn(Pitch) Freq`",
         ),
     ] {
         assert_eq!(error(&with(stmts)).0, msg, "{stmts}");
@@ -1645,7 +1645,7 @@ fn each_makes_an_argument_per_copy() {
     );
     assert_eq!(
         error(&with_voices("let x = sin(each random())")).0,
-        "`each` only works on rills, and `sin` is a built-in function"
+        "`each` only works on rills, and `sin` is a prelude function"
     );
     assert_eq!(
         error(&with_voices(
@@ -1984,11 +1984,11 @@ fn const_names_are_their_own() {
     for (src, msg) in [
         (
             "const RATE = 2",
-            "`RATE` is already the name of a built-in constant",
+            "`RATE` is already the name of a prelude constant",
         ),
         (
             "const sin = 2",
-            "`sin` is already the name of a built-in function",
+            "`sin` is already the name of a prelude function",
         ),
         ("const C4 = 2", "`C4` is already the name of a note"),
         (

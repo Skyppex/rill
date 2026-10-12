@@ -22,14 +22,15 @@
 
 pub mod ast;
 pub mod build;
-pub mod builtins;
 pub mod check;
 pub mod compile;
+pub mod core;
 pub mod diag;
 pub mod lexer;
 pub mod module;
 pub mod opt;
 pub mod parser;
+pub mod prelude;
 pub mod pretty;
 pub mod types;
 pub mod vector;
@@ -80,18 +81,13 @@ pub fn compile_entry(src: &str, entry: &str) -> Result<(ast::Program, Checked), 
 /// Parse and type-check `src`.
 pub fn compile(src: &str) -> Result<(ast::Program, Checked), Vec<Diagnostic>> {
     let program = parse(src)?;
-    if !program.imports.is_empty() {
-        return Err(program
-            .imports
-            .iter()
-            .map(|i| {
-                Diagnostic::error(i.path_span, "imports need a file to look next to")
-                    .with_help("compile the program from its file, as `rill check song.rill` does")
-            })
-            .collect());
+    if program.imports.is_empty() {
+        let checked = check::check(&program)?;
+        return Ok((program, checked));
     }
-    let checked = check::check(&program)?;
-    Ok((program, checked))
+    // Only core modules can be imported without a file to look next to.
+    let loaded = module::load_tree(Path::new(""), Some(src), &module::NoFiles, false);
+    check_loaded(loaded.program, loaded.diagnostics)
 }
 
 /// Parse and type-check the program starting at the file `path`, with every
@@ -102,25 +98,35 @@ pub fn compile_file(
     sources: &dyn Sources,
 ) -> (SourceMap, Result<(ast::Program, Checked), Vec<Diagnostic>>) {
     let loaded = module::load_tree(path, None, sources, false);
-    let mut found = loaded.diagnostics;
+    (
+        loaded.sources,
+        check_loaded(loaded.program, loaded.diagnostics),
+    )
+}
+
+/// Check a program read by [`module::load_tree`], unless reading it already
+/// went wrong; `found` is what reading it found.
+fn check_loaded(
+    program: ast::Program,
+    mut found: Vec<Diagnostic>,
+) -> Result<(ast::Program, Checked), Vec<Diagnostic>> {
     if found.iter().any(Diagnostic::is_error) {
         found.sort_by_key(|d| d.span.start);
-        return (loaded.sources, Err(found));
+        return Err(found);
     }
-    let result = match check::check(&loaded.program) {
+    match check::check(&program) {
         Ok(mut checked) => {
             found.extend(checked.warnings);
             found.sort_by_key(|d| d.span.start);
             checked.warnings = found;
-            Ok((loaded.program, checked))
+            Ok((program, checked))
         }
         Err(mut diags) => {
             diags.extend(found);
             diags.sort_by_key(|d| (!d.is_error(), d.span.start));
             Err(diags)
         }
-    };
-    (loaded.sources, result)
+    }
 }
 
 /// [`compile_file`], including that `entry` can run as the program.

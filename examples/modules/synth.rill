@@ -1,8 +1,9 @@
 // A pad voice, built from the other files.
 
-// `export import` passes on everything `osc` exports: a file importing
-// `synth` gets `saw` and `sine` too. `synth` can use them itself as well.
-export import "osc"
+// The oscillators come from the core library, which every program has.
+// `export import` passes on everything it exports: a file importing `synth`
+// gets `saw` and `sine` too. `synth` can use them itself as well.
+export import "@gen/osc"
 
 // A plain import: only this file sees `lowpass`.
 import "fx"

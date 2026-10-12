@@ -5,7 +5,7 @@
 //! - Units never appear or vanish implicitly: `440 + 1Hz` is an error, and
 //!   `Freq / Freq` is a plain number.
 //! - A rill taking a scalar can be applied to `[T; N]`; it runs once per
-//!   channel and returns a frame (lifting). A fn or built-in takes exactly
+//!   channel and returns a frame (lifting). A fn or prelude function takes exactly
 //!   what it declares and never lifts.
 //! - `state` lives only at the top of a rill body; only `state` can be
 //!   assigned to.
@@ -23,8 +23,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::ast::*;
-use super::builtins;
 use super::diag::{Diagnostic, Span, suggest};
+use super::prelude;
 use super::types::{
     Align, DefKind, ParamSig, Signature, Size, Type, align, coerces, frame_shape, join,
 };
@@ -164,11 +164,11 @@ pub struct Binding {
 }
 
 impl Checked {
-    /// Whether the program calls or names the built-in `name` anywhere.
-    pub fn uses_builtin(&self, name: &str) -> bool {
+    /// Whether the program calls or names the prelude function `name` anywhere.
+    pub fn uses_prelude(&self, name: &str) -> bool {
         self.resolutions
             .iter()
-            .any(|(_, r)| matches!(r, Resolution::Builtin(n) if n == name))
+            .any(|(_, r)| matches!(r, Resolution::Prelude(n) if n == name))
     }
 }
 
@@ -178,7 +178,7 @@ pub enum Resolution {
     Binding(BindingId),
     /// A fn or rill, by index into [`Checked::signatures`].
     Def(usize),
-    Builtin(String),
+    Prelude(String),
     Constant(String),
     /// A note name like `F#4`.
     Note,
@@ -1425,8 +1425,8 @@ impl Checker {
         if self.own_first(m, name, |g| matches!(g, Global::Def(_))) != Some(Global::Def(index)) {
             let e = self.error(d.name.span, format!("`{name}` is defined more than once"));
             self.report(e);
-        } else if builtins::constant(name).is_some() {
-            let e = self.error(d.name.span, format!("`{name}` is a built-in constant"));
+        } else if prelude::constant(name).is_some() {
+            let e = self.error(d.name.span, format!("`{name}` is a prelude constant"));
             self.report(e);
         }
 
@@ -1525,7 +1525,7 @@ impl Checker {
         if !self.is_const(default) {
             let e = self
                 .error(default.span, format!("default for `{param}` must be a constant"))
-                .with_help("defaults are fixed before audio starts; use literals, built-in constants and built-in functions");
+                .with_help("defaults are fixed before audio starts; use literals, prelude constants and prelude functions");
             self.report(e);
             return;
         }
@@ -2082,11 +2082,11 @@ impl Checker {
                     self.resolve(e.span, Resolution::Note);
                     return Type::Pitch;
                 }
-                if let Some(t) = builtins::constant(name) {
+                if let Some(t) = prelude::constant(name) {
                     self.resolve(e.span, Resolution::Constant(name.clone()));
                     return t.clone();
                 }
-                if self.def_named(name).is_some() || !builtins::lookup(name).is_empty() {
+                if self.def_named(name).is_some() || !prelude::lookup(name).is_empty() {
                     return self.fn_value(name, e.span, None);
                 }
                 let d = self.unknown_name(name, e.span);
@@ -2161,7 +2161,7 @@ impl Checker {
                                 expr.span,
                                 format!("range {name} must be known before audio starts"),
                             )
-                            .with_help("use literals, built-in constants, size parameters and pure built-in functions");
+                            .with_help("use literals, prelude constants, size parameters and pure prelude functions");
                         self.report(d);
                     }
                 }
@@ -2414,7 +2414,7 @@ impl Checker {
             .iter()
             .flat_map(|s| s.keys().map(String::as_str))
             .collect();
-        candidates.extend(builtins::CONSTANTS.iter().map(|(n, _)| *n));
+        candidates.extend(prelude::CONSTANTS.iter().map(|(n, _)| *n));
         candidates.extend(self.visible(|g| matches!(g, Global::Const(_))));
         let d = Diagnostic::error(span, format!("unknown name `{name}`"));
         match suggest(name, candidates) {
@@ -2447,7 +2447,7 @@ impl Checker {
 
         let sigs = match self.def_named(name) {
             Some(i) => vec![self.signatures[i].clone()],
-            None => builtins::lookup(name),
+            None => prelude::lookup(name),
         };
         if sigs.is_empty() {
             self.exprs(args);
@@ -2463,7 +2463,7 @@ impl Checker {
             let candidates = self
                 .visible(|g| matches!(g, Global::Def(_)))
                 .into_iter()
-                .chain(builtins::FUNCTIONS.iter().copied());
+                .chain(prelude::FUNCTIONS.iter().copied());
             if let Some(s) = suggest(name, candidates) {
                 d = d.with_help(format!("did you mean `{s}`?"));
             }
@@ -2476,7 +2476,7 @@ impl Checker {
             callee.span,
             match def {
                 Some(i) => Resolution::Def(i),
-                None => Resolution::Builtin(name.to_owned()),
+                None => Resolution::Prelude(name.to_owned()),
             },
         );
         let kind = sigs[0].kind;
@@ -2493,11 +2493,11 @@ impl Checker {
             };
             self.report(d);
         }
-        if kind != DefKind::Builtin {
+        if kind != DefKind::Prelude {
             self.note_use(name, callee.span);
         }
 
-        // Built-ins overloaded by arity (like `min`) are picked by argument
+        // Prelude functions overloaded by arity (like `min`) are picked by argument
         // count; everything else has one signature, with defaults.
         let sig = if sigs.len() == 1 {
             sigs[0].clone()
@@ -2616,8 +2616,8 @@ impl Checker {
 
         // Unify argument types with parameter types. A rill whose parameter
         // receives a value with more frame layers runs once per element of
-        // the extra layers (lifting); fns and built-ins never lift, except
-        // the built-ins documented to take a frame in their first parameter.
+        // the extra layers (lifting); fns and prelude functions never lift, except
+        // the prelude functions documented to take a frame in their first parameter.
         let mut subst = Subst::default();
         if let Some(explicit_sizes) = explicit_sizes {
             for (name, size) in sig.generics.iter().zip(explicit_sizes) {
@@ -2657,7 +2657,7 @@ impl Checker {
                     continue;
                 }
                 let lifts_here = kind == DefKind::Rill
-                    || (kind == DefKind::Builtin && pi == 0 && builtins::takes_frames(name));
+                    || (kind == DefKind::Prelude && pi == 0 && prelude::takes_frames(name));
                 if !lifts_here {
                     let msg = if matches!(p.ty, Type::Frame(..)) {
                         format!("`{name}` takes `{}`, not `{at}`", substitute(&p.ty, &trial))
@@ -2670,7 +2670,7 @@ impl Checker {
                              as in `fn {name}<N>(x: [Sample; N])`, or make it a rill to run it per channel"
                         )
                     } else {
-                        "built-in functions take one value; to run one per channel, call it from a \
+                        "prelude functions take one value; to run one per channel, call it from a \
                          rill and apply that rill to the frame"
                             .to_owned()
                     };
@@ -2832,7 +2832,7 @@ impl Checker {
                         return self.size_of(id.span, value);
                     }
                 }
-                if builtins::constant(&id.name).is_some() && !generics.contains(&id.name) {
+                if prelude::constant(&id.name).is_some() && !generics.contains(&id.name) {
                     let e = self
                         .error(id.span, format!("`{}` cannot be a size", id.name))
                         .with_help("a size is a whole number known while checking, as in `8` or `riff.step_count`");
@@ -3020,7 +3020,7 @@ impl Checker {
             if let Some(n) = names.iter().find(|n| self.def_named(n).is_some()) {
                 let e = self
                     .error(c.value.span, format!("`{n}` cannot be used in a `const`"))
-                    .with_help("a `const` is worked out before any fn or rill runs: from numbers, pitches, other `const`s and built-in functions of them");
+                    .with_help("a `const` is worked out before any fn or rill runs: from numbers, pitches, other `const`s and prelude functions of them");
                 self.report(e);
                 continue;
             }
@@ -3043,7 +3043,7 @@ impl Checker {
         if ok && let Some(part) = self.non_const_part(&c.value) {
             let e = self
                 .error(part.span, format!("the value of `{}` must be a constant", c.name.name))
-                .with_help("a `const` is worked out once, before audio starts: from numbers, pitches, other `const`s and built-in functions of them; use `let` for a value worked out while playing");
+                .with_help("a `const` is worked out once, before audio starts: from numbers, pitches, other `const`s and prelude functions of them; use `let` for a value worked out while playing");
             self.report(e);
             ok = false;
         }
@@ -3100,12 +3100,12 @@ impl Checker {
                 "a sequence"
             } else if self.own_has(m, n, |g| matches!(g, Global::Event(_))) {
                 "an event"
-            } else if builtins::constant(n).is_some() {
-                "a built-in constant"
+            } else if prelude::constant(n).is_some() {
+                "a prelude constant"
             } else if pitch_literal(n).is_some() {
                 "a note"
-            } else if !builtins::lookup(n).is_empty() {
-                "a built-in function"
+            } else if !prelude::lookup(n).is_empty() {
+                "a prelude function"
             } else {
                 continue;
             };
@@ -3284,7 +3284,7 @@ impl Checker {
             }
             (ExprKind::Name(name), Some(exp))
                 if self.lookup(name).is_none()
-                    && (self.def_named(name).is_some() || !builtins::lookup(name).is_empty()) =>
+                    && (self.def_named(name).is_some() || !prelude::lookup(name).is_empty()) =>
             {
                 self.fn_value(name, e.span, Some(exp))
             }
@@ -3294,16 +3294,16 @@ impl Checker {
         t
     }
 
-    /// The type of `name` (a fn or built-in, not a variable) used as a
+    /// The type of `name` (a fn or prelude function, not a variable) used as a
     /// value, fitted to `expected` if given.
     fn fn_value(&mut self, name: &str, span: Span, expected: Option<&Type>) -> Type {
         let sigs = match self.def_named(name) {
             Some(i) => vec![self.signatures[i].clone()],
-            None => builtins::lookup(name),
+            None => prelude::lookup(name),
         };
         let r = match self.def_named(name) {
             Some(i) => Resolution::Def(i),
-            None => Resolution::Builtin(name.to_owned()),
+            None => Resolution::Prelude(name.to_owned()),
         };
         self.resolve(span, r);
         let kind = sigs[0].kind;
@@ -3507,8 +3507,8 @@ impl Checker {
         Type::Error
     }
 
-    /// Known before audio starts: literals, built-in constants, size
-    /// parameters, and built-in functions of those.
+    /// Known before audio starts: literals, prelude constants, size
+    /// parameters, and prelude functions of those.
     fn is_const(&self, e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Number { .. } | ExprKind::Bool(_) => true,
@@ -3520,18 +3520,18 @@ impl Checker {
                 Some(v) => matches!(v.kind, VarKind::Size | VarKind::Const),
                 None => {
                     self.const_named(n).is_some()
-                        || builtins::constant(n).is_some()
+                        || prelude::constant(n).is_some()
                         || pitch_literal(n).is_some()
                         // A named fn is a fixed value.
                         || self.def_named(n).is_some_and(|i| self.signatures[i].kind == DefKind::Fn)
-                        || !builtins::lookup(n).is_empty()
+                        || !prelude::lookup(n).is_empty()
                 }
             },
             ExprKind::Call { callee, args, .. } => {
                 let name = callee.name.as_str();
                 self.lookup(name).is_none()
                     && self.def_named(name).is_none()
-                    && !builtins::lookup(name).is_empty()
+                    && !prelude::lookup(name).is_empty()
                     && args.iter().all(|a| self.is_const(&a.value))
             }
             ExprKind::Field(base, _) => self.seq_of(base).is_some(),
@@ -3618,7 +3618,7 @@ fn kind_word(kind: DefKind) -> &'static str {
     match kind {
         DefKind::Fn => "fn",
         DefKind::Rill => "rill",
-        DefKind::Builtin => "built-in function",
+        DefKind::Prelude => "prelude function",
     }
 }
 
@@ -3711,7 +3711,7 @@ fn fits(sig: &Signature, params: &[Type], ret: &Type) -> bool {
     !matches!(actual, Type::Error) && coerces(&actual, ret)
 }
 
-/// Does `t` mention a built-in type parameter?
+/// Does `t` mention a prelude type parameter?
 fn contains_param(t: &Type) -> bool {
     match t {
         Type::Param(_) => true,
@@ -3813,6 +3813,9 @@ fn build_scopes(program: &Program) -> (Vec<OwnNames>, Vec<Scope>, HashSet<Global
 /// The path module `from` imports module `to` by: both are paths from the
 /// root file's folder.
 fn relative_import(from: &str, to: &str) -> String {
+    if to.starts_with('@') {
+        return to.to_owned();
+    }
     let from_dir: Vec<&str> = from.split('/').collect::<Vec<_>>();
     let from_dir = &from_dir[..from_dir.len().saturating_sub(1)];
     let to: Vec<&str> = to.split('/').collect();
@@ -3870,7 +3873,7 @@ fn size_span(size: &SizeExpr) -> Span {
 fn unify(param: &Type, arg: &Type, subst: &mut Subst, generics: &[String]) -> bool {
     match param {
         Type::Param(c) => {
-            if !builtins::satisfies(c, arg) {
+            if !prelude::satisfies(c, arg) {
                 return false;
             }
             let joined = match subst.types.get(c) {

@@ -36,7 +36,7 @@ pub enum CVal {
 pub enum FnVal {
     /// A user fn, by index into the program's items.
     Def(usize),
-    /// A built-in, by name.
+    /// A prelude function, by name.
     Named(String),
     /// An anonymous fn (by expression id) and the scopes it captured.
     Lambda {
@@ -754,7 +754,7 @@ impl<'a> Compiler<'a> {
 
     fn op1(&mut self, op: Op1, x: Operand) -> CResult<Operand> {
         if let Operand::Const(x) = x {
-            return Ok(Operand::Const(op.apply(x, self.sample_rate)));
+            return Ok(Operand::Const(op.apply(x)));
         }
         let k = (1, op as u8, key(x), 0);
         if let Some(&r) = self.cse.get(&k) {
@@ -1298,7 +1298,7 @@ impl<'a> Compiler<'a> {
                 if let Some(Resolution::Def(i)) = self.defs.resolution(e.span) {
                     return Ok(CVal::Fn(FnVal::Def(*i)));
                 }
-                if !super::builtins::lookup(name).is_empty() {
+                if !super::prelude::lookup(name).is_empty() {
                     return Ok(CVal::Fn(FnVal::Named(name.clone())));
                 }
                 Err(internal(e.span, &format!("unknown name `{name}`")))
@@ -1904,7 +1904,7 @@ impl<'a> Compiler<'a> {
             }
             return self.call_value(&f, vals, e.span);
         }
-        // User definitions shadow built-ins.
+        // User definitions shadow prelude functions.
         if let Some((def, sig)) = self.defs.def_at(callee.span) {
             if sig.rate != (1, 1) {
                 return Err(rate_unsupported(callee.span, name));
@@ -1943,7 +1943,7 @@ impl<'a> Compiler<'a> {
         if !sizes.is_empty() {
             return Err(Diagnostic::error(
                 callee.span,
-                "built-in functions do not take explicit size arguments",
+                "prelude functions do not take explicit size arguments",
             ));
         }
         self.call_builtin(e.span, name, args)
@@ -2013,11 +2013,11 @@ impl<'a> Compiler<'a> {
                 self.inline(def, sig, filled, HashMap::new())
             }
             FnVal::Named(name) => {
-                let sigs = super::builtins::lookup(name);
+                let sigs = super::prelude::lookup(name);
                 let mut vals = vals;
                 if let [sig] = sigs.as_slice() {
                     for p in &sig.params[vals.len().min(sig.params.len())..] {
-                        let d = super::builtins::default_value(name, &p.name).ok_or_else(|| {
+                        let d = super::prelude::default_value(name, &p.name).ok_or_else(|| {
                             internal(span, &format!("missing argument `{}`", p.name))
                         })?;
                         vals.push(CVal::Scalar(Operand::Const(d)));
@@ -2246,10 +2246,10 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// A direct call of a built-in: arguments by position or name, with
+    /// A direct call of a prelude function: arguments by position or name, with
     /// defaults for the rest.
     fn call_builtin(&mut self, span: Span, name: &str, args: &[Arg]) -> CResult<CVal> {
-        let sigs = super::builtins::lookup(name);
+        let sigs = super::prelude::lookup(name);
         // Overloads are picked by argument count, as the checker did.
         let sig = match sigs.as_slice() {
             [sig] => Some(sig),
@@ -2273,7 +2273,7 @@ impl<'a> Compiler<'a> {
                 vals.push(match slot {
                     Some(a) => self.expr(a)?,
                     None => {
-                        let d = super::builtins::default_value(name, &p.name).ok_or_else(|| {
+                        let d = super::prelude::default_value(name, &p.name).ok_or_else(|| {
                             internal(span, &format!("missing argument `{}`", p.name))
                         })?;
                         CVal::Scalar(Operand::Const(d))
@@ -2288,7 +2288,7 @@ impl<'a> Compiler<'a> {
         self.builtin(span, name, vals)
     }
 
-    /// A built-in applied to its arguments, in parameter order.
+    /// A prelude function applied to its arguments, in parameter order.
     fn builtin(&mut self, span: Span, name: &str, vals: Vec<CVal>) -> CResult<CVal> {
         if let Some(op) = Op1::builtin(name) {
             return self.map1(op, &vals[0]);
@@ -2355,7 +2355,7 @@ fn is_interval(t: &Type) -> bool {
     }
 }
 
-/// Built-in constants. `RATE` is the host rate the graph is built for.
+/// Prelude constants. `RATE` is the host rate the graph is built for.
 pub fn constant(name: &str, sample_rate: f32) -> Option<f32> {
     match name {
         "PI" => Some(std::f32::consts::PI),

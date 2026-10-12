@@ -49,8 +49,6 @@ pub enum Op1 {
     Wrap,
     /// Toward zero, for `x as Int`.
     Trunc,
-    /// Per-tick multiplier that decays by 60 dB over the given seconds.
-    Decay,
 }
 
 /// `x.floor()`, written so it vectorizes on plain x86-64 (which has no SIMD
@@ -123,7 +121,7 @@ impl Op2 {
 
 impl Op1 {
     #[inline(always)]
-    pub fn apply(self, x: f32, sample_rate: f32) -> f32 {
+    pub fn apply(self, x: f32) -> f32 {
         match self {
             Op1::Neg => -x,
             Op1::Not => truth(x == 0.0),
@@ -140,15 +138,6 @@ impl Op1 {
             Op1::Round => x.round(),
             Op1::Wrap => x - x.floor(),
             Op1::Trunc => x.trunc(),
-            Op1::Decay => {
-                let ticks = x * sample_rate;
-                if ticks > 0.0 {
-                    // 0.001 is -60 dB.
-                    (0.001f32.ln() / ticks).exp()
-                } else {
-                    0.0
-                }
-            }
         }
     }
 
@@ -169,11 +158,10 @@ impl Op1 {
             Op1::Round => "round",
             Op1::Wrap => "wrap",
             Op1::Trunc => "trunc",
-            Op1::Decay => "decay",
         }
     }
 
-    /// The op behind a one-argument built-in function, if it is one.
+    /// The op behind a one-argument prelude function, if it is one.
     pub fn builtin(name: &str) -> Option<Op1> {
         Some(match name {
             "abs" => Op1::Abs,
@@ -188,7 +176,6 @@ impl Op1 {
             "ceil" => Op1::Ceil,
             "round" => Op1::Round,
             "wrap" => Op1::Wrap,
-            "decay" => Op1::Decay,
             _ => return None,
         })
     }
@@ -199,22 +186,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decay_reaches_minus_60_db() {
-        let rate = 48_000.0;
-        let k = Op1::Decay.apply(0.5, rate);
-        let after = k.powi(24_000);
-        assert!((after - 0.001).abs() < 1e-5, "{after}");
-        assert_eq!(Op1::Decay.apply(0.0, rate), 0.0);
-    }
-
-    #[test]
     fn logic_and_integers() {
         assert_eq!(Op2::Lt.apply(1.0, 2.0), 1.0);
         assert_eq!(Op2::And.apply(1.0, 0.0), 0.0);
-        assert_eq!(Op1::Not.apply(0.0, 1.0), 1.0);
+        assert_eq!(Op1::Not.apply(0.0), 1.0);
         assert_eq!(Op2::IDiv.apply(-7.0, 2.0), -3.0);
         assert_eq!(Op2::Rem.apply(-7.0, 2.0), -1.0);
-        assert_eq!(Op1::Wrap.apply(-0.25, 1.0), 0.75);
+        assert_eq!(Op1::Wrap.apply(-0.25), 0.75);
     }
 }
 

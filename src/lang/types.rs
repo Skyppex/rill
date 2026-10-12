@@ -37,7 +37,7 @@ pub enum Type {
     Unit,
     /// The expression always `return`s, so it never produces a value.
     Never,
-    /// A type parameter of a built-in, e.g. `T` in `min(a: T, b: T) T`.
+    /// A type parameter of a prelude function, e.g. `T` in `min(a: T, b: T) T`.
     Param(&'static str),
     /// Stands in after an error so one mistake is reported once.
     Error,
@@ -253,7 +253,7 @@ pub fn join(a: &Type, b: &Type) -> Option<Type> {
 pub enum DefKind {
     Fn,
     Rill,
-    Builtin,
+    Prelude,
 }
 
 impl DefKind {
@@ -261,7 +261,7 @@ impl DefKind {
         match self {
             DefKind::Fn => "fn",
             DefKind::Rill => "rill",
-            DefKind::Builtin => "built-in",
+            DefKind::Prelude => "prelude",
         }
     }
 }
@@ -273,7 +273,7 @@ pub struct ParamSig {
     pub has_default: bool,
 }
 
-/// The callable shape of a fn, rill or built-in.
+/// The callable shape of a fn, rill or prelude function.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Signature {
     pub kind: DefKind,

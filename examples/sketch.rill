@@ -9,7 +9,14 @@ fn abs(x: Sample) Sample {
 rill peak(x: Sample, release: Time = 300ms) Sample {
     state level: Sample = 0
     let a = abs(x)
-    level = if a > level { a } else { level * decay(release) }
+
+    // Falls by 60 dB (to 0.001) over `release`.
+    level = if a > level {
+        a
+    } else {
+        level * exp(log(0.001) / (release * RATE))
+    }
+
     return level
 }
 

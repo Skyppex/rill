@@ -151,7 +151,7 @@ pub enum VInstr {
     },
 }
 
-/// The built-in tunings, as run by [`Instr::Tune`].
+/// The prelude's tunings, as run by [`Instr::Tune`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tuning {
     Equal,
@@ -161,7 +161,7 @@ pub enum Tuning {
 }
 
 impl Tuning {
-    /// The tuning behind a built-in function name.
+    /// The tuning behind a prelude function name.
     pub fn builtin(name: &str) -> Option<Tuning> {
         Some(match name {
             "equal" => Tuning::Equal,
@@ -1261,7 +1261,6 @@ fn stop(run: &mut Run, seq: usize, k: usize, reason: EventKind) {
 
 /// Run `fast` (lowered from `instrs`) to the end.
 fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
-    let rate = run.rate;
     let mut pc = 0;
     while let Some(&f) = fast.get(pc) {
         pc += 1;
@@ -1300,14 +1299,14 @@ fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
             Fast::Op2RR { op, d, a, b } => set!(d, op.apply(r!(a), r!(b))),
             Fast::Op2RC { op, d, a, c } => set!(d, op.apply(r!(a), c)),
             Fast::Op2CR { op, d, c, b } => set!(d, op.apply(c, r!(b))),
-            Fast::Op1 { op, d, x } => set!(d, op.apply(r!(x), rate)),
+            Fast::Op1 { op, d, x } => set!(d, op.apply(r!(x))),
             Fast::JumpUnless { cond, target } => {
                 if r!(cond) == 0.0 {
                     pc = target as usize;
                 }
             }
             Fast::Jump { target } => pc = target as usize,
-            Fast::Vector { block } => run_vector(&code.vectors[block as usize], regs, rate),
+            Fast::Vector { block } => run_vector(&code.vectors[block as usize], regs),
             Fast::Slow { index } => {
                 if let Some(target) = step(&instrs[index as usize], code, run) {
                     pc = target;
@@ -1374,7 +1373,7 @@ enum Src {
 }
 
 /// Run every instruction of `block` over all of its lanes.
-fn run_vector(block: &VectorBlock, regs: &mut [f32], rate: f32) {
+fn run_vector(block: &VectorBlock, regs: &mut [f32]) {
     let n = usize::from(block.lanes);
     let p = regs.as_mut_ptr();
     // SAFETY: `check_vector` made sure every lane group and register is
@@ -1462,7 +1461,7 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32], rate: f32) {
                     Op1::Neg => unary!(d, x, |v: f32| -v),
                     Op1::Abs => unary!(d, x, f32::abs),
                     Op1::Not => unary!(d, x, |v: f32| truth(v == 0.0)),
-                    op => unary!(d, x, |v: f32| op.apply(v, rate)),
+                    op => unary!(d, x, |v: f32| op.apply(v)),
                 },
                 VInstr::Copy { d, s } => unary!(d, s, |v: f32| v),
                 VInstr::Select { d, cond, a, b } => {
@@ -1521,14 +1520,13 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32], rate: f32) {
 
 /// Run one instruction the general way; a jump's target if it jumps.
 fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
-    let rate = run.rate;
     let regs = &mut run.regs[..];
     match *instr {
         Instr::Op2 { op, dst, a, b } => {
             regs[dst as usize] = op.apply(val(regs, a), val(regs, b));
         }
         Instr::Op1 { op, dst, x } => {
-            regs[dst as usize] = op.apply(val(regs, x), rate);
+            regs[dst as usize] = op.apply(val(regs, x));
         }
         Instr::Copy { dst, src } => regs[dst as usize] = val(regs, src),
         Instr::Tune {
@@ -1554,7 +1552,7 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
             }
         }
         Instr::Jump { target } => return Some(target as usize),
-        Instr::Vector { block } => run_vector(&code.vectors[block as usize], regs, rate),
+        Instr::Vector { block } => run_vector(&code.vectors[block as usize], regs),
         Instr::InvokeSeq { call } => invoke(call, code, run),
         Instr::InvokeEvent { event, values } => {
             let kind = code.decls[usize::from(event.0)].kind;

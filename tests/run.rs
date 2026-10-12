@@ -428,7 +428,7 @@ fn peak_decays_by_60_db_over_its_release() {
         }
         rill peak(x: Sample, release: Time = 300ms) Sample {
             state level: Sample = 0
-            level = if abs(x) > level { abs(x) } else { level * decay(release) }
+            level = if abs(x) > level { abs(x) } else { level * exp(-6.9078 / (release * RATE)) }
             return level
         }
         rill main() Sample { return impulse(0) |> peak(release: 100ms) }

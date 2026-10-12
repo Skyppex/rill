@@ -1,6 +1,8 @@
-//! The prelude: built-in constants and functions.
+//! The prelude: the constants and functions every program has without
+//! naming them. Only what cannot be written in Rill (or would be much
+//! slower in it) belongs here; everything else goes in the core library.
 //!
-//! Built-ins use type parameters, which user code cannot declare:
+//! Prelude functions use type parameters, which user code cannot declare:
 //!
 //! - `T`: a plain number (`Sample`, `Float`, `Int` or a literal)
 //! - `S`: any number, with or without a unit, or a pitch
@@ -26,7 +28,7 @@ pub fn satisfies(param: &str, ty: &Type) -> bool {
         "T" => ty.is_plain(),
         "S" => ty.is_quantity(),
         "F" => ty.leaf().is_plain(),
-        _ => unreachable!("unknown builtin type parameter {param}"),
+        _ => unreachable!("unknown prelude type parameter {param}"),
     }
 }
 
@@ -38,7 +40,7 @@ pub fn lookup(name: &str) -> Vec<Signature> {
     let frame_f = || Type::Frame(Box::new(Type::Param("F")), Size::Var("N".into()));
 
     let sig = |params: &[(&str, Type)], ret: Type| Signature {
-        kind: DefKind::Builtin,
+        kind: DefKind::Prelude,
         name: name.to_owned(),
         generics: if params.iter().any(|(_, ty)| matches!(ty, Type::Frame(..))) {
             vec!["N".to_owned()]
@@ -67,8 +69,6 @@ pub fn lookup(name: &str) -> Vec<Signature> {
         ],
         "sum" => vec![sig(&[("x", frame_f())], f())],
         "clamp" => vec![sig(&[("x", s()), ("lo", s()), ("hi", s())], s())],
-        // Per-tick multiplier that decays by 60 dB over `time`.
-        "decay" => vec![sig(&[("time", Type::Time)], Type::Sample)],
         // Tunings: a pitch (or a chord of them) in, a frequency out.
         "equal" => vec![sig(
             &[
@@ -95,7 +95,7 @@ pub fn lookup(name: &str) -> Vec<Signature> {
     }
 }
 
-/// The default of built-in parameter `param` of `name`, if it has one.
+/// The default of prelude parameter `param` of `name`, if it has one.
 pub fn default_value(name: &str, param: &str) -> Option<f32> {
     match (name, param) {
         ("equal", "steps") => Some(12.0),
@@ -104,13 +104,13 @@ pub fn default_value(name: &str, param: &str) -> Option<f32> {
     }
 }
 
-/// Built-ins that accept a frame in their first parameter and return one
+/// Prelude functions that accept a frame in their first parameter and return one
 /// result per channel. Tunings do, so a chord can be tuned in one go.
 pub fn takes_frames(name: &str) -> bool {
     matches!(name, "equal" | "just" | "pythagorean" | "meantone")
 }
 
-/// What a built-in function or constant does, for tools such as editors.
+/// What a prelude function or constant does, for tools such as editors.
 pub fn doc(name: &str) -> Option<&'static str> {
     Some(match name {
         "PI" => "Half a turn, π ≈ 3.14159.",
@@ -146,9 +146,6 @@ pub fn doc(name: &str) -> Option<&'static str> {
              of frames, adds them channel by channel, so `sum` of stereo voices is a stereo mix."
         }
         "clamp" => "`x` limited to the range [`lo`, `hi`].",
-        "decay" => {
-            "Per-tick multiplier that falls by 60 dB over `time`. Multiply a level by it every tick for an exponential release."
-        }
         "equal" => {
             "Equal temperament: places `pitch` on the nearest of `steps` equal divisions of the octave, with A4 at `a4`. Accepts a chord and tunes each pitch."
         }
@@ -176,7 +173,7 @@ pub fn doc(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Every built-in function name, for suggestions.
+/// Every prelude function name, for suggestions.
 pub const FUNCTIONS: &[&str] = &[
     "level",
     "amp",
@@ -197,7 +194,6 @@ pub const FUNCTIONS: &[&str] = &[
     "max",
     "sum",
     "clamp",
-    "decay",
     "equal",
     "just",
     "pythagorean",

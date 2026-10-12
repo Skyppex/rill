@@ -30,6 +30,17 @@ pub trait Sources {
     }
 }
 
+/// No files at all: for a program from a string, which can only import
+/// the core library.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoFiles;
+
+impl Sources for NoFiles {
+    fn read(&self, _: &Path) -> io::Result<String> {
+        Err(io::Error::from(io::ErrorKind::NotFound))
+    }
+}
+
 /// Files on disk.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Disk;
@@ -74,6 +85,14 @@ pub struct SourceFile {
     pub text: String,
     /// Where its text starts in the program's spans.
     pub base: u32,
+}
+
+impl SourceFile {
+    /// For a file of the core library, its name as imported, without `@`:
+    /// `"gen/osc"`.
+    pub fn core_module(&self) -> Option<&str> {
+        self.display.strip_prefix('@')?.strip_suffix(".rill")
+    }
 }
 
 /// The files of a program and where each one's spans are.
@@ -168,7 +187,9 @@ pub fn load_tree(
     let stem = root
         .file_stem()
         .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-    if let Some((problem, fixed)) = name_problem(&stem) {
+    // A program from a string, not a file: it can only import core.
+    let no_file = root.as_os_str().is_empty();
+    if let Some((problem, fixed)) = name_problem(&stem).filter(|_| !no_file) {
         diagnostics.push(
             Diagnostic::warning(
                 Span::default(),
@@ -188,7 +209,7 @@ pub fn load_tree(
         diagnostics,
     };
     l.add(
-        root.to_owned(),
+        Some(root.to_owned()),
         sources.canonical(root),
         stem,
         root.display().to_string(),
@@ -213,6 +234,29 @@ pub fn load_tree(
             let import = l.files[i].program.imports[k].clone();
             if let Err(d) = check_path(&import.path, import.path_span) {
                 l.diagnostics.push(d);
+                continue;
+            }
+            if let Some(name) = import.path.strip_prefix('@') {
+                match load_core(&mut l, name, import.path_span) {
+                    Some(t) => l.files[i].program.imports[k].module = Some(t as u32),
+                    None => continue,
+                }
+                continue;
+            }
+            if no_file && i == 0 {
+                l.diagnostics.push(
+                    Diagnostic::error(import.path_span, "imports need a file to look next to")
+                        .with_help("only core modules, such as \"@gen/osc\", can be imported by a program that is not in a file"),
+                );
+                continue;
+            }
+            // Core modules only import each other: a relative path in one
+            // would depend on where the compiler was built.
+            if l.map.files[i].core_module().is_some() {
+                l.diagnostics.push(Diagnostic::error(
+                    import.path_span,
+                    "a core module imports other core modules, with `@`",
+                ));
                 continue;
             }
             let rel = format!("{}.rill", import.path);
@@ -243,7 +287,7 @@ pub fn load_tree(
                             .to_string_lossy()
                             .replace('\\', "/");
                         let display = normalize(&display_dir.join(&rel)).display().to_string();
-                        l.add(path.clone(), canonical, name, display, text);
+                        l.add(Some(path.clone()), canonical, name, display, text);
                         l.files.len() - 1
                     }
                     Err(_) => {
@@ -365,7 +409,7 @@ impl Loader {
     /// Parse one more file, after the others in the program's spans.
     fn add(
         &mut self,
-        path: PathBuf,
+        path: Option<PathBuf>,
         canonical: PathBuf,
         name: String,
         display: String,
@@ -381,17 +425,54 @@ impl Loader {
         self.diagnostics.extend(parse_errors);
         self.map.files.push(SourceFile {
             display,
-            path: Some(path.clone()),
+            path: path.clone(),
             text,
             base,
         });
         self.infos.push(ModuleInfo {
             name,
-            path: Some(path),
+            path,
             sees: Vec::new(),
         });
         self.files.push(File { canonical, program });
     }
+}
+
+/// Load the core module `name` (as in `"gen/osc"`), or find it already
+/// loaded. An error at `span` if there is none by that name.
+fn load_core(l: &mut Loader, name: &str, span: Span) -> Option<usize> {
+    let canonical = PathBuf::from(format!("@{name}.rill"));
+    if let Some(t) = l.files.iter().position(|f| f.canonical == canonical) {
+        return Some(t);
+    }
+    let Some(text) = super::core::module(name) else {
+        let names: Vec<String> = super::core::names().collect();
+        let wanted = format!("@{name}");
+        let help = match super::diag::suggest(&wanted, names.iter().map(String::as_str)) {
+            Some(s) => format!("did you mean \"{s}\"? `rill core` lists them all"),
+            None => format!(
+                "the core modules are {}",
+                names
+                    .iter()
+                    .map(|n| format!("\"{n}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        l.diagnostics.push(
+            Diagnostic::error(span, format!("there is no core module \"{wanted}\""))
+                .with_help(help),
+        );
+        return None;
+    };
+    l.add(
+        None,
+        canonical.clone(),
+        format!("@{name}"),
+        format!("@{name}.rill"),
+        text.to_owned(),
+    );
+    Some(l.files.len() - 1)
 }
 
 /// What is wrong with `path` in `import "path"`, as an error at `span`.
@@ -403,6 +484,26 @@ pub fn check_path(path: &str, span: Span) -> Result<(), Diagnostic> {
             "an import needs a module's name".into(),
             "as in `import \"osc\"` for `osc.rill` next to this file".into(),
         );
+    }
+    // A core module: `@` and its path in the core library.
+    if let Some(rest) = path.strip_prefix('@') {
+        let rest = rest.strip_suffix(".rill").map_or(Ok(rest), |stem| {
+            Err(
+                Diagnostic::error(span, "leave out `.rill`: a module is imported by its name")
+                    .with_help(format!("write `import \"@{stem}\"`")),
+            )
+        })?;
+        if rest.is_empty()
+            || rest
+                .split('/')
+                .any(|p| p.is_empty() || p == ".." || p == ".")
+        {
+            return error(
+                "a core module is named by its folders in the core library".into(),
+                "as in `import \"@gen/osc\"`".into(),
+            );
+        }
+        return Ok(());
     }
     if let Some(stem) = path.strip_suffix(".rill") {
         return error(

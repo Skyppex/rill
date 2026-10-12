@@ -31,7 +31,7 @@ enum Style {
     /// A label the tree adds, like `param`, `body` or `binary`.
     Property,
     Ident,
-    /// The name of a fn, rill or built-in function.
+    /// The name of a fn, rill or prelude function.
     Callable,
     Op,
     Type,
@@ -359,7 +359,7 @@ impl Printer<'_> {
             ExprKind::Number { .. } | ExprKind::Bool(_) => {
                 Node::leaf(typed(Label::default().value(self.text(e.span))))
             }
-            ExprKind::Name(name) if super::builtins::constant(name).is_some() => {
+            ExprKind::Name(name) if super::prelude::constant(name).is_some() => {
                 Node::leaf(typed(Label::default().value(name)))
             }
             ExprKind::Name(name) => Node::leaf(typed(Label::default().ident(name))),
@@ -568,7 +568,7 @@ mod tests {
     const SRC: &str = "\
 rill peak(x: Sample, release: Time = 300ms) Sample {
     state level: Sample = 0
-    level = if abs(x) > level { abs(x) } else { level * decay(release) }
+    level = if abs(x) > level { abs(x) } else { level * 0.999 }
     return level
 }
 rill main() Sample {
@@ -601,8 +601,7 @@ rill peak Sample
    │     └─ else
    │        └─ binary * : Sample
    │           ├─ level : Sample
-   │           └─ call decay : Sample
-   │              └─ release : Time
+   │           └─ 0.999 : number
    └─ return
       └─ level : Sample
 

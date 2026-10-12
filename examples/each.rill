@@ -10,33 +10,7 @@
 // playing. Every run sounds a little different; pass `--seed` (the one
 // printed at the start) to hear a run again.
 
-// The correction a jump at phase 0 needs, to remove most of its aliasing
-// (PolyBLEP). `dt` is how far the phase moves in one sample.
-fn blep(t: Float, dt: Float) Float {
-    if t < dt {
-        let x = t / dt
-        x + x - x * x - 1
-    } else if t > 1 - dt {
-        let x = (t - 1) / dt
-        x * x + x + x + 1
-    } else {
-        0
-    }
-}
-
-// `offset` starts the wave part of a cycle later (0 to 1).
-rill saw(freq: Freq, offset: Float = 0) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    let p = wrap(phase + offset)
-    return p * 2 - 1 - blep(p, freq / RATE)
-}
-
-rill sine(freq: Freq, offset: Float = 0) Sample {
-    state phase: Float = 0
-    phase = wrap(phase + freq / RATE)
-    return sin(wrap(phase + offset) * TAU)
-}
+import "@gen/osc"
 
 // A slow wave from 0 to 1.
 rill lfo(rate: Freq, offset: Float = 0) Float {

@@ -731,7 +731,11 @@ fn profile(
 
     let audio = frames as f64 / f64::from(rate);
     let load = total.as_secs_f64() / audio;
-    let (instructions, registers) = engine.program_size();
+    let rill::lang::vm::ProgramSize {
+        instructions,
+        operations,
+        registers,
+    } = engine.program_size();
     let build = if cfg!(debug_assertions) {
         "debug"
     } else {
@@ -741,7 +745,7 @@ fn profile(
     let how = if scalar { ", scalar" } else { "" };
     println!("{} ({build} build{how})", source.name());
     println!(
-        "  program:  {instructions} instructions per sample, {registers} registers, {} node(s); built in {:.1} ms",
+        "  program:  {instructions} instructions per sample ({operations} operations), {registers} registers, {} node(s); built in {:.1} ms",
         engine.node_count(),
         ms(build_time)
     );
@@ -761,7 +765,60 @@ fn profile(
         ms(budget),
         frames.div_ceil(block)
     );
+    // Which copies run together, and why the others do not.
+    let grouping = engine.grouping();
+    if !grouping.is_empty() {
+        let together = grouping.iter().filter(|g| g.why.is_none()).count();
+        println!(
+            "  grouped:  {together} of {} pools and loops run their copies together",
+            grouping.len()
+        );
+        // The same thing in every copy of an outer pool once, with a count:
+        // names that differ only by copy index, as `[3]`.
+        let mut left: Vec<(String, usize, &str, usize)> = Vec::new();
+        for g in grouping.iter().filter(|g| g.why.is_some()) {
+            let name = any_copy(&g.name);
+            let why = g.why.as_deref().unwrap_or_default();
+            match left
+                .iter_mut()
+                .find(|(n, c, w, _)| *n == name && *c == g.copies && *w == why)
+            {
+                Some(same) => same.3 += 1,
+                None => left.push((name, g.copies, why, 1)),
+            }
+        }
+        for (name, copies, why, times) in left {
+            let times = if times > 1 {
+                format!(", {times} times")
+            } else {
+                String::new()
+            };
+            println!("    {name} ({copies} copies{times}): {why}");
+        }
+    }
     Ok(())
+}
+
+/// `name` with every copy index (`[3]`) as `[*]`.
+fn any_copy(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find(']') {
+            Some(close) if close > 0 && after[..close].bytes().all(|b| b.is_ascii_digit()) => {
+                out.push_str("[*]");
+                rest = &after[close + 1..];
+            }
+            _ => {
+                out.push('[');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// What a core module exports, one line each: `rill saw(freq: Freq) Sample`.

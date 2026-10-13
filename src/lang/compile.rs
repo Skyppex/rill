@@ -406,6 +406,11 @@ pub fn compile_instance(
         });
     }
     let out = c.inline(def, sig, vals, HashMap::new())?;
+    // Names for reports: pools by their state keys, then the loops.
+    let mut pool_names = vec![String::new(); c.pools.len()];
+    for (key, pool) in &c.keys.pools {
+        pool_names[*pool as usize] = key.clone();
+    }
     let mut code = Code {
         instrs: c.code,
         post: c.post,
@@ -423,7 +428,9 @@ pub fn compile_instance(
             .into_iter()
             .chain(c.loop_ranges.into_iter().map(Some))
             .collect(),
+        lane_names: pool_names.into_iter().chain(c.loop_names).collect(),
         vectors: Vec::new(),
+        grouping: Vec::new(),
         noises: c.noises,
         delays: c.delays,
         keys: c.keys,
@@ -631,6 +638,8 @@ struct Compiler<'a> {
     in_lanes: u32,
     /// The loop ranges, kept apart until the pools are known.
     loop_ranges: Vec<Vec<(u32, u32)>>,
+    /// Where each of `loop_ranges` is, for reports.
+    loop_names: Vec<String>,
     /// The operator being compiled lines a shorter frame up with the inner
     /// layers of the longer one, not the outer ones.
     align_inner: bool,
@@ -692,6 +701,7 @@ impl<'a> Compiler<'a> {
             lane_ranges: Vec::new(),
             in_lanes: 0,
             loop_ranges: Vec::new(),
+            loop_names: Vec::new(),
             align_inner: false,
             noises: Vec::new(),
             delays: Vec::new(),
@@ -913,6 +923,9 @@ impl<'a> Compiler<'a> {
         }
         if self.main && n >= 2 {
             self.loop_ranges.push(ranges);
+            let at = self.path.join("/");
+            self.loop_names
+                .push(format!("{at}/{op:?} of {n}").to_lowercase());
         }
         Ok(CVal::Frame(out))
     }
@@ -1431,6 +1444,8 @@ impl<'a> Compiler<'a> {
                 }
                 if self.main && !returned && ranges.len() >= 2 {
                     self.loop_ranges.push(ranges);
+                    let at = self.path.join("/");
+                    self.loop_names.push(format!("{at}/for {}", name.name));
                 }
                 Ok((None, returned))
             }

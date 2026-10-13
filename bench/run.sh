@@ -198,13 +198,14 @@ measure() {
         echo "bench: $name failed:"$'\n'"${best#FAILED$'\n'}" >&2
         line="$(printf '%-12s %s' "$name" "failed")"
     else
-        line="$(printf '%-12s %8s %10s %15s %9s %10s %10s %9s' \
+        line="$(printf '%-12s %8s %10s %15s %9s %10s %10s %10s %9s' \
             "$name" \
             "$(field 's/.*load: *\([0-9.]*%\).*/\1/p' "$best")" \
             "$best_ns" \
             "$(field 's/.*worst \([0-9.]*\) ms of a \([0-9.]*\) ms.*/\1\/\2/p' "$best")" \
             "$(field 's/.*; \([0-9]*\) of \([0-9]*\) over budget.*/\1\/\2/p' "$best")" \
             "$(field 's/.*program: *\([0-9]*\) instructions.*/\1/p' "$best")" \
+            "$(field 's/.*(\([0-9]*\) operations).*/\1/p' "$best")" \
             "$(field 's/.* \([0-9]*\) registers.*/\1/p' "$best")" \
             "$(field 's/.*built in \([0-9.]*\) ms.*/\1/p' "$best")")"
     fi
@@ -232,8 +233,8 @@ for index in "${!files[@]}"; do
     details+="$(cat "$work/$index.details")"$'\n'
 done
 
-header="$(printf '%-12s %8s %10s %15s %9s %10s %10s %9s' \
-    bench load ns/sample "worst block ms" "over" instr/smp registers "build ms")"
+header="$(printf '%-12s %8s %10s %15s %9s %10s %10s %10s %9s' \
+    bench load ns/sample "worst block ms" "over" instr/smp ops/smp registers "build ms")"
 
 {
     echo "rill benchmarks: $message"
@@ -248,7 +249,9 @@ header="$(printf '%-12s %8s %10s %15s %9s %10s %10s %9s' \
     echo "ns/sample:   nanoseconds per frame of output"
     echo "worst block: the slowest callback / the time it had"
     echo "over:        callbacks over their time / all callbacks"
-    echo "instr/smp:   instructions per sample, after optimising"
+    echo "instr/smp:   instructions per sample, after optimising: what is dispatched"
+    echo "ops/smp:     operations per sample: the work those do (a vector block counts"
+    echo "             each of its instructions once per lane, a sum once per value)"
     echo
     echo "$header"
     printf '%s' "$table"

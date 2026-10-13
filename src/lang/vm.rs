@@ -514,8 +514,14 @@ pub struct Code {
     /// [`Code::instrs`] each copy (or iteration) fills, when it is in the
     /// tick's code.
     pub lane_ranges: Vec<Option<Vec<(u32, u32)>>>,
+    /// A name for each entry of [`Code::lane_ranges`], for reports: a
+    /// pool's state key, or where a `for` loop or a lifted operator is.
+    pub lane_names: Vec<String>,
     /// Copies of pools that run together, by [`Instr::Vector`].
     pub vectors: Vec<VectorBlock>,
+    /// Whether each pool (or loop) with copies to run together does, and
+    /// why not if not. Filled by the vectoriser; empty without it.
+    pub grouping: Vec<Grouping>,
     /// Per noise generator ([`Instr::Noise`]), its seed.
     pub noises: Vec<u64>,
     /// Per delay line ([`Instr::DelayRead`]), its length in samples,
@@ -2022,11 +2028,24 @@ impl Node for Program {
         }
     }
 
-    fn program_size(&self) -> Option<(usize, usize)> {
-        Some((
-            self.code.instrs.len() + self.code.post.len(),
-            self.code.regs,
-        ))
+    fn program_size(&self) -> Option<ProgramSize> {
+        let code = &self.code;
+        let instrs = code.instrs.iter().chain(&code.post);
+        let operations = instrs
+            .map(|i| match *i {
+                Instr::Vector { block } => {
+                    let block = &code.vectors[block as usize];
+                    block.instrs.len() * usize::from(block.lanes)
+                }
+                Instr::Sum { n, .. } => n as usize,
+                _ => 1,
+            })
+            .sum();
+        Some(ProgramSize {
+            instructions: code.instrs.len() + code.post.len(),
+            operations,
+            registers: code.regs,
+        })
     }
 
     fn reset(&mut self) {
@@ -2076,6 +2095,26 @@ impl Node for Program {
 }
 
 // ---- taking over from another build -----------------------------------------
+
+/// Whether a pool's copies (or a loop's iterations) run together.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Grouping {
+    /// What it is: a pool's state key, or where a loop is.
+    pub name: String,
+    pub copies: usize,
+    /// Why its copies run one at a time, or `None` if they run together.
+    pub why: Option<String>,
+}
+
+/// How big a program is, per sample: what the interpreter dispatches, and
+/// the work that does (an instruction per lane for a vector block, an add
+/// per value for a sum).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProgramSize {
+    pub instructions: usize,
+    pub operations: usize,
+    pub registers: usize,
+}
 
 /// The places a program sized when it was built, with their sizes, and a
 /// counter each for what it has asked of them while playing.
@@ -2264,6 +2303,10 @@ fn renamed(old: &[&(Kind, String, u32)], new: &[&(Kind, String, u32)]) -> Vec<(K
 impl Program {
     /// The places sized when the program was built, with their sizes, and
     /// what they have been asked for while playing, in the same order.
+    pub fn grouping(&self) -> &[Grouping] {
+        &self.code.grouping
+    }
+
     pub fn ceilings(&self) -> Ceilings {
         (self.code.ceilings.clone(), self.run.wants.clone())
     }

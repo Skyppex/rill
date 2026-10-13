@@ -134,7 +134,7 @@ pub trait Node: Send {
 
     /// For compiled programs: instructions run per tick and registers used,
     /// for profiling.
-    fn program_size(&self) -> Option<(usize, usize)> {
+    fn program_size(&self) -> Option<crate::lang::vm::ProgramSize> {
         None
     }
 

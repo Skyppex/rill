@@ -408,11 +408,25 @@ impl Engine {
     }
 
     /// Instructions per tick and registers, summed over compiled programs.
-    pub fn program_size(&self) -> (usize, usize) {
+    pub fn program_size(&self) -> crate::lang::vm::ProgramSize {
+        self.nodes.iter().filter_map(|n| n.program_size()).fold(
+            crate::lang::vm::ProgramSize::default(),
+            |a, b| crate::lang::vm::ProgramSize {
+                instructions: a.instructions + b.instructions,
+                operations: a.operations + b.operations,
+                registers: a.registers + b.registers,
+            },
+        )
+    }
+
+    /// Whether each pool of the program runs its copies together, and why
+    /// not where it does not.
+    pub fn grouping(&self) -> Vec<crate::lang::vm::Grouping> {
         self.nodes
             .iter()
-            .filter_map(|n| n.program_size())
-            .fold((0, 0), |(i, r), (ni, nr)| (i + ni, r + nr))
+            .filter_map(|n| n.program())
+            .flat_map(|p| p.grouping().to_vec())
+            .collect()
     }
 
     /// The program's declared events, indexed by [`EventId`].

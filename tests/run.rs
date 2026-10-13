@@ -1557,7 +1557,7 @@ fn same_either_way(
         let (graph, _) = lang::load_with(src, &config(channels), "main", &options)
             .unwrap_or_else(|d| panic!("{d:#?}"));
         let mut engine = Engine::new(graph, config(channels)).unwrap();
-        let size = engine.program_size().0;
+        let size = engine.program_size().instructions;
         let mut out = vec![0.0f32; frames * channels];
         let mut done = 0;
         for &(at, event) in events
@@ -1876,7 +1876,7 @@ fn random_numbers_are_constants() {
     };
     let (graph, _) = lang::load_with(src, &config(1), "main", &options).unwrap();
     let engine = Engine::new(graph, config(1)).unwrap();
-    assert_eq!(engine.program_size().0, 0);
+    assert_eq!(engine.program_size().instructions, 0);
 }
 
 #[test]
@@ -2209,6 +2209,54 @@ fn consts_are_worked_out_when_building() {
     ";
     let want = RATE as f32 / 2.0 / 1000.0 + 440.0 + 880.0 + 1.0;
     close(&render(src, 2), &[want, want], 1e-3);
+}
+
+#[test]
+fn the_report_says_which_copies_run_alone_and_why() {
+    let src = "
+        import \"@gen/osc\"
+        rill echo(x: Sample, time: Time) Sample {
+            return delay(x, time, max: 50ms)
+        }
+        rill sometimes(every: Int) Sample {
+            state n: Int = 0
+            n = n + 1
+            return if n % every == 0 { noise() } else { 0 }
+        }
+        rill main() [Sample; 2] {
+            let tones = sum(saw([110Hz, 220Hz, 330Hz, 440Hz]))
+            let echoes = sum(echo(tones, [10ms, 20ms, 30ms]))
+            let clicks = sum(sometimes([2, 3, 5]))
+            return [tones + echoes, clicks]
+        }
+    ";
+    let options = lang::build::Options {
+        seed: Some(7),
+        ..Default::default()
+    };
+    let (graph, _) =
+        lang::load_with(src, &config(2), "main", &options).unwrap_or_else(|d| panic!("{d:#?}"));
+    let engine = Engine::new(graph, config(2)).unwrap();
+    let grouping = engine.grouping();
+    let why = |part: &str| {
+        grouping
+            .iter()
+            .find(|g| g.name.contains(part))
+            .unwrap_or_else(|| panic!("no {part} in {grouping:#?}"))
+            .why
+            .clone()
+    };
+    assert_eq!(why("tones"), None, "{grouping:#?}");
+    assert!(why("echoes").unwrap().contains("reads a delay line"));
+    assert!(
+        why("clicks")
+            .unwrap()
+            .contains("noise() on only some paths")
+    );
+    // Four saws in one block: a few instructions, but every one of them
+    // per saw.
+    let size = engine.program_size();
+    assert!(size.operations > size.instructions * 2, "{size:?}");
 }
 
 #[test]

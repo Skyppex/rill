@@ -31,24 +31,27 @@
 use std::collections::HashMap;
 
 use super::opt::{Usage, reads, usage, writes};
-use super::vm::{Code, Instr, Operand, Reg, Source, VArg, VInstr, VectorBlock};
+use super::vm::{Code, Grouping, Instr, Operand, Reg, Source, VArg, VInstr, VectorBlock};
 use crate::ops::{Op1, Op2};
 
 /// Replace every pool whose copies can run together with a vector block.
 pub fn vectorize(code: &mut Code) {
     let usage = usage(code);
+    // What happened to each pool, as far as it is known yet.
+    let mut outcome: Vec<Option<Outcome>> = vec![None; code.lane_ranges.len()];
     // Pools whose copies are back to back in the tick's code.
-    let mut regions: Vec<(usize, u32, u32)> = code
-        .lane_ranges
-        .iter()
-        .enumerate()
-        .filter_map(|(p, r)| {
-            let r = r.as_ref()?;
-            let contiguous = r.windows(2).all(|w| w[0].1 == w[1].0);
-            (r.len() >= 2 && contiguous && r[0].0 < r[r.len() - 1].1)
-                .then(|| (p, r[0].0, r[r.len() - 1].1))
-        })
-        .collect();
+    let mut regions: Vec<(usize, u32, u32)> = Vec::new();
+    for (p, r) in code.lane_ranges.iter().enumerate() {
+        let Some(r) = r else { continue };
+        if r.len() < 2 || r[0].0 >= r[r.len() - 1].1 {
+            continue;
+        }
+        if r.windows(2).all(|w| w[0].1 == w[1].0) {
+            regions.push((p, r[0].0, r[r.len() - 1].1));
+        } else {
+            outcome[p] = Some(Outcome::Left(Why::Apart));
+        }
+    }
     // The most lanes first, then the largest: of an outer pool and the
     // pools inside it, the one with more copies gains the most.
     regions.sort_by_key(|&(p, s, e)| {
@@ -57,8 +60,9 @@ pub fn vectorize(code: &mut Code) {
     });
     let mut chosen: Vec<(usize, u32, u32)> = Vec::new();
     for r in regions {
-        if chosen.iter().all(|c| r.2 <= c.1 || r.1 >= c.2) {
-            chosen.push(r);
+        match chosen.iter().find(|c| !(r.2 <= c.1 || r.1 >= c.2)) {
+            None => chosen.push(r),
+            Some(c) => outcome[r.0] = Some(Outcome::Inside(c.0)),
         }
     }
     // Old register -> new register, for every register in a lane group.
@@ -81,11 +85,15 @@ pub fn vectorize(code: &mut Code) {
             .map(|(a, b)| (a - shift, b - shift))
             .collect();
         let mut next = code.regs as u32;
-        let Some((block, new_names, consts)) =
-            vectorize_pool(code, &usage, &ranges, s, e, &renames, &mut next)
-        else {
-            continue;
-        };
+        let (block, new_names, consts) =
+            match vectorize_pool(code, &usage, &ranges, s, e, &renames, &mut next) {
+                Ok(done) => done,
+                Err(why) => {
+                    outcome[pool] = Some(Outcome::Left(why));
+                    continue;
+                }
+            };
+        outcome[pool] = Some(Outcome::Grouped);
         code.regs = next as usize;
         renames.extend(new_names);
         code.state_init.extend(consts);
@@ -94,10 +102,110 @@ pub fn vectorize(code: &mut Code) {
         replace_region(&mut code.instrs, s, e, Instr::Vector { block: index });
         replaced.push((s0, e0 - s0 - 1));
     }
+    code.grouping = outcome
+        .iter()
+        .enumerate()
+        .filter_map(|(p, o)| {
+            let o = o.as_ref()?;
+            let copies = code.lane_ranges[p].as_ref().map_or(0, Vec::len);
+            let name = |p: usize| code.lane_names.get(p).cloned().unwrap_or_default();
+            let why = match o {
+                Outcome::Grouped => None,
+                Outcome::Left(why) => Some(why.to_string()),
+                Outcome::Inside(outer) => match &outcome[*outer] {
+                    Some(Outcome::Grouped) => None,
+                    _ => Some(format!(
+                        "it is inside {}, which was tried instead",
+                        name(*outer)
+                    )),
+                },
+            };
+            Some(Grouping {
+                name: name(p),
+                copies,
+                why,
+            })
+        })
+        .collect();
     // The copy ranges no longer match the code.
     code.lane_ranges.fill(None);
     if !renames.is_empty() {
         rename(code, &renames);
+    }
+}
+
+/// What became of a pool.
+#[derive(Clone, Debug)]
+enum Outcome {
+    Grouped,
+    /// Inside the pool at this index, which was tried in its place (it has
+    /// more copies, or is bigger).
+    Inside(usize),
+    Left(Why),
+}
+
+/// Why a pool's copies cannot run together.
+#[derive(Clone, Debug)]
+enum Why {
+    /// Other code sits between its copies.
+    Apart,
+    /// Code outside jumps into the middle of it.
+    JumpIn,
+    /// It jumps out of its own code.
+    JumpOut,
+    /// The copies compiled to different instructions.
+    Differ,
+    /// An instruction that has no form for lanes.
+    Unsupported(&'static str),
+    /// `noise()` that does not run on every path.
+    BranchNoise,
+    /// The copies' noise generators are not evenly spaced.
+    NoiseSpacing,
+    /// A register would need two places, or there are none left.
+    Registers,
+    /// More copies than a block can hold.
+    TooMany,
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Why::Apart => write!(f, "other code sits between its copies"),
+            Why::JumpIn => write!(f, "code outside it jumps into it"),
+            Why::JumpOut => write!(f, "it jumps out of its own code"),
+            Why::Differ => write!(
+                f,
+                "its copies compile to different code (a branch decided when \
+                 building, or a different callee)"
+            ),
+            Why::Unsupported(what) => write!(f, "it {what}"),
+            Why::BranchNoise => write!(f, "it calls noise() on only some paths"),
+            Why::NoiseSpacing => write!(f, "its noise generators are not evenly spaced"),
+            Why::Registers => write!(f, "a value would need two places in the lanes"),
+            Why::TooMany => write!(f, "it has more than 65,535 copies"),
+        }
+    }
+}
+
+/// What an instruction that cannot run in lanes does, for [`Why`].
+fn what(i: &Instr) -> &'static str {
+    match i {
+        Instr::DelayRead { .. } => "reads a delay line",
+        Instr::DelayWrite { .. } => "writes a delay line",
+        Instr::Want { .. } => "checks a ceiling (a growing max)",
+        Instr::InvokeSeq { .. } => "starts a sequence",
+        Instr::Halt { .. } => "stops a sequence",
+        Instr::InvokeEvent { .. } => "sends an event",
+        Instr::LoadCapture { .. } | Instr::SetSlot { .. } => "follows a playing sequence",
+        Instr::Vector { .. } => "holds copies that already run together",
+        Instr::Sum { .. } => "sums",
+        Instr::Noise { .. } => "calls noise()",
+        Instr::Jump { .. } | Instr::JumpUnless { .. } => "branches",
+        Instr::Op1 { .. }
+        | Instr::Op2 { .. }
+        | Instr::Copy { .. }
+        | Instr::Select { .. }
+        | Instr::Tune { .. } => "computes",
     }
 }
 
@@ -229,7 +337,7 @@ fn vectorize_pool(
     e: u32,
     earlier: &HashMap<Reg, Reg>,
     next: &mut u32,
-) -> Option<Block> {
+) -> Result<Block, Why> {
     let list = &code.instrs;
     // Nothing outside may jump into the middle of the region.
     for (i, instr) in list.iter().enumerate() {
@@ -241,7 +349,7 @@ fn vectorize_pool(
             && target > s
             && target < e
         {
-            return None;
+            return Err(Why::JumpIn);
         }
     }
     // Each copy as straight-line code.
@@ -251,7 +359,7 @@ fn vectorize_pool(
     }
     let len = copies[0].len();
     if copies.iter().any(|c| c.len() != len) {
-        return None;
+        return Err(Why::Differ);
     }
     let mut written = std::collections::HashSet::new();
     for c in &copies {
@@ -280,20 +388,26 @@ fn vectorize_pool(
                     .iter()
                     .all(|i| matches!(i, Instr::Op2 { op: o, .. } if *o == op))
                 {
-                    return None;
+                    return Err(Why::Differ);
                 }
-                let a = g.arg(&ops(&|i| match *i {
-                    Instr::Op2 { a, .. } => a,
-                    _ => unreachable!(),
-                }))?;
-                let b = g.arg(&ops(&|i| match *i {
-                    Instr::Op2 { b, .. } => b,
-                    _ => unreachable!(),
-                }))?;
-                let d = g.dst(&dsts(&|i| match *i {
-                    Instr::Op2 { dst, .. } => dst,
-                    _ => unreachable!(),
-                }))?;
+                let a = g
+                    .arg(&ops(&|i| match *i {
+                        Instr::Op2 { a, .. } => a,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                let b = g
+                    .arg(&ops(&|i| match *i {
+                        Instr::Op2 { b, .. } => b,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                let d = g
+                    .dst(&dsts(&|i| match *i {
+                        Instr::Op2 { dst, .. } => dst,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
                 VInstr::Op2 { op, d, a, b }
             }
             Instr::Op1 { op, .. } => {
@@ -301,35 +415,43 @@ fn vectorize_pool(
                     .iter()
                     .all(|i| matches!(i, Instr::Op1 { op: o, .. } if *o == op))
                 {
-                    return None;
+                    return Err(Why::Differ);
                 }
-                let x = g.arg(&ops(&|i| match *i {
-                    Instr::Op1 { x, .. } => x,
-                    _ => unreachable!(),
-                }))?;
-                let d = g.dst(&dsts(&|i| match *i {
-                    Instr::Op1 { dst, .. } => dst,
-                    _ => unreachable!(),
-                }))?;
+                let x = g
+                    .arg(&ops(&|i| match *i {
+                        Instr::Op1 { x, .. } => x,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                let d = g
+                    .dst(&dsts(&|i| match *i {
+                        Instr::Op1 { dst, .. } => dst,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
                 VInstr::Op1 { op, d, x }
             }
             Instr::Copy { .. } => {
                 if !at.iter().all(|i| matches!(i, Instr::Copy { .. })) {
-                    return None;
+                    return Err(Why::Differ);
                 }
-                let s = g.arg(&ops(&|i| match *i {
-                    Instr::Copy { src, .. } => src,
-                    _ => unreachable!(),
-                }))?;
-                let d = g.dst(&dsts(&|i| match *i {
-                    Instr::Copy { dst, .. } => dst,
-                    _ => unreachable!(),
-                }))?;
+                let s = g
+                    .arg(&ops(&|i| match *i {
+                        Instr::Copy { src, .. } => src,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                let d = g
+                    .dst(&dsts(&|i| match *i {
+                        Instr::Copy { dst, .. } => dst,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
                 VInstr::Copy { d, s }
             }
             Instr::Select { .. } => {
                 if !at.iter().all(|i| matches!(i, Instr::Select { .. })) {
-                    return None;
+                    return Err(Why::Differ);
                 }
                 let part = |n: usize| {
                     ops(&move |i| match *i {
@@ -337,13 +459,15 @@ fn vectorize_pool(
                         _ => unreachable!(),
                     })
                 };
-                let cond = g.arg(&part(0))?;
-                let a = g.arg(&part(1))?;
-                let b = g.arg(&part(2))?;
-                let d = g.dst(&dsts(&|i| match *i {
-                    Instr::Select { dst, .. } => dst,
-                    _ => unreachable!(),
-                }))?;
+                let cond = g.arg(&part(0)).ok_or(Why::Registers)?;
+                let a = g.arg(&part(1)).ok_or(Why::Registers)?;
+                let b = g.arg(&part(2)).ok_or(Why::Registers)?;
+                let d = g
+                    .dst(&dsts(&|i| match *i {
+                        Instr::Select { dst, .. } => dst,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
                 VInstr::Select { d, cond, a, b }
             }
             Instr::Tune { tuning, .. } => {
@@ -351,7 +475,7 @@ fn vectorize_pool(
                     .iter()
                     .all(|i| matches!(i, Instr::Tune { tuning: t, .. } if *t == tuning))
                 {
-                    return None;
+                    return Err(Why::Differ);
                 }
                 let part = |n: usize| {
                     ops(&move |i| match *i {
@@ -361,13 +485,15 @@ fn vectorize_pool(
                         _ => unreachable!(),
                     })
                 };
-                let pitch = g.arg(&part(0))?;
-                let setting = g.arg(&part(1))?;
-                let a4 = g.arg(&part(2))?;
-                let d = g.dst(&dsts(&|i| match *i {
-                    Instr::Tune { dst, .. } => dst,
-                    _ => unreachable!(),
-                }))?;
+                let pitch = g.arg(&part(0)).ok_or(Why::Registers)?;
+                let setting = g.arg(&part(1)).ok_or(Why::Registers)?;
+                let a4 = g.arg(&part(2)).ok_or(Why::Registers)?;
+                let d = g
+                    .dst(&dsts(&|i| match *i {
+                        Instr::Tune { dst, .. } => dst,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
                 VInstr::Tune {
                     tuning,
                     d,
@@ -386,44 +512,55 @@ fn vectorize_pool(
                         Instr::Noise { source, .. } => Some(usize::from(source)),
                         _ => None,
                     })
-                    .collect::<Option<_>>()?;
-                let stride = sources[1].checked_sub(sources[0]).filter(|&s| s > 0)?;
+                    .collect::<Option<_>>()
+                    .ok_or(Why::Differ)?;
+                let stride = sources[1]
+                    .checked_sub(sources[0])
+                    .filter(|&s| s > 0)
+                    .ok_or(Why::NoiseSpacing)?;
                 if sources
                     .iter()
                     .enumerate()
                     .any(|(k, &s)| s != sources[0] + k * stride)
                 {
-                    return None;
+                    return Err(Why::NoiseSpacing);
                 }
-                let d = g.dst(&dsts(&|i| match *i {
-                    Instr::Noise { dst, .. } => dst,
-                    _ => unreachable!(),
-                }))?;
+                let d = g
+                    .dst(&dsts(&|i| match *i {
+                        Instr::Noise { dst, .. } => dst,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
                 VInstr::Noise {
                     d,
                     source,
-                    stride: u16::try_from(stride).ok()?,
+                    stride: u16::try_from(stride).map_err(|_| Why::NoiseSpacing)?,
                 }
             }
-            _ => return None,
+            other => return Err(Why::Unsupported(what(&other))),
         };
         instrs.push(v);
     }
-    let lanes = u16::try_from(copies.len()).ok()?;
-    Some((VectorBlock { lanes, instrs }, g.names, g.consts))
+    let lanes = u16::try_from(copies.len()).map_err(|_| Why::TooMany)?;
+    Ok((VectorBlock { lanes, instrs }, g.names, g.consts))
 }
 
 /// `copy` (which starts at `offset` in the tick's code) as straight-line
 /// code with the same effect, or `None` if it has side effects.
-fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Option<Vec<Instr>> {
+fn straighten(
+    copy: &[Instr],
+    offset: u32,
+    usage: &Usage,
+    next: &mut u32,
+) -> Result<Vec<Instr>, Why> {
     let len = copy.len();
     let mut targets = vec![Vec::new(); len + 1];
     for (i, instr) in copy.iter().enumerate() {
         match *instr {
             Instr::Jump { target } | Instr::JumpUnless { target, .. } => {
-                let t = target.checked_sub(offset)? as usize;
+                let t = target.checked_sub(offset).ok_or(Why::JumpOut)? as usize;
                 if t > len {
-                    return None;
+                    return Err(Why::JumpOut);
                 }
                 targets[t].push(i);
             }
@@ -433,14 +570,14 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
             | Instr::Select { .. }
             | Instr::Tune { .. }
             | Instr::Noise { .. } => {}
-            _ => return None,
+            other => return Err(Why::Unsupported(what(&other))),
         }
     }
     let jumps = copy
         .iter()
         .any(|i| matches!(i, Instr::Jump { .. } | Instr::JumpUnless { .. }));
     if !jumps {
-        return Some(copy.to_vec());
+        return Ok(copy.to_vec());
     }
     let target_of = |i: &Instr| match *i {
         Instr::Jump { target } | Instr::JumpUnless { target, .. } => (target - offset) as usize,
@@ -518,7 +655,7 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
                 acc = Some(match acc {
                     None => w,
                     Some(a) => {
-                        let d = fresh(next)?;
+                        let d = fresh(next).ok_or(Why::Registers)?;
                         out.push(Instr::Op2 {
                             op: Op2::Or,
                             dst: d,
@@ -552,15 +689,15 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
         match copy[i] {
             Instr::JumpUnless { cond, .. } => {
                 let t = target_of(&copy[i]);
-                let not = fresh(next)?;
+                let not = fresh(next).ok_or(Why::Registers)?;
                 out.push(Instr::Op1 {
                     op: Op1::Not,
                     dst: not,
                     x: cond,
                 });
-                let taken = and(pred, Operand::Reg(not), &mut out, next)?;
+                let taken = and(pred, Operand::Reg(not), &mut out, next).ok_or(Why::Registers)?;
                 incoming[t].push(taken);
-                cur = Some(and(pred, cond, &mut out, next)?);
+                cur = Some(and(pred, cond, &mut out, next).ok_or(Why::Registers)?);
             }
             Instr::Jump { .. } => {
                 incoming[target_of(&copy[i])].push(pred);
@@ -568,7 +705,7 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
             }
             // Noise run on a path not taken would still move its generator
             // on, so only noise that always runs can go in a block.
-            Instr::Noise { .. } if pred != one => return None,
+            Instr::Noise { .. } if pred != one => return Err(Why::BranchNoise),
             instr => {
                 let mut d: Reg = 0;
                 writes(&instr, &mut |r| d = r);
@@ -585,7 +722,7 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
                 if pred == one || temporary {
                     out.push(instr);
                 } else {
-                    let t = fresh(next)?;
+                    let t = fresh(next).ok_or(Why::Registers)?;
                     let mut guarded = instr;
                     match &mut guarded {
                         Instr::Op1 { dst, .. }
@@ -607,7 +744,7 @@ fn straighten(copy: &[Instr], offset: u32, usage: &Usage, next: &mut u32) -> Opt
             }
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 /// Put `instr` in place of `list[s..e]`, moving jumps after it along.

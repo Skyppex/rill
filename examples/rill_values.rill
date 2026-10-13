@@ -37,6 +37,8 @@ rill voice(
 }
 
 rill main(volume: Gain = -10dB) [Sample; 2] {
+    let lfo = (sine(0.5Hz) / 2 + 1) * 20Hz
+
     // The annotation fixes the callable type and lets `bright` drop its
     // defaulted parameters not mentioned here.
     let lead: rill(Freq, Float) Sample = if slow_switch(55Hz) {

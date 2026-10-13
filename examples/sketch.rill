@@ -4,6 +4,8 @@
 
 import "@gen/osc"
 import "@effects/env"
+import "@gen/noise"
+import "@effects/filter"
 
 fn abs(x: Sample) Sample {
     if x < 0 { -x } else { x }
@@ -72,11 +74,11 @@ rill crush(x: Sample, bits: Float = 8, hold: Time = 0.5ms) Sample {
 
 // Entry point: the program runs `main` and plays what it returns.
 rill main() Sample {
-    let lfo = sine(0.5Hz) * 0.5 + 0.5
+    let lfo = perlin(1Hz)
     let voice1 = sine(440Hz)
     let voice2 = square(440Hz)
 
-    let voice = wavetable(voice1, voice2, lfo)
+    let voice = wavetable(voice1, voice2, lfo) |> lowpass(2000Hz)
 
-    return voice - 12dB
+    return voice - 24dB
 }

@@ -4,19 +4,13 @@
 
 import "@gen/osc"
 import "@mix/stereo"
+import "@gen/noise"
 
 rill main(volume: Gain = -12dB) [Sample; 2] {
-    let lfo = (
-        sine([random(), random(), random()] * 1Hz, offset: each random()) * 0.5
-        + 0.5
-    )
+    let lfo = perlin([random() * 1Hz, random() * 0.5Hz, random() * 0.5Hz])
+    let lfo2 = perlin([random() * 0.5Hz, random() * 0.5Hz, random() * 0.5Hz])
 
-    let lfo2 = (
-        sine([random(), random(), random()] * 1Hz, offset: each random()) * 0.5
-        + 0.5
-    )
-
-    let voices = [C2, G2, C3]
+    let voices = [C3, G3, E4]
         |> just(C, 440Hz)
         // |> equal
         |> sine // [Sample; 3]

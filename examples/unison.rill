@@ -3,6 +3,7 @@
 // frames, and `sum` mixes them down to one.
 
 import "@gen/osc"
+import "@gen/noise"
 import "@effects/filter"
 import "@mix/stereo"
 
@@ -85,16 +86,20 @@ rill main(volume: Gain = 0dB) [Sample; 2] {
     let chord2 = [G2, D3, B3, F4, A#4]
     let freqs = chord1 |> equal
 
-    const UNISON = 16
+    const UNISON = 3
 
     return (
         (
             unison<UNISON>(freqs, 10cents)
                 |> saw(offset: each random())
+                |> tremolo(
+                    speed: each perlin(1Hz) * 1Hz,
+                    offset: each random(),
+                    depth: 1,
+                )
                 |> sum
                 |> unison_pan
                 |> sum
-                |> tremolo(5Hz, depth: 0.4)
         )
             / UNISON
         + volume

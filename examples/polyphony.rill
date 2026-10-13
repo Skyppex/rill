@@ -7,8 +7,23 @@ import "@mix/stereo"
 import "@gen/noise"
 
 rill main(volume: Gain = -12dB) [Sample; 2] {
-    let lfo = perlin([random() * 1Hz, random() * 0.5Hz, random() * 0.5Hz])
-    let lfo2 = perlin([random() * 0.5Hz, random() * 0.5Hz, random() * 0.5Hz])
+    let lfo = (
+        sine(
+            [perlin(100Hz), perlin(100Hz), perlin(100Hz)] * 1Hz,
+            offset: each random(),
+        )
+            * 0.5
+        + 0.5
+    )
+
+    let lfo2 = (
+        sine(
+            [perlin(100Hz), perlin(100Hz), perlin(100Hz)] * 1Hz,
+            offset: each random(),
+        )
+            * 0.5
+        + 0.5
+    )
 
     let voices = [C3, G3, E4]
         |> just(C, 440Hz)

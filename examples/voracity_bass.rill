@@ -4,7 +4,6 @@
 import "@gen/osc"
 import "@effects/env"
 import "@effects/filter"
-import "@effects/delay"
 import "@mix/stereo"
 
 seq bass(step: 1/16, tempo: 100bpm, gate: 0.6, loop: true) {
@@ -63,10 +62,10 @@ rill main(volume: Gain = -9dB) [Sample; 2] {
 
     let synth = sum([voice(); 6])
 
-    let space = [
-        comb(synth[0], 241ms, feedback: 0.3, tone: 1.5kHz),
-        comb(synth[1], 362ms, feedback: 0.3, tone: 1.5kHz),
-    ]
+    // let space = [
+    //     comb(synth[0], 241ms, feedback: 0.3, tone: 1.5kHz),
+    //     comb(synth[1], 362ms, feedback: 0.3, tone: 1.5kHz),
+    // ]
 
-    return synth + space * 0.3 + volume
+    return synth + volume
 }

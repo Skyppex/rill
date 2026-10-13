@@ -13,7 +13,10 @@
 //!   writes that must not happen on the side not taken go through a
 //!   `Select` on that side's condition. A temporary is computed without a
 //!   select when everything that reads it can only run after it, since
-//!   whatever it feeds is guarded in turn.
+//!   whatever it feeds is guarded in turn. A register every path writes,
+//!   and nothing on the way reads (the result of an `if` with an `else`),
+//!   needs no guard on its first write. The tick's other `if`s are made
+//!   straight-line the same way ([`straighten_branches`]).
 //! - **Registers are renumbered.** A register that differs per copy joins a
 //!   lane group: one register per copy, in a row. Everything in the program
 //!   that refers to those registers is renumbered to match. A constant that
@@ -158,7 +161,7 @@ pub fn straighten_branches(code: &mut Code) {
     let mut moved = vec![0u32; list.len() + 1];
     let mut i = 0;
     while i < list.len() {
-        let Instr::Jump { target } | Instr::JumpUnless { target, .. } = list[i] else {
+        let (Instr::Jump { target } | Instr::JumpUnless { target, .. }) = list[i] else {
             moved[i] = out.len() as u32;
             out.push(list[i]);
             i += 1;
@@ -784,6 +787,33 @@ fn straighten(
     for (i, instr) in copy.iter().enumerate() {
         reads(instr, &mut |r| local_reads.entry(r).or_default().push(i));
     }
+    // Registers every path writes and nothing here reads (the result of an
+    // `if` with an `else`): their value from before is never seen, so the
+    // first write needs no guard. Paths that skip it write over it later.
+    let mut first_free: HashMap<Reg, usize> = HashMap::new();
+    let mut written: HashMap<Reg, Vec<usize>> = HashMap::new();
+    for (i, instr) in copy.iter().enumerate() {
+        writes(instr, &mut |r| written.entry(r).or_default().push(i));
+    }
+    for (&d, at) in &written {
+        if local_reads.contains_key(&d) {
+            continue;
+        }
+        // Paths to the end that write `d` nowhere.
+        let mut c = vec![0u128; len + 1];
+        c[0] = 1;
+        for i in 0..len {
+            if c[i] == 0 || at.contains(&i) {
+                continue;
+            }
+            for j in succ(i) {
+                c[j] = c[j].saturating_add(c[i]);
+            }
+        }
+        if c[len] == 0 {
+            first_free.insert(d, at[0]);
+        }
+    }
     let fresh = |next: &mut u32| -> Option<Reg> {
         let r = *next;
         *next = next.checked_add(1)?;
@@ -880,7 +910,7 @@ fn straighten(
                     && local_reads
                         .get(&d)
                         .is_none_or(|js| js.iter().all(|&j| j > i && dominates(i, j)));
-                if pred == one || temporary {
+                if pred == one || temporary || first_free.get(&d) == Some(&i) {
                     out.push(instr);
                 } else {
                     let t = fresh(next).ok_or(Why::Registers)?;

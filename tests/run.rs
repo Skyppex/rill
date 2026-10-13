@@ -2343,6 +2343,55 @@ fn a_value_from_the_last_sample_loops_without_a_cycle() {
 }
 
 #[test]
+fn an_if_that_chooses_between_values_streams() {
+    // Both sides run, and a select picks; nothing has to wait for the
+    // last sample.
+    let s = stages_of(
+        "rill main(gain: Float = 0.7) [Sample; 2] {
+            let x = if gain > 0.5 { tanh(gain * 2) } else if gain > 0.2 { gain } else { 0 }
+            return [x, x * 0.5]
+        }",
+    );
+    let (streams, loops) = s.counts();
+    assert!(streams > 0 && loops == 0, "{s:#?}");
+}
+
+#[test]
+fn an_if_with_noise_on_one_side_stays_a_branch() {
+    // Noise run on the side not taken would still move its generator on.
+    let s = stages_of(
+        "rill main(gain: Float = 0.7) [Sample; 2] {
+            let x = if gain > 0.5 { noise() } else { 0 }
+            return [x, x]
+        }",
+    );
+    let why: Vec<&str> = s.looping.iter().map(|(w, _)| *w).collect();
+    assert!(why.contains(&"in an `if`"), "{why:?}");
+}
+
+#[test]
+fn the_side_of_an_if_not_taken_leaves_nothing_behind() {
+    // Both sides run once straightened: `1 / x` is infinite when `x` is
+    // 0, and the counter would count every sample, but neither may show.
+    let out = render_with(
+        "rill main() [Sample; 2] {
+            state x: Float = 0
+            state n: Float = 0
+            let y = if x > 0 { 1 / x } else { 0 }
+            if x > 0.5 {
+                n = n + 1
+            }
+            x = x + 0.25
+            return [y, n]
+        }",
+        2,
+        4,
+        Blocks::Fixed(64),
+    );
+    assert_eq!(out, vec![0.0, 0.0, 4.0, 0.0, 2.0, 0.0, 4.0 / 3.0, 1.0]);
+}
+
+#[test]
 fn a_tempo_that_follows_computed_values_runs_sample_by_sample() {
     // When steps fall depends on what the tick computes, sample by sample;
     // a tempo that is a control is known ahead, and does not need that.

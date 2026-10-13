@@ -9,7 +9,14 @@ use rill::{Config, Engine, Graph, ParamEvent, RillEvent, patches};
 
 #[derive(Parser)]
 #[command(
-    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RILL_COMMIT"), ")"),
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("RILL_COMMIT"),
+        "; ",
+        env!("RILL_RUSTC"),
+        ")"
+    ),
     about = "Rill: a language for real-time audio"
 )]
 struct Cli {
@@ -712,9 +719,11 @@ fn profile(
     }
     engine.reset();
 
-    let mut worst = Duration::ZERO;
     let mut late = 0usize;
     let budget = Duration::from_secs_f64(block as f64 / f64::from(rate));
+    // Every block's time, set aside first so measuring allocates nothing.
+    let mut times: Vec<Duration> = Vec::with_capacity(frames.div_ceil(block));
+    let cpu_before = cpu_usage();
     let started = Instant::now();
     let mut done = 0;
     while done < frames {
@@ -722,11 +731,21 @@ fn profile(
         let t = Instant::now();
         engine.render_interleaved(&mut out[..n * usize::from(channels)]);
         let took = t.elapsed();
-        worst = worst.max(took);
+        times.push(took);
         late += usize::from(took > budget);
         done += n;
     }
     let total = started.elapsed();
+    let cpu = cpu_usage()
+        .zip(cpu_before)
+        .map(|(after, before)| after.since(&before));
+    times.sort_unstable();
+    let worst = times.last().copied().unwrap_or_default();
+    // The block time that `p` of the blocks were faster than.
+    let at = |p: f64| {
+        let i = ((times.len() as f64 * p).ceil() as usize).clamp(1, times.len().max(1)) - 1;
+        times.get(i).copied().unwrap_or_default()
+    };
     std::hint::black_box(&out);
 
     let audio = frames as f64 / f64::from(rate);
@@ -765,6 +784,34 @@ fn profile(
         ms(budget),
         frames.div_ceil(block)
     );
+    println!(
+        "  spread:   median {:.3} ms, p99 {:.3} ms, p99.9 {:.3} ms, worst {:.3} ms",
+        ms(at(0.5)),
+        ms(at(0.99)),
+        ms(at(0.999)),
+        ms(worst)
+    );
+    if let Some(cpu) = cpu {
+        let busy = cpu.user + cpu.system;
+        let share = |d: Duration| {
+            if busy.is_zero() {
+                0.0
+            } else {
+                d.as_secs_f64() / busy.as_secs_f64() * 100.0
+            }
+        };
+        println!(
+            "  cpu:      user {:.1} ms ({:.1}%), kernel {:.1} ms ({:.1}%); {} switches ({} forced); {} page faults ({} from disk)",
+            ms(cpu.user),
+            share(cpu.user),
+            ms(cpu.system),
+            share(cpu.system),
+            cpu.voluntary + cpu.involuntary,
+            cpu.involuntary,
+            cpu.minor_faults + cpu.major_faults,
+            cpu.major_faults
+        );
+    }
     // Which copies run together, and why the others do not.
     let grouping = engine.grouping();
     if !grouping.is_empty() {
@@ -797,6 +844,66 @@ fn profile(
         }
     }
     Ok(())
+}
+
+/// CPU time and interruptions of the thread doing the rendering (of the
+/// whole process where the OS cannot tell threads apart), from `getrusage`.
+struct CpuUsage {
+    user: std::time::Duration,
+    system: std::time::Duration,
+    /// Times the thread gave up the CPU (to wait), and was made to.
+    voluntary: i64,
+    involuntary: i64,
+    /// Pages touched for the first time, and pages read back from disk.
+    minor_faults: i64,
+    major_faults: i64,
+}
+
+impl CpuUsage {
+    fn since(&self, before: &CpuUsage) -> CpuUsage {
+        CpuUsage {
+            user: self.user.saturating_sub(before.user),
+            system: self.system.saturating_sub(before.system),
+            voluntary: self.voluntary - before.voluntary,
+            involuntary: self.involuntary - before.involuntary,
+            minor_faults: self.minor_faults - before.minor_faults,
+            major_faults: self.major_faults - before.major_faults,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn cpu_usage() -> Option<CpuUsage> {
+    #[cfg(target_os = "linux")]
+    let who = libc::RUSAGE_THREAD;
+    #[cfg(not(target_os = "linux"))]
+    let who = libc::RUSAGE_SELF;
+    // SAFETY: `getrusage` fills in the struct it is given, which starts
+    // zeroed (a valid `rusage`).
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(who, &mut usage) != 0 {
+            return None;
+        }
+        usage
+    };
+    let time = |t: libc::timeval| {
+        std::time::Duration::from_secs(t.tv_sec as u64)
+            + std::time::Duration::from_micros(t.tv_usec as u64)
+    };
+    Some(CpuUsage {
+        user: time(usage.ru_utime),
+        system: time(usage.ru_stime),
+        voluntary: usage.ru_nvcsw as i64,
+        involuntary: usage.ru_nivcsw as i64,
+        minor_faults: usage.ru_minflt as i64,
+        major_faults: usage.ru_majflt as i64,
+    })
+}
+
+#[cfg(not(unix))]
+fn cpu_usage() -> Option<CpuUsage> {
+    None
 }
 
 /// `name` with every copy index (`[3]`) as `[*]`.

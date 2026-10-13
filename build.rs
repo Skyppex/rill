@@ -1,12 +1,14 @@
 //! Embeds the core library: every `.rill` file under `core/` becomes part
 //! of the compiler, so every program has it wherever it is built. Also
-//! records the commit the compiler was built from, for `rill --version`.
+//! records the commit the compiler was built from, and the Rust compiler
+//! that built it, for `rill --version`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 fn main() {
     commit();
+    rustc();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("core");
     println!("cargo:rerun-if-changed={}", root.display());
     let mut files = Vec::new();
@@ -48,6 +50,20 @@ fn commit() {
         .or_else(from_git)
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=RILL_COMMIT={commit}");
+}
+
+/// Sets `RILL_RUSTC`: the version of the Rust compiler building this, as
+/// `rustc 1.92.0 (...)`, since a new one can change how fast Rill runs.
+fn rustc() {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let version = std::process::Command::new(rustc)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_else(|| "rustc unknown".into());
+    println!("cargo:rustc-env=RILL_RUSTC={version}");
 }
 
 fn from_git() -> Option<String> {

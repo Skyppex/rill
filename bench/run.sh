@@ -122,23 +122,94 @@ else
 fi
 
 version="$("$RILL" --version)"
-# The commit, from `rill 0.1.0 (<commit>)`.
-commit="$(sed -n 's/.*(\(.*\))$/\1/p' <<<"$version")"
+# The commit, from `rill 0.1.0 (<commit>; rustc ...)`.
+commit="$(sed -n 's/^[^(]*(\([^;)]*\).*/\1/p' <<<"$version")"
 stamp="$(date +%Y-%m-%dT%H-%M-%S)"
 short="${commit:0:12}"
 [[ "$commit" == *-dirty ]] && short="$short-dirty"
 mkdir -p "$results"
 report="$results/${stamp}_${short:-unknown}_${slug}.txt"
 
+# What the machine is and what state it is in, for telling a change in
+# Rill apart from a change in where it ran. Everything is read where it is
+# exposed, and left out where it is not.
+lscpu_field() {
+    if command -v lscpu >/dev/null; then
+        lscpu | sed -n "s/^$1:[[:space:]]*//p" | head -n 1
+    fi
+}
+
 # The CPU's name: x86 has it in /proc/cpuinfo, ARM often only its vendor.
-cpu="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -n 1)"
-if [[ -z "$cpu" ]] && command -v lscpu >/dev/null; then
-    model="$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
-    vendor="$(lscpu | sed -n 's/^Vendor ID:[[:space:]]*//p' | head -n 1)"
+cpu="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -n 1 || true)"
+if [[ -z "$cpu" ]]; then
+    model="$(lscpu_field "Model name")"
     [[ "$model" == "-" ]] && model=""
-    cpu="$(echo "$vendor $model" | xargs)"
+    cpu="$(echo "$(lscpu_field "Vendor ID") $model" | xargs)"
 fi
-machine="${cpu:+$cpu }$(uname -m), $(nproc) threads, $(uname -sr)"
+sockets="$(lscpu_field "Socket(s)")"
+per_socket="$(lscpu_field "Core(s) per socket")"
+cores=""
+[[ "$sockets" =~ ^[0-9]+$ && "$per_socket" =~ ^[0-9]+$ ]] && cores="$((sockets * per_socket)) cores, "
+max_mhz="$(lscpu_field "CPU max MHz" | sed 's/\..*//')"
+cpu_line="${cpu:-unknown}, ${cores}$(nproc) threads${max_mhz:+, up to $max_mhz MHz}"
+caches=""
+for c in L1d L1i L2 L3; do
+    size="$(lscpu_field "$c cache")"
+    [[ -n "$size" ]] && caches+="${caches:+, }$c $size"
+done
+
+os="$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release 2>/dev/null || true)"
+os_line="${os:-$(uname -s)}, $(uname -sr) ($(uname -m))"
+
+# Where it runs: WSL, a virtual machine, a container, or the machine itself.
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    environment="WSL2 (Linux on Windows, in a virtual machine)"
+elif command -v systemd-detect-virt >/dev/null; then
+    virt="$(systemd-detect-virt 2>/dev/null || true)"
+    if [[ -z "$virt" || "$virt" == none ]]; then
+        environment="bare metal"
+    else
+        environment="virtual machine ($virt)"
+    fi
+elif [[ -n "$(lscpu_field "Hypervisor vendor")" ]]; then
+    environment="virtual machine ($(lscpu_field "Hypervisor vendor"))"
+else
+    environment="bare metal, as far as can be told"
+fi
+if [[ -e /.dockerenv || -e /run/.containerenv ]]; then
+    environment+=", in a container"
+fi
+
+memory="$(awk '/^MemTotal:/ {t = $2} /^MemAvailable:/ {a = $2}
+    END { if (t) printf "%.1f GiB, %.1f GiB available", t / 1048576, a / 1048576 }' /proc/meminfo 2>/dev/null || true)"
+
+# On a laptop, running on battery often means a slower clock.
+power=""
+for supply in /sys/class/power_supply/*; do
+    [[ -r "$supply/type" ]] || continue
+    case "$(cat "$supply/type")" in
+    Mains)
+        if [[ "$(cat "$supply/online" 2>/dev/null || true)" == 1 ]]; then
+            power="on AC${power:+, $power}"
+        else
+            power="on battery${power:+, $power}"
+        fi
+        ;;
+    Battery)
+        level="$(cat "$supply/capacity" 2>/dev/null || true)"
+        state="$(cat "$supply/status" 2>/dev/null || true)"
+        power+="${power:+, }battery ${level:-?}%${state:+ ($state)}"
+        ;;
+    esac
+done
+
+governor="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
+load_before="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || true)"
+
+case "$RILL" in
+/nix/store/*) build_kind="the flake's release package" ;;
+*) build_kind="cargo, release, without the audio device" ;;
+esac
 
 # One field from `rill profile`'s output.
 field() {
@@ -198,12 +269,15 @@ measure() {
         echo "bench: $name failed:"$'\n'"${best#FAILED$'\n'}" >&2
         line="$(printf '%-12s %s' "$name" "failed")"
     else
-        line="$(printf '%-12s %8s %10s %15s %9s %10s %10s %10s %9s' \
+        line="$(printf '%-12s %8s %10s %15s %9s %8s %6s %6s %10s %10s %10s %9s' \
             "$name" \
             "$(field 's/.*load: *\([0-9.]*%\).*/\1/p' "$best")" \
             "$best_ns" \
             "$(field 's/.*worst \([0-9.]*\) ms of a \([0-9.]*\) ms.*/\1\/\2/p' "$best")" \
             "$(field 's/.*; \([0-9]*\) of \([0-9]*\) over budget.*/\1\/\2/p' "$best")" \
+            "$(field 's/.*p99 \([0-9.]*\) ms,.*/\1/p' "$best")" \
+            "$(field 's/.*kernel [0-9.]* ms (\([0-9.]*%\)).*/\1/p' "$best")" \
+            "$(field 's/.*switches (\([0-9]*\) forced).*/\1/p' "$best")" \
             "$(field 's/.*program: *\([0-9]*\) instructions.*/\1/p' "$best")" \
             "$(field 's/.*(\([0-9]*\) operations).*/\1/p' "$best")" \
             "$(field 's/.* \([0-9]*\) registers.*/\1/p' "$best")" \
@@ -233,22 +307,39 @@ for index in "${!files[@]}"; do
     details+="$(cat "$work/$index.details")"$'\n'
 done
 
-header="$(printf '%-12s %8s %10s %15s %9s %10s %10s %10s %9s' \
-    bench load ns/sample "worst block ms" "over" instr/smp ops/smp registers "build ms")"
+header="$(printf '%-12s %8s %10s %15s %9s %8s %6s %6s %10s %10s %10s %9s' \
+    bench load ns/sample "worst block ms" "over" "p99 ms" kern% forced \
+    instr/smp ops/smp registers "build ms")"
+load_after="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || true)"
 
 {
     echo "rill benchmarks: $message"
     echo
-    echo "date:     $(date '+%Y-%m-%d %H:%M:%S %z')"
-    echo "rill:     $version"
-    echo "binary:   $RILL"
-    echo "machine:  $machine"
-    echo "settings: ${seconds}s of audio per run unless a benchmark says otherwise, seed 1, best of $runs runs, $threads at a time"
+    echo "date:        $(date '+%Y-%m-%d %H:%M:%S %z')"
+    echo "settings:    ${seconds}s of audio per run unless a benchmark says otherwise, seed 1, best of $runs runs, $threads at a time"
+    echo
+    echo "Build"
+    echo "rill:        $version"
+    echo "binary:      $RILL ($build_kind)"
+    echo
+    echo "System"
+    echo "os:          $os_line"
+    echo "environment: $environment"
+    echo "cpu:         $cpu_line"
+    [[ -n "$caches" ]] && echo "caches:      $caches (as the OS reports them)"
+    [[ -n "$memory" ]] && echo "memory:      $memory"
+    [[ -n "$power" ]] && echo "power:       $power"
+    echo "governor:    ${governor:-not exposed}"
+    [[ -n "$load_before" ]] && echo "system load: $load_before before, $load_after after (1, 5 and 15 minute averages)"
     echo
     echo "load:        time to render / length of the audio, on one core"
     echo "ns/sample:   nanoseconds per frame of output"
     echo "worst block: the slowest callback / the time it had"
     echo "over:        callbacks over their time / all callbacks"
+    echo "p99 ms:      99% of callbacks were faster than this; far below the worst means"
+    echo "             the worst was a one-off (often the OS), close to it means it recurs"
+    echo "kern%:       share of the rendering thread's CPU time spent in the kernel"
+    echo "forced:      times the OS took the CPU away from the rendering thread"
     echo "instr/smp:   instructions per sample, after optimising: what is dispatched"
     echo "ops/smp:     operations per sample: the work those do (a vector block counts"
     echo "             each of its instructions once per lane, a sum once per value)"

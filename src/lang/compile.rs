@@ -440,6 +440,10 @@ pub fn compile_instance(
     if defs.vectorize {
         super::vector::vectorize(&mut code);
     }
+    // What grouping left foldable: `x + 0` and the like, kept in the copies
+    // of pools so they stayed alike, and copies inside vector blocks.
+    super::opt::simplify(&mut code);
+    super::opt::optimize(&mut code);
     super::opt::sums(&mut code);
     Ok(code)
 }

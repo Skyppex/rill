@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use super::vm::{Code, Instr, Operand, Reg, Source};
+use super::vm::{Code, Instr, Operand, Reg, Source, VArg, VInstr};
 use crate::ops::Op2;
 
 /// Rewrite `code` into an equivalent with fewer instructions.
@@ -155,6 +155,20 @@ pub(crate) fn usage(code: &Code) -> Usage {
         for i in list {
             writes(i, &mut |r| u.defs[r as usize] += 1);
             reads(i, &mut |r| u.uses[r as usize] += 1);
+        }
+    }
+    // What vector blocks read and write, lane by lane.
+    for block in &code.vectors {
+        let n = usize::from(block.lanes);
+        for i in &block.instrs {
+            vector_regs(i, &mut |a| match a {
+                VArg::Lanes(b) => (0..n).for_each(|k| u.uses[b as usize + k] += 1),
+                VArg::Scalar(r) => u.uses[r as usize] += 1,
+                VArg::Const(_) => {}
+            });
+            if let Some(d) = vector_dst(i) {
+                (0..n).for_each(|k| u.defs[d as usize + k] += 1);
+            }
         }
     }
     let mut pin = |r: Reg| {
@@ -328,6 +342,248 @@ pub(crate) fn sums(code: &mut Code) {
     }
 }
 
+/// The operands a vector instruction reads.
+fn vector_regs(i: &VInstr, f: &mut impl FnMut(VArg)) {
+    match *i {
+        VInstr::Op2 { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        VInstr::Op1 { x, .. } => f(x),
+        VInstr::Copy { s, .. } => f(s),
+        VInstr::Select { cond, a, b, .. } => {
+            f(cond);
+            f(a);
+            f(b);
+        }
+        VInstr::Tune {
+            pitch, setting, a4, ..
+        } => {
+            f(pitch);
+            f(setting);
+            f(a4);
+        }
+        VInstr::DelayRead { time, .. } => f(time),
+        VInstr::DelayWrite { x, .. } => f(x),
+        VInstr::Noise { .. } => {}
+    }
+}
+
+/// The lane group a vector instruction writes.
+fn vector_dst(i: &VInstr) -> Option<Reg> {
+    match *i {
+        VInstr::Op2 { d, .. }
+        | VInstr::Op1 { d, .. }
+        | VInstr::Copy { d, .. }
+        | VInstr::Select { d, .. }
+        | VInstr::Tune { d, .. }
+        | VInstr::Noise { d, .. }
+        | VInstr::DelayRead { d, .. } => Some(d),
+        VInstr::DelayWrite { .. } => None,
+    }
+}
+
+/// What `a op b` leaves as it is: `x + 0`, `x * 1` and the like, as
+/// `Compiler::op2` folds them outside pools.
+fn identity(op: Op2, a: Option<f32>, b: Option<f32>) -> Option<bool> {
+    match (op, a, b) {
+        (Op2::Add | Op2::Sub, _, Some(0.0)) => Some(true),
+        (Op2::Mul | Op2::Div | Op2::Pow, _, Some(1.0)) => Some(true),
+        (Op2::Add, Some(0.0), _) | (Op2::Mul, Some(1.0), _) => Some(false),
+        _ => None,
+    }
+}
+
+/// After grouping, fold what the copies of pools kept so they stayed alike:
+/// selects on a constant become copies of the side chosen, `x + 0` and the
+/// like become copies of `x`, and operations on constants their result. In
+/// vector blocks too, where the constant turned out the same in every lane.
+/// [`optimize`] then removes the copies.
+pub(crate) fn simplify(code: &mut Code) {
+    let konst = |o: Operand| match o {
+        Operand::Const(c) => Some(c),
+        Operand::Reg(_) => None,
+    };
+    let lists = std::iter::once(&mut code.instrs)
+        .chain(std::iter::once(&mut code.post))
+        .chain(code.events.iter_mut().map(|e| &mut e.instrs));
+    for list in lists {
+        for i in list.iter_mut() {
+            *i = match *i {
+                Instr::Select { dst, cond, a, b } => match konst(cond) {
+                    Some(c) => Instr::Copy {
+                        dst,
+                        src: if c != 0.0 { a } else { b },
+                    },
+                    None => continue,
+                },
+                Instr::Op2 { op, dst, a, b } => match (konst(a), konst(b)) {
+                    (Some(x), Some(y)) => Instr::Copy {
+                        dst,
+                        src: Operand::Const(op.apply(x, y)),
+                    },
+                    (x, y) => match identity(op, x, y) {
+                        Some(keep_a) => Instr::Copy {
+                            dst,
+                            src: if keep_a { a } else { b },
+                        },
+                        None => continue,
+                    },
+                },
+                Instr::Op1 {
+                    op,
+                    dst,
+                    x: Operand::Const(x),
+                } => Instr::Copy {
+                    dst,
+                    src: Operand::Const(op.apply(x)),
+                },
+                _ => continue,
+            };
+        }
+    }
+    let konst = |a: VArg| match a {
+        VArg::Const(c) => Some(c),
+        _ => None,
+    };
+    for block in &mut code.vectors {
+        for i in &mut block.instrs {
+            *i = match *i {
+                VInstr::Select { d, cond, a, b } => match konst(cond) {
+                    Some(c) => VInstr::Copy {
+                        d,
+                        s: if c != 0.0 { a } else { b },
+                    },
+                    None => continue,
+                },
+                VInstr::Op2 { op, d, a, b } => match identity(op, konst(a), konst(b)) {
+                    Some(keep_a) => VInstr::Copy {
+                        d,
+                        s: if keep_a { a } else { b },
+                    },
+                    None => continue,
+                },
+                _ => continue,
+            };
+        }
+    }
+    forward_copies(code);
+}
+
+/// In vector blocks, `d = s` goes away, as a copy in a block is a loop over
+/// every lane, unlike a register that is simply read where it is:
+///
+/// - when `d` is a temporary of the block (nothing but this copy writes it,
+///   nothing outside the block, nor state or outputs, reads it, and the
+///   block does not write `s` again after the copy), later instructions
+///   read `s` instead;
+/// - when `s` is a temporary that only this copy reads, what computed it
+///   writes `d` instead, if nothing between touches `d`.
+fn forward_copies(code: &mut Code) {
+    let u = usage(code);
+    for block in &mut code.vectors {
+        let n = usize::from(block.lanes);
+        let mut i = 0;
+        while i < block.instrs.len() {
+            let VInstr::Copy { d, s } = block.instrs[i] else {
+                i += 1;
+                continue;
+            };
+            let later = &block.instrs[i + 1..];
+            // Reads of `d` after the copy, per lane.
+            let mut reads = 0u32;
+            for j in later {
+                vector_regs(j, &mut |a| reads += u32::from(a == VArg::Lanes(d)));
+            }
+            let lanes = (0..n).map(|k| d as usize + k);
+            let temporary = lanes
+                .clone()
+                .all(|r| u.defs[r] == 1 && !u.pinned[r] && u.uses[r] == reads);
+            let source_kept = match s {
+                VArg::Lanes(b) => later.iter().all(|j| vector_dst(j) != Some(b)),
+                VArg::Scalar(_) | VArg::Const(_) => true,
+            };
+            if s == VArg::Lanes(d) {
+                i += 1;
+                continue;
+            }
+            if !temporary || !source_kept {
+                // The other way around: `s` is a temporary that only this copy
+                // reads, so what computed it can write `d` instead.
+                if let VArg::Lanes(b) = s
+                    && let Some(j) = (0..i)
+                        .rev()
+                        .find(|&j| vector_dst(&block.instrs[j]) == Some(b))
+                    && (0..n).all(|k| {
+                        let r = b as usize + k;
+                        u.defs[r] == 1 && u.uses[r] == 1 && !u.pinned[r]
+                    })
+                    && block.instrs[j + 1..i].iter().all(|x| {
+                        let mut touches = vector_dst(x) == Some(d);
+                        vector_regs(x, &mut |a| touches |= a == VArg::Lanes(d));
+                        !touches
+                    })
+                {
+                    set_vector_dst(&mut block.instrs[j], d);
+                    block.instrs.remove(i);
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            for j in &mut block.instrs[i + 1..] {
+                vector_args_mut(j, &mut |a| {
+                    if *a == VArg::Lanes(d) {
+                        *a = s;
+                    }
+                });
+            }
+            block.instrs.remove(i);
+        }
+    }
+}
+
+/// Make a vector instruction write lane group `d`.
+fn set_vector_dst(i: &mut VInstr, to: Reg) {
+    match i {
+        VInstr::Op2 { d, .. }
+        | VInstr::Op1 { d, .. }
+        | VInstr::Copy { d, .. }
+        | VInstr::Select { d, .. }
+        | VInstr::Tune { d, .. }
+        | VInstr::Noise { d, .. }
+        | VInstr::DelayRead { d, .. } => *d = to,
+        VInstr::DelayWrite { .. } => {}
+    }
+}
+
+/// The operands of a vector instruction, to change.
+fn vector_args_mut(i: &mut VInstr, f: &mut impl FnMut(&mut VArg)) {
+    match i {
+        VInstr::Op2 { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        VInstr::Op1 { x, .. } => f(x),
+        VInstr::Copy { s, .. } => f(s),
+        VInstr::Select { cond, a, b, .. } => {
+            f(cond);
+            f(a);
+            f(b);
+        }
+        VInstr::Tune {
+            pitch, setting, a4, ..
+        } => {
+            f(pitch);
+            f(setting);
+            f(a4);
+        }
+        VInstr::DelayRead { time, .. } => f(time),
+        VInstr::DelayWrite { x, .. } => f(x),
+        VInstr::Noise { .. } => {}
+    }
+}
+
 /// Positions some jump in `list` lands on.
 fn jump_targets(list: &[Instr]) -> Vec<bool> {
     let mut targets = vec![false; list.len() + 1];
@@ -381,9 +637,13 @@ fn coalesce(code: &mut Code) -> bool {
                 let mut touches = false;
                 writes(i, &mut |r| touches |= r == d);
                 reads(i, &mut |r| touches |= r == d);
+                // A vector block's registers are not in `reads`/`writes`.
                 if touches
                     || targets[p + 1]
-                    || matches!(i, Instr::Jump { .. } | Instr::JumpUnless { .. })
+                    || matches!(
+                        i,
+                        Instr::Jump { .. } | Instr::JumpUnless { .. } | Instr::Vector { .. }
+                    )
                 {
                     break;
                 }

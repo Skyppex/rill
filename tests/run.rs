@@ -2341,6 +2341,31 @@ fn the_report_says_which_copies_run_alone_and_why() {
 }
 
 #[test]
+fn what_copies_keep_to_stay_alike_is_folded_after_grouping() {
+    // In a pool, `x * 1` and `x + 0` stay in each copy until grouping (one
+    // copy folding them and another not would make the copies differ);
+    // after, they are folded, so the pool does the same work without them.
+    let with = "
+        import \"@gen/osc\"
+        rill voice(f: Freq, gain: Float, offset: Float) Sample {
+            return saw(f) * gain + offset
+        }
+        rill main() [Sample; 2] {
+            let x = sum(voice([110Hz, 220Hz, 330Hz, 440Hz, 550Hz, 660Hz], 1, 0))
+            return [x, x]
+        }
+    ";
+    let without = with.replace("saw(f) * gain + offset", "saw(f)");
+    let size = |src: &str| {
+        let (graph, _) = lang::load_with(src, &config(2), "main", &Default::default())
+            .unwrap_or_else(|d| panic!("{d:#?}"));
+        Engine::new(graph, config(2)).unwrap().program_size()
+    };
+    assert_eq!(size(with).operations, size(&without).operations);
+    same_either_way(with, 2, 5_000, &[]);
+}
+
+#[test]
 fn a_sum_over_a_pool_is_one_instruction() {
     // Mono and stereo pools summed, a sum mixed with other values, and a
     // sum too short to bother with: the same to the bit, and the long sums

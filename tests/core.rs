@@ -373,6 +373,44 @@ fn noise_colours() {
 }
 
 #[test]
+fn perlin_wanders_smoothly_between_0_and_1() {
+    // 20 seconds at 4 steps a second.
+    let out = render(&with(&["@gen/noise"], "perlin(4Hz)"), 960_000);
+    assert!(out.iter().all(|x| (0.0..=1.0).contains(x)));
+    let mean = out.iter().sum::<f32>() / out.len() as f32;
+    assert!((mean - 0.5).abs() < 0.05, "{mean}");
+    // It moves: well away from the middle, both ways.
+    let (lo, hi) = out
+        .iter()
+        .fold((1.0f32, 0.0f32), |(l, h), &x| (l.min(x), h.max(x)));
+    assert!(lo < 0.3 && hi > 0.7, "{lo}..{hi}");
+    // Gradually: no step bigger than its steepest slope allows, and no
+    // corners (the slope barely changes between samples).
+    assert!(biggest_step(&out) < 1e-3, "{}", biggest_step(&out));
+    let slopes: Vec<f32> = out.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(biggest_step(&slopes) < 1e-5, "{}", biggest_step(&slopes));
+    // Back through the middle at every step (give or take a little
+    // rounding in where steps fall).
+    for k in 1..80 {
+        let near = &out[k * 12_000 - 600..k * 12_000 + 600];
+        let closest = near.iter().map(|x| (x - 0.5).abs()).fold(1.0, f32::min);
+        assert!(closest < 1e-3, "step {k}: {closest}");
+    }
+    // Copies wander on their own, and the same run alone or together.
+    let together = render(&with(&["@gen/noise"], "sum([perlin(4Hz); 4]) / 4"), 48_000);
+    let apart = render(
+        &with(
+            &["@gen/noise"],
+            "(perlin(4Hz) + perlin(4Hz) + perlin(4Hz) + perlin(4Hz)) / 4",
+        ),
+        48_000,
+    );
+    let one = render(&with(&["@gen/noise"], "perlin(4Hz)"), 48_000);
+    assert!(together.iter().zip(&one).any(|(a, b)| (a - b).abs() > 0.05));
+    assert!(apart.iter().zip(&one).any(|(a, b)| (a - b).abs() > 0.05));
+}
+
+#[test]
 fn filters_respond_where_they_should() {
     let f = &["@effects/filter"];
     // 3 dB down at the cutoff, flat well below, falling 12 dB per octave

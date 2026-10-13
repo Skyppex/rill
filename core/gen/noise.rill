@@ -21,3 +21,32 @@ export rill brown() Sample {
     y = (y + noise() * 0.02) / 1.02
     return y * 3.5
 }
+
+// Perlin noise: a value that wanders smoothly at random between 0 and 1,
+// turning about `rate` times a second. Good for slow, natural movement:
+// `200Hz + perlin(0.3Hz) * 800Hz`, or a drift in pitch or pan.
+//
+// At every whole step it picks a new random slope; between two steps, the
+// lines through each step's slope are blended with Perlin's fade
+// (6t⁵ - 15t⁴ + 10t³), which leaves no corners. It passes through 0.5 at
+// every step.
+export rill perlin(rate: Freq) Float {
+    state t: Float = 0
+    // The slopes at the step behind and the step ahead.
+    state behind: Float = random() * 2 - 1
+    state ahead: Float = random() * 2 - 1
+    // Drawn every sample, so copies can run together; kept only at a step.
+    let next = noise()
+    let fade = t * t * t * (t * (t * 6 - 15) + 10)
+    let from = behind * t
+    let to = ahead * (t - 1)
+    // From -0.5 to 0.5 around the middle.
+    let out = from + (to - from) * fade + 0.5
+    let moved = t + rate / RATE
+    if moved >= 1 {
+        behind = ahead
+        ahead = next
+    }
+    t = wrap(moved)
+    return out
+}

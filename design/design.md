@@ -496,6 +496,19 @@ Run-stage rules: no allocation, no locks, no syscalls, no unbounded loops; denor
 
 Per-callback inputs the runtime receives from the host: input buffer, output buffer, frame count (up to a declared maximum), channel counts, sample rate, frame position, and timestamped events. Buffers are planar internally; interleaved host buffers are converted at the boundary.
 
+### Stages over segments
+
+A rill's body describes one tick, but most of it does not need to run one sample at a time. The compiled tick is split into stages:
+
+- **Streaming stages** hold plain maths on values from this sample only: a phasor's increment, a filter's coefficients, shaping, mixing, levels. Each instruction runs over a whole segment of samples in one go, on buffers, with SIMD.
+- **Looping stages** hold what needs the previous sample first: recurrences (a phasor's phase, a filter's state), values read before they are written, noise, delay lines, voice pools running together, and `if`s with side effects on only one side. They run sample by sample, as before, but only their own instructions.
+
+`if`s without such side effects become straight-line code first, so they can stream: both sides run, and selects keep what the side taken writes.
+
+A segment runs from one moment where something happens to the next: a host event or control change (the engine already splits blocks there), or a sequence's next note, beat or step. Handlers run only at segment boundaries, and see every register as the last sample left it. Segments are at most 64 samples long.
+
+Output is identical to the bit to running the tick sample by sample. That is still how a program runs whose sequences follow values it computes, since when their steps fall is only known sample by sample. `rill profile` reports how much streams, and `--per-sample` runs the old way, to compare.
+
 ### Live rebuilds
 
 A running program can be replaced by a new build without a gap and without losing what it was doing: oscillators keep their phase, delays keep their echoes, envelopes, voices and playing sequences carry on. Two things rebuild it:
@@ -547,7 +560,7 @@ Not in v0.1: plugin formats (CLAP comes later), FFT and other block-level rills,
 Open questions:
 
 - **Headroom on integer targets.** `f32` can exceed 1.0 mid-graph and come back down; fixed-point clips. Options: guard bits in the internal format, or saturating arithmetic with a compiler warning.
-- **Feedback in block processing.** Process cycles sample by sample, or fuse each cycle into one node that loops internally?
+- **Feedback in block processing.** Cycles now run sample by sample in looping stages of their own (see Stages over segments). Fusing a common one (a one-pole, a phasor, a filter stage) into a single instruction that loops internally would make them faster still.
 - ~~**Sequencing.**~~ Settled: sequences are senders of note events, started and stopped from handlers (see Sequences).
 - **Block-level escape hatch.** Syntax for rills that need a whole buffer, such as FFT effects, and how they report latency.
 - ~~**Sharing semantics.**~~ Settled: `let` binds a value, so a bound stream used twice is one instance; every call is a new instance.

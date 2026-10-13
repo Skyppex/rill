@@ -23,7 +23,8 @@
 //!
 //! The groups that result, in an order that respects every edge, make the
 //! stages: consecutive streaming groups form one streaming stage, and
-//! consecutive looping groups one looping stage.
+//! consecutive looping groups one looping stage. The program runs them
+//! over segments of samples (see `Streams` in [`super::vm`]).
 
 use std::collections::HashMap;
 
@@ -182,7 +183,8 @@ pub fn analyze(code: &Code) -> Stages {
             match list[node.instrs.start] {
                 Instr::Vector { .. } => "vector blocks",
                 Instr::Noise { .. } => "noise",
-                _ => "delay lines",
+                Instr::DelayRead { .. } | Instr::DelayWrite { .. } => "delay lines",
+                _ => "doing something besides maths",
             }
         } else if lagged_self[k] {
             "reading their own last value"
@@ -279,7 +281,10 @@ fn fallback(code: &Code) -> Option<String> {
     if code.instrs.iter().any(|i| {
         matches!(
             i,
-            Instr::InvokeSeq { .. } | Instr::InvokeEvent { .. } | Instr::Halt { .. }
+            Instr::InvokeSeq { .. }
+                | Instr::InvokeEvent { .. }
+                | Instr::Halt { .. }
+                | Instr::SetSlot { .. }
         )
     }) {
         return Some(
@@ -349,6 +354,13 @@ fn visit(code: &Code, instr: &Instr, node: &mut Node) {
     reads(instr, &mut |r| node.reads.push(r));
     writes(instr, &mut |r| node.writes.push(r));
     match *instr {
+        // What a streaming stage can run; the rest loops.
+        Instr::Op1 { .. }
+        | Instr::Op2 { .. }
+        | Instr::Copy { .. }
+        | Instr::Select { .. }
+        | Instr::Tune { .. }
+        | Instr::Sum { .. } => {}
         Instr::Noise { .. } => node.loops = true,
         Instr::DelayRead { line, .. } => {
             node.loops = true;
@@ -382,8 +394,23 @@ fn visit(code: &Code, instr: &Instr, node: &mut Node) {
                 }
             }
         }
-        _ => {}
+        _ => node.loops = true,
     }
+}
+
+/// The registers `instr` reads and writes, with every lane of a vector
+/// block's.
+pub(crate) fn touches(code: &Code, instr: &Instr) -> (Vec<Reg>, Vec<Reg>) {
+    let mut node = Node {
+        instrs: 0..0,
+        reads: Vec::new(),
+        writes: Vec::new(),
+        reads_lines: Vec::new(),
+        writes_lines: Vec::new(),
+        loops: false,
+    };
+    visit(code, instr, &mut node);
+    (node.reads, node.writes)
 }
 
 /// Strongly connected components (Tarjan's, without recursion): the group

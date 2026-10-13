@@ -142,6 +142,9 @@ pub struct Defs<'a> {
     /// Run the copies of voice pools, loop iterations and frame elements
     /// together where they line up (see [`super::vector`]).
     pub vectorize: bool,
+    /// Run the tick over stretches of samples where it can (see
+    /// [`super::stages`]).
+    pub stream: bool,
     /// Where `random()` draws its numbers from.
     pub random: Random,
     /// Ceilings raised while playing, by state key (see
@@ -225,6 +228,7 @@ impl<'a> Defs<'a> {
             decls: checked.events.iter().flatten().cloned().collect(),
             seqs: Vec::new(),
             vectorize: true,
+            stream: true,
             random: Random::default(),
             raised: HashMap::new(),
             const_values: &checked.const_values,
@@ -448,6 +452,12 @@ pub fn compile_instance(
     super::opt::optimize(&mut code);
     super::opt::sums(&mut code);
     code.stages = super::stages::analyze(&code);
+    if !defs.stream && code.stages.fallback.is_none() {
+        code.stages = super::stages::Stages {
+            fallback: Some("asked to (--per-sample)".into()),
+            ..Default::default()
+        };
+    }
     Ok(code)
 }
 

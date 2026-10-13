@@ -427,6 +427,16 @@ impl Engine {
             .find_map(|n| n.program().map(|p| p.stages().clone()))
     }
 
+    /// How many registers have a buffer for running the program in stages,
+    /// and how many samples each holds (see [`Program::stream_buffers`]).
+    ///
+    /// [`Program::stream_buffers`]: crate::lang::vm::Program::stream_buffers
+    pub fn stream_buffers(&self) -> Option<(usize, usize)> {
+        self.nodes
+            .iter()
+            .find_map(|n| n.program().and_then(|p| p.stream_buffers()))
+    }
+
     /// Whether each pool of the program runs its copies together, and why
     /// not where it does not.
     pub fn grouping(&self) -> Vec<crate::lang::vm::Grouping> {

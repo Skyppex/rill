@@ -26,6 +26,10 @@ pub struct Options {
     /// Run repeated code (voices, loop iterations, frame elements) as lanes
     /// together. The result is the same either way; off is for comparing.
     pub vectorize: bool,
+    /// Run the tick over stretches of samples where it can (see
+    /// [`super::stages`]). The result is the same either way; off runs
+    /// every sample on its own, for comparing.
+    pub stream: bool,
     /// Where the numbers `random()` picks come from: the same seed picks the
     /// same numbers. `None` picks a new seed every build.
     pub seed: Option<u64>,
@@ -38,6 +42,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             vectorize: true,
+            stream: true,
             seed: None,
             ceilings: std::collections::HashMap::new(),
         }
@@ -72,6 +77,7 @@ pub fn build_with(
     check_entry(program, checked, entry)?;
     let mut defs = Defs::new(program, checked);
     defs.vectorize = options.vectorize;
+    defs.stream = options.stream;
     defs.random = Random::new(options.seed.unwrap_or_else(new_seed));
     defs.raised = options.ceilings.clone();
     const_table(

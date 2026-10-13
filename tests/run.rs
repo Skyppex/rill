@@ -136,6 +136,111 @@ fn examples_are_block_size_invariant() {
     }
 }
 
+/// An engine for `src`, running its tick in stages over segments of
+/// samples, or one sample at a time.
+fn engine_streaming(src: &str, channels: usize, stream: bool) -> Engine {
+    let options = lang::build::Options {
+        seed: Some(0),
+        stream,
+        ..Default::default()
+    };
+    let (graph, _) = lang::load_with(src, &config(channels), "main", &options)
+        .unwrap_or_else(|d| panic!("{d:#?}"));
+    Engine::new(graph, config(channels)).unwrap()
+}
+
+#[test]
+fn examples_run_the_same_in_stages_as_sample_by_sample() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
+    let mut streamed = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "rill") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap();
+        let mut engine = engine_streaming(&src, 2, false);
+        let reference = offline::render(&mut engine, 10_000, &Blocks::Fixed(256));
+        let stages = engine_streaming(&src, 2, true).stages();
+        streamed += usize::from(stages.is_some_and(|s| s.counts().0 > 0));
+        for blocks in [
+            Blocks::Fixed(1),
+            Blocks::Fixed(7),
+            Blocks::Fixed(64),
+            Blocks::Fixed(256),
+            Blocks::Random {
+                min: 0,
+                max: 256,
+                seed: 3,
+            },
+        ] {
+            let mut engine = engine_streaming(&src, 2, true);
+            let got = offline::render(&mut engine, 10_000, &blocks);
+            assert!(got == reference, "{path:?} differs with {blocks:?}");
+        }
+    }
+    assert!(streamed >= 4, "only {streamed} examples stream");
+}
+
+#[test]
+fn events_inside_segments_land_on_their_sample_in_stages() {
+    // The tick streams around a phasor; a handler reads what it computed,
+    // and a control moves, at samples inside and at the edges of
+    // segments.
+    let src = "
+        event keys note_on
+        rill main(gain: Float = 0.5) [Sample; 2] {
+            state phase: Float = 0
+            state last: Float = 0
+            state held: Float = 0
+            phase = wrap(phase + 0.01)
+            let shaped = tanh(phase * gain * 4) * 0.5
+            last = shaped
+            on keys(note) {
+                held = last + note.velocity
+            }
+            return [shaped + held, gain]
+        }
+    ";
+    let note = |frame_offset: usize| RillEvent {
+        frame_offset,
+        dispatch: Dispatch::Incoming(Event {
+            sender: 0,
+            channel: 0,
+            payload: Payload::NoteOn {
+                pitch: 60.0,
+                velocity: 0.25,
+                instance: 0,
+            },
+        }),
+    };
+    let run = |stream: bool| {
+        let mut engine = engine_streaming(src, 2, stream);
+        let mut all = Vec::new();
+        for (k, at) in [0usize, 1, 37, 63, 64, 65, 200, 255].into_iter().enumerate() {
+            let mut out = [0.0f32; 512];
+            let gain = ParamEvent {
+                frame_offset: (at + 13) % 256,
+                name: "gain",
+                value: k as f32 * 0.1,
+            };
+            engine.render_interleaved_with_param_and_rill_events(
+                &mut out,
+                |x| x,
+                &[gain],
+                &[note(at)],
+            );
+            all.extend(out);
+        }
+        all
+    };
+    let streamed = run(true);
+    assert!(streamed == run(false));
+    assert!(streamed.iter().any(|&x| x > 0.25));
+    let s = stages_of(src);
+    assert!(s.counts().0 > 0, "{s:#?}");
+}
+
 #[test]
 fn the_example_made_of_several_files_runs() {
     let path = std::path::Path::new(concat!(

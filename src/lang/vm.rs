@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 
 use crate::event::{EventDecl, EventId, EventKind, Payload, Sender};
-use crate::node::{Context, Inputs, Node, Outputs};
+use crate::node::{Context, Inputs, Node, Outputs, Signal};
 use crate::ops::{Op1, Op2};
 
 /// A register's number.
@@ -903,6 +903,250 @@ pub struct Program {
     handlers: Vec<Vec<Fast>>,
     /// Whether any voice pool has `claim` handlers to keep track of.
     claims: bool,
+    /// How the tick runs over segments, unless it runs sample by sample.
+    streams: Option<Streams>,
+}
+
+/// Most samples a segment runs at once: the length of every buffer.
+const SEGMENT: usize = 64;
+
+/// The tick in stages, run over a segment of samples at a time (see
+/// [`super::stages`]).
+///
+/// A register that crosses stages, or that a streaming stage writes, has a
+/// buffer of [`SEGMENT`] values after the registers, in [`Run::regs`]. A
+/// streaming stage is a vector block whose lanes are the segment's samples.
+/// A looping stage runs its instructions sample by sample on registers,
+/// taking the buffered values it reads from their buffers first and
+/// putting what it writes into them after.
+struct Streams {
+    stages: Vec<StageRun>,
+    /// Every buffered register, with where its buffer starts.
+    buffered: Vec<(Reg, u32)>,
+    /// Node inputs the tick reads, by input, with their buffers.
+    inputs: Vec<(usize, u32)>,
+    /// Each output channel, and each pool copy's outputs (for voices
+    /// falling silent).
+    outputs: Vec<Out>,
+    pools: Vec<Vec<Vec<Out>>>,
+}
+
+enum StageRun {
+    Stream(VectorBlock),
+    Loop {
+        fast: Vec<Fast>,
+        instrs: Vec<Instr>,
+        /// Registers taken from their buffers before each sample, and put
+        /// into them after.
+        loads: Vec<(Reg, u32)>,
+        stores: Vec<(Reg, u32)>,
+    },
+}
+
+/// Where an output's values are over a segment.
+#[derive(Clone, Copy)]
+enum Out {
+    Buffer(u32),
+    /// The same all through it.
+    Value(Operand),
+}
+
+impl Streams {
+    /// How `code`'s tick runs in stages, if it can (and gains from it), and
+    /// the registers it needs in all.
+    fn new(code: &Code, claims: bool) -> Option<(Streams, usize)> {
+        use std::collections::{HashMap, HashSet};
+        let stages = &code.stages;
+        if stages.fallback.is_some() || !stages.stages.iter().any(|s| s.streams) {
+            return None;
+        }
+        let list = &code.instrs;
+        let inputs: HashSet<Reg> = code.input_regs.iter().copied().collect();
+        // What each stage reads and writes.
+        let mut reads: Vec<HashSet<Reg>> = Vec::new();
+        let mut writes: Vec<HashSet<Reg>> = Vec::new();
+        let mut writers: HashMap<Reg, Vec<usize>> = HashMap::new();
+        for (k, stage) in stages.stages.iter().enumerate() {
+            let (mut r, mut w) = (HashSet::new(), HashSet::new());
+            for &p in &stage.instrs {
+                let (rs, ws) = super::stages::touches(code, &list[p as usize]);
+                r.extend(rs);
+                w.extend(ws);
+            }
+            for &x in &w {
+                writers.entry(x).or_default().push(k);
+            }
+            reads.push(r);
+            writes.push(w);
+        }
+        // Inputs are set before the tick; one written in it would be both.
+        if inputs.iter().any(|r| writers.contains_key(r)) {
+            return None;
+        }
+        let mut buffer: HashSet<Reg> = HashSet::new();
+        for (k, stage) in stages.stages.iter().enumerate() {
+            if stage.streams {
+                buffer.extend(&writes[k]);
+            }
+            for &r in &reads[k] {
+                let elsewhere = writers.get(&r).is_some_and(|ws| ws.iter().any(|&w| w != k));
+                if elsewhere || inputs.contains(&r) {
+                    buffer.insert(r);
+                }
+            }
+        }
+        let seen = |o: &Operand| match *o {
+            Operand::Reg(r) if writers.contains_key(&r) || inputs.contains(&r) => Some(r),
+            _ => None,
+        };
+        // What a pool's copies output only matters for knowing when a
+        // claimed voice falls silent.
+        let pools: &[Vec<Vec<Operand>>] = if claims { &code.pools } else { &[] };
+        buffer.extend(
+            code.output
+                .iter()
+                .chain(pools.iter().flatten().flatten())
+                .filter_map(seen),
+        );
+        let mut buffered: Vec<Reg> = buffer.into_iter().collect();
+        buffered.sort_unstable();
+        let at: HashMap<Reg, u32> = buffered
+            .iter()
+            .enumerate()
+            .map(|(k, &r)| (r, (code.regs + k * SEGMENT) as u32))
+            .collect();
+        let total = code.regs + buffered.len() * SEGMENT;
+        let arg = |o: Operand| match o {
+            Operand::Const(c) => VArg::Const(c),
+            Operand::Reg(r) => at.get(&r).map_or(VArg::Scalar(r), |&b| VArg::Lanes(b)),
+        };
+        let mut runs = Vec::new();
+        for (k, stage) in stages.stages.iter().enumerate() {
+            if stage.streams {
+                let mut instrs = Vec::new();
+                for &p in &stage.instrs {
+                    let i = list[p as usize];
+                    let mut d = 0;
+                    super::opt::writes(&i, &mut |r| d = at[&r]);
+                    let v = match i {
+                        Instr::Op2 { op, a, b, .. } => VInstr::Op2 {
+                            op,
+                            d,
+                            a: arg(a),
+                            b: arg(b),
+                        },
+                        Instr::Op1 { op, x, .. } => VInstr::Op1 { op, d, x: arg(x) },
+                        Instr::Copy { src, .. } => VInstr::Copy { d, s: arg(src) },
+                        Instr::Select { cond, a, b, .. } => VInstr::Select {
+                            d,
+                            cond: arg(cond),
+                            a: arg(a),
+                            b: arg(b),
+                        },
+                        Instr::Tune {
+                            tuning,
+                            pitch,
+                            setting,
+                            a4,
+                            ..
+                        } => VInstr::Tune {
+                            tuning,
+                            d,
+                            pitch: arg(pitch),
+                            setting: arg(setting),
+                            a4: arg(a4),
+                        },
+                        Instr::Sum {
+                            dst,
+                            init,
+                            base,
+                            n,
+                            stride,
+                        } => {
+                            // One add at a time, in the same order.
+                            let parts: Vec<Reg> = (0..n).map(|j| base + j * stride).collect();
+                            if parts.contains(&dst) {
+                                return None;
+                            }
+                            let mut acc = arg(init);
+                            for r in parts {
+                                instrs.push(VInstr::Op2 {
+                                    op: Op2::Add,
+                                    d,
+                                    a: acc,
+                                    b: arg(Operand::Reg(r)),
+                                });
+                                acc = VArg::Lanes(d);
+                            }
+                            VInstr::Copy { d, s: acc }
+                        }
+                        _ => return None,
+                    };
+                    instrs.push(v);
+                }
+                let block = VectorBlock {
+                    lanes: SEGMENT as u16,
+                    instrs,
+                };
+                check_vector(&block, total, 0, 0, 0);
+                runs.push(StageRun::Stream(block));
+            } else {
+                // Its own code, with jumps moved to match.
+                let at_new = |t: u32| stage.instrs.partition_point(|&p| p < t) as u32;
+                let instrs: Vec<Instr> = stage
+                    .instrs
+                    .iter()
+                    .map(|&p| {
+                        let mut i = list[p as usize];
+                        if let Instr::Jump { target } | Instr::JumpUnless { target, .. } = &mut i {
+                            *target = at_new(*target);
+                        }
+                        i
+                    })
+                    .collect();
+                let pick = |set: &HashSet<Reg>, keep: &dyn Fn(Reg) -> bool| {
+                    let mut v: Vec<(Reg, u32)> = set
+                        .iter()
+                        .filter(|&&r| keep(r))
+                        .filter_map(|r| Some((*r, *at.get(r)?)))
+                        .collect();
+                    v.sort_unstable();
+                    v
+                };
+                let loads = pick(&reads[k], &|r| {
+                    inputs.contains(&r)
+                        || writers.get(&r).is_some_and(|ws| ws.iter().any(|&w| w != k))
+                });
+                let stores = pick(&writes[k], &|_| true);
+                runs.push(StageRun::Loop {
+                    fast: lower(&instrs, code.regs),
+                    instrs,
+                    loads,
+                    stores,
+                });
+            }
+        }
+        let out = |o: &Operand| match *o {
+            Operand::Reg(r) => at.get(&r).map_or(Out::Value(*o), |&b| Out::Buffer(b)),
+            Operand::Const(_) => Out::Value(*o),
+        };
+        let streams = Streams {
+            stages: runs,
+            buffered: buffered.iter().map(|r| (*r, at[r])).collect(),
+            inputs: code
+                .input_regs
+                .iter()
+                .enumerate()
+                .filter_map(|(k, r)| Some((k, *at.get(r)?)))
+                .collect(),
+            outputs: code.output.iter().map(out).collect(),
+            pools: pools
+                .iter()
+                .map(|p| p.iter().map(|c| c.iter().map(out).collect()).collect())
+                .collect(),
+        };
+        Some((streams, total))
+    }
 }
 
 impl Program {
@@ -1010,9 +1254,13 @@ impl Program {
                 bits
             })
             .collect();
+        let (streams, regs) = match Streams::new(&code, claims) {
+            Some((s, total)) => (Some(s), total),
+            None => (None, code.regs),
+        };
         let mut p = Program {
             run: Run {
-                regs: vec![0.0; code.regs].into_boxed_slice(),
+                regs: vec![0.0; regs].into_boxed_slice(),
                 slots,
                 voices,
                 queue: VecDeque::with_capacity(queue),
@@ -1039,6 +1287,7 @@ impl Program {
             post,
             handlers,
             claims,
+            streams,
         };
         p.reset();
         p
@@ -1233,17 +1482,168 @@ impl Program {
         let regs = &self.run.regs;
         for (p, copies) in self.code.pools.iter().enumerate() {
             for (c, outputs) in copies.iter().enumerate() {
-                let v = &mut self.run.voices[p][c];
-                if v.state != VoiceState::Releasing {
-                    continue;
-                }
                 let quiet = outputs.iter().all(|&o| val(regs, o).abs() < SILENCE);
-                v.silent = if quiet { v.silent + 1 } else { 0 };
-                if v.silent >= v.tail {
-                    v.state = VoiceState::Free;
+                note_quiet(&mut self.run.voices[p][c], quiet);
+            }
+        }
+    }
+
+    /// The tick over `ctx.frames` samples, in segments: each from where a
+    /// sequence does something to the next, [`SEGMENT`] samples at most.
+    /// Handlers only run where a segment starts, so every stage sees what
+    /// it would sample by sample.
+    fn process_segments(&mut self, ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
+        let sequences = !self.code.seqs.is_empty();
+        let mut i = 0;
+        while i < ctx.frames {
+            if sequences {
+                self.fire_sequences();
+            }
+            let mut n = 0;
+            loop {
+                // Sequences move on by what the inputs say; what the tick
+                // computes they cannot follow here (see `stages::fallback`).
+                if sequences {
+                    self.advance_sequences_at(inputs, i + n);
+                }
+                n += 1;
+                if n == SEGMENT || i + n == ctx.frames || (sequences && self.sequences_due()) {
+                    break;
+                }
+            }
+            self.run_segment(inputs, out, i, n);
+            i += n;
+        }
+    }
+
+    /// [`Program::advance_sequences`] for sample `i`, with the values it
+    /// follows taken from the inputs.
+    fn advance_sequences_at(&mut self, inputs: &Inputs, i: usize) {
+        let rate = f64::from(self.run.rate);
+        let (code, run) = (&self.code, &mut self.run);
+        for slots in &mut run.slots {
+            for slot in slots.iter_mut().filter(|s| s.active) {
+                for s in 0..3 {
+                    if let Source::Follow(r) = slot.sources[s] {
+                        slot.values[s] = match code.input_regs.iter().position(|&x| x == r) {
+                            Some(k) => inputs.get(k).at(i),
+                            None => run.regs[r as usize],
+                        };
+                    }
+                }
+                slot.pos += f64::from(slot.values[TEMPO].max(0.0)) / rate;
+            }
+        }
+    }
+
+    /// Whether any playing sequence could do something now. Once
+    /// [`Program::fire_sequences`] has run, an instance does nothing more
+    /// until its position reaches a note-off, the next beat or step, or
+    /// the end of its pass (see [`next_event`]).
+    fn sequences_due(&self) -> bool {
+        for (table, slots) in self.code.seqs.iter().zip(&self.run.slots) {
+            let len = table.steps.len();
+            let total = len as f64 * table.step_beats;
+            for slot in slots.iter().filter(|s| s.active) {
+                let pos = slot.pos + EPS;
+                let beat_at = f64::from(slot.beat);
+                let beats_left = beat_at < total - EPS;
+                let steps_left = slot.next < len;
+                if slot.held.iter().any(|&(_, off)| off <= pos)
+                    || (beats_left && beat_at <= pos)
+                    || (steps_left && slot.next as f64 * table.step_beats <= pos)
+                    || (!beats_left && !steps_left && total <= pos)
+                {
+                    return true;
                 }
             }
         }
+        false
+    }
+
+    /// Run the tick's stages over samples `i..i + n` of this block.
+    fn run_segment(&mut self, inputs: &Inputs, out: &mut Outputs, i: usize, n: usize) {
+        let Program {
+            code,
+            run,
+            streams,
+            claims,
+            ..
+        } = self;
+        let streams = streams.as_ref().expect("runs in stages");
+        for &(k, b) in &streams.inputs {
+            let dst = &mut run.regs[b as usize..b as usize + n];
+            match inputs.get(k) {
+                Signal::Const(v) => dst.fill(v),
+                Signal::Buffer(src) => dst.copy_from_slice(&src[i..i + n]),
+            }
+        }
+        for stage in &streams.stages {
+            match stage {
+                StageRun::Stream(block) => {
+                    let state = LaneState {
+                        noise: &mut run.noise,
+                        delays: &mut run.delays,
+                        wants: &run.wants,
+                        rate: run.rate,
+                    };
+                    run_lanes(block, n, &mut run.regs, state);
+                }
+                StageRun::Loop {
+                    fast,
+                    instrs,
+                    loads,
+                    stores,
+                } => {
+                    for j in 0..n {
+                        for &(r, b) in loads {
+                            run.regs[r as usize] = run.regs[b as usize + j];
+                        }
+                        exec(fast, instrs, code, run);
+                        for &(r, b) in stores {
+                            run.regs[b as usize + j] = run.regs[r as usize];
+                        }
+                    }
+                }
+            }
+        }
+        let regs = &run.regs;
+        let at = |o: Out, j: usize| match o {
+            Out::Buffer(b) => regs[b as usize + j],
+            Out::Value(o) => val(regs, o),
+        };
+        for (c, &o) in streams.outputs.iter().enumerate() {
+            for j in 0..n {
+                out.set(c, i + j, at(o, j));
+            }
+        }
+        if *claims {
+            for j in 0..n {
+                for (p, copies) in streams.pools.iter().enumerate() {
+                    for (c, outputs) in copies.iter().enumerate() {
+                        let quiet = outputs.iter().all(|&o| at(o, j).abs() < SILENCE);
+                        note_quiet(&mut run.voices[p][c], quiet);
+                    }
+                }
+            }
+        }
+        // Each register as the segment's last sample left it, for handlers
+        // and the next segment.
+        for &(r, b) in &streams.buffered {
+            run.regs[r as usize] = run.regs[b as usize + n - 1];
+        }
+        run.now += n as u64;
+    }
+}
+
+/// Count a releasing voice's silent samples; it is free after its tail.
+fn note_quiet(v: &mut Voice, quiet: bool) {
+    if v.state != VoiceState::Releasing {
+        return;
+    }
+    v.silent = if quiet { v.silent + 1 } else { 0 };
+    if v.silent >= v.tail {
+        v.state = VoiceState::Free;
     }
 }
 
@@ -1573,7 +1973,13 @@ enum Src {
 /// and shape of operands, kept out of this one: each is compiled on its own
 /// terms (SIMD, unrolling), however this function changes around them.
 fn run_vector(block: &VectorBlock, regs: &mut [f32], state: LaneState) {
-    let n = usize::from(block.lanes);
+    run_lanes(block, usize::from(block.lanes), regs, state);
+}
+
+/// Run every instruction of `block` over its first `n` lanes (at most
+/// `block.lanes`).
+fn run_lanes(block: &VectorBlock, n: usize, regs: &mut [f32], state: LaneState) {
+    debug_assert!(n <= usize::from(block.lanes));
     let p = regs.as_mut_ptr();
     // SAFETY: `check_vector` made sure every lane group and register is
     // inside `regs`. Lane groups never partly overlap: a write goes to the
@@ -2152,6 +2558,10 @@ impl Node for Program {
     fn process(&mut self, ctx: &Context, inputs: &Inputs, out: &mut Outputs) {
         self.run.rate = ctx.sample_rate;
         self.ensure_started();
+        if self.streams.is_some() {
+            self.process_segments(ctx, inputs, out);
+            return;
+        }
         let sequences = !self.code.seqs.is_empty();
         for i in 0..ctx.frames {
             if sequences {
@@ -2458,6 +2868,12 @@ impl Program {
 
     pub fn stages(&self) -> &super::stages::Stages {
         &self.code.stages
+    }
+
+    /// How many registers have a buffer for running in stages, and how
+    /// many samples each holds; `None` when the tick runs sample by sample.
+    pub fn stream_buffers(&self) -> Option<(usize, usize)> {
+        self.streams.as_ref().map(|s| (s.buffered.len(), SEGMENT))
     }
 
     pub fn ceilings(&self) -> Ceilings {

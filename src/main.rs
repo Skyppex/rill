@@ -374,6 +374,10 @@ enum Command {
         /// to compare.
         #[arg(long)]
         scalar: bool,
+        /// Run the program one sample at a time instead of over stretches
+        /// of samples, to compare.
+        #[arg(long)]
+        per_sample: bool,
     },
     /// Render a Rill file (or a built-in patch) to a WAV file through a
     /// simulated audio callback.
@@ -544,7 +548,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             channels,
             block,
             scalar,
-        } => profile(&source, seconds, rate, channels, block, scalar)?,
+            per_sample,
+        } => profile(&source, seconds, rate, channels, block, scalar, per_sample)?,
         Command::Render {
             source,
             out,
@@ -690,6 +695,7 @@ fn profile(
     channels: u16,
     block: usize,
     scalar: bool,
+    per_sample: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{Duration, Instant};
     if block == 0 {
@@ -706,6 +712,7 @@ fn profile(
     let built = Instant::now();
     let options = rill::lang::build::Options {
         vectorize: !scalar,
+        stream: !per_sample,
         ..Default::default()
     };
     let mut engine = Engine::new(source.graph_with(&config, &options)?, config)?;
@@ -761,7 +768,12 @@ fn profile(
         "release"
     };
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-    let how = if scalar { ", scalar" } else { "" };
+    let how = match (scalar, per_sample) {
+        (false, false) => "",
+        (true, false) => ", scalar",
+        (false, true) => ", per sample",
+        (true, true) => ", scalar, per sample",
+    };
     println!("{} ({build} build{how})", source.name());
     println!(
         "  program:  {instructions} instructions per sample ({operations} operations), {registers} registers, {} node(s); built in {:.1} ms",
@@ -812,7 +824,7 @@ fn profile(
             cpu.major_faults
         );
     }
-    // How much of the tick could stream over samples (not yet used).
+    // How much of the tick streams over samples.
     if let Some(stages) = engine.stages() {
         match &stages.fallback {
             Some(why) => println!("  stages:   sample by sample: {why}"),
@@ -820,8 +832,15 @@ fn profile(
                 let (streams, loops) = stages.counts();
                 let total = (streams + loops).max(1);
                 let streaming = stages.stages.iter().filter(|s| s.streams).count();
+                let buffers = match engine.stream_buffers() {
+                    Some((n, len)) => format!(
+                        "; {n} buffers of {len} samples ({:.0} KB)",
+                        (n * len * 4) as f64 / 1024.0
+                    ),
+                    None => "; runs sample by sample, as nothing streams".into(),
+                };
                 println!(
-                    "  stages:   {streams} of {} instructions could stream ({:.0}%); {} stages, {streaming} streaming",
+                    "  stages:   {streams} of {} instructions stream ({:.0}%); {} stages, {streaming} streaming{buffers}",
                     streams + loops,
                     streams as f64 * 100.0 / total as f64,
                     stages.stages.len()

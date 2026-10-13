@@ -1034,7 +1034,10 @@ fn casts_with_as() {
     assert_eq!(t("let f = 3 as Int as Float", "f"), Type::Float);
     assert_eq!(t("let s = 2.5 as Sample", "s"), Type::Sample);
     assert_eq!(
-        t("let f = [1 as Sample, 2 as Sample, 3 as Sample] as Float", "f"),
+        t(
+            "let f = [1 as Sample, 2 as Sample, 3 as Sample] as Float",
+            "f"
+        ),
         frame(Type::Float, 3)
     );
     assert_eq!(

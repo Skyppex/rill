@@ -433,6 +433,7 @@ pub fn compile_instance(
     if defs.vectorize {
         super::vector::vectorize(&mut code);
     }
+    super::opt::sums(&mut code);
     Ok(code)
 }
 

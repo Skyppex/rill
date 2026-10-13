@@ -12,7 +12,10 @@
 //! Every list of instructions is looked at together (the tick, the code
 //! after it, and the handlers), since they share registers.
 
+use std::collections::HashMap;
+
 use super::vm::{Code, Instr, Operand, Reg, Source};
+use crate::ops::Op2;
 
 /// Rewrite `code` into an equivalent with fewer instructions.
 pub fn optimize(code: &mut Code) {
@@ -31,7 +34,8 @@ fn pure_dst(i: &Instr) -> Option<Reg> {
         Instr::Op1 { dst, .. }
         | Instr::Op2 { dst, .. }
         | Instr::Tune { dst, .. }
-        | Instr::Copy { dst, .. } => Some(dst),
+        | Instr::Copy { dst, .. }
+        | Instr::Sum { dst, .. } => Some(dst),
         _ => None,
     }
 }
@@ -41,7 +45,8 @@ fn pure_dst_mut(i: &mut Instr) -> Option<&mut Reg> {
         Instr::Op1 { dst, .. }
         | Instr::Op2 { dst, .. }
         | Instr::Tune { dst, .. }
-        | Instr::Copy { dst, .. } => Some(dst),
+        | Instr::Copy { dst, .. }
+        | Instr::Sum { dst, .. } => Some(dst),
         _ => None,
     }
 }
@@ -56,7 +61,8 @@ pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(Reg)) {
         | Instr::Select { dst, .. }
         | Instr::LoadCapture { dst, .. }
         | Instr::Noise { dst, .. }
-        | Instr::DelayRead { dst, .. } => f(dst),
+        | Instr::DelayRead { dst, .. }
+        | Instr::Sum { dst, .. } => f(dst),
         Instr::DelayWrite { .. }
         | Instr::Want { .. }
         | Instr::JumpUnless { .. }
@@ -107,6 +113,18 @@ pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(Reg)) {
         | Instr::Noise { .. }
         | Instr::Vector { .. } => {}
         Instr::Want { x, .. } => op(x),
+        Instr::Sum {
+            init,
+            base,
+            n,
+            stride,
+            ..
+        } => {
+            op(init);
+            for k in 0..n {
+                f(base + k * stride);
+            }
+        }
     }
 }
 
@@ -190,6 +208,124 @@ pub(crate) fn usage(code: &Code) -> Usage {
         }
     }
     u
+}
+
+/// Chains of adds over evenly spaced registers become one [`Instr::Sum`]:
+/// `t1 = init + x0; t2 = t1 + x1; ...; d = tn + xn`, where `x0..=xn` are
+/// `stride` apart, as `sum` over the copies of a pool is once they run
+/// together (their results are a lane group, one apart). One instruction
+/// instead of one per copy; the adds happen in the same order, so the
+/// result is the same to the bit.
+///
+/// Each `t` must be read only by the next add, and the chain must run
+/// straight through, with nothing in between writing the registers it adds
+/// (the sum reads them all at the end).
+pub(crate) fn sums(code: &mut Code) {
+    let u = usage(code);
+    let lists = std::iter::once(&mut code.instrs)
+        .chain(std::iter::once(&mut code.post))
+        .chain(code.events.iter_mut().map(|e| &mut e.instrs));
+    for list in lists {
+        let targets = jump_targets(list);
+        // Where each single-use register is written by an add.
+        let mut add_at: HashMap<Reg, usize> = HashMap::new();
+        for (p, i) in list.iter().enumerate() {
+            if let Instr::Op2 {
+                op: Op2::Add, dst, ..
+            } = *i
+            {
+                let d = dst as usize;
+                if u.defs[d] == 1 && u.uses[d] == 1 && !u.pinned[d] {
+                    add_at.insert(dst, p);
+                }
+            }
+        }
+        let mut remove = vec![false; list.len()];
+        // From the end, so the longest chain is found from its last add.
+        for t in (0..list.len()).rev() {
+            if remove[t] {
+                continue;
+            }
+            let Instr::Op2 {
+                op: Op2::Add,
+                dst,
+                a: Operand::Reg(mut acc),
+                b: Operand::Reg(last),
+            } = list[t]
+            else {
+                continue;
+            };
+            // Walk back along the chain while each add brings in the
+            // register `stride` before the one after it.
+            let mut leaves = vec![last];
+            let mut links = Vec::new();
+            let mut stride = None;
+            let mut init = Operand::Reg(acc);
+            while let Some(&q) = add_at.get(&acc) {
+                let Instr::Op2 {
+                    a,
+                    b: Operand::Reg(x),
+                    ..
+                } = list[q]
+                else {
+                    break;
+                };
+                let prev = *leaves.last().expect("one at least");
+                let s = prev.checked_sub(x).filter(|&s| s > 0);
+                if s.is_none() || stride.is_some_and(|st| Some(st) != s) || q >= t {
+                    break;
+                }
+                stride = s;
+                leaves.push(x);
+                links.push(q);
+                init = a;
+                match a {
+                    Operand::Reg(r) => acc = r,
+                    Operand::Const(_) => break,
+                }
+            }
+            let Some(stride) = stride else { continue };
+            // A sum of fewer than four is not worth it.
+            if leaves.len() < 4 {
+                continue;
+            }
+            let first = *links.last().expect("links for every leaf but one");
+            // Straight through from the first add to the last, nothing
+            // writing what is added, and nothing that writes registers it
+            // does not say (vector blocks).
+            let mut leaf_set: std::collections::HashSet<Reg> = leaves.iter().copied().collect();
+            if let Operand::Reg(r) = init {
+                leaf_set.insert(r);
+            }
+            let clear = (first..t).all(|p| {
+                let mut writes_leaf = false;
+                writes(&list[p], &mut |r| writes_leaf |= leaf_set.contains(&r));
+                !targets[p + 1]
+                    && !writes_leaf
+                    && !matches!(
+                        list[p],
+                        Instr::Jump { .. } | Instr::JumpUnless { .. } | Instr::Vector { .. }
+                    )
+            });
+            if !clear {
+                continue;
+            }
+            let base = *leaves.last().expect("leaves");
+            list[t] = Instr::Sum {
+                dst,
+                init,
+                base,
+                n: leaves.len() as u32,
+                stride,
+            };
+            for q in links {
+                remove[q] = true;
+            }
+        }
+        if remove.iter().any(|&r| r) {
+            retain(list, &remove);
+        }
+    }
 }
 
 /// Positions some jump in `list` lands on.

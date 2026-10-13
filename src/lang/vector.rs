@@ -684,6 +684,9 @@ fn rename(code: &mut Code, map: &HashMap<Reg, Reg>) {
             op(time);
         }
         Instr::DelayWrite { x, .. } | Instr::Want { x, .. } => op(x),
+        // Made after renaming (see `opt::sums`), so its registers are
+        // already the new ones.
+        Instr::Sum { .. } => {}
         Instr::Jump { .. } | Instr::InvokeSeq { .. } | Instr::Vector { .. } => {}
     };
     for i in code

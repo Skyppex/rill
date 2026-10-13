@@ -2212,6 +2212,31 @@ fn consts_are_worked_out_when_building() {
 }
 
 #[test]
+fn a_sum_over_a_pool_is_one_instruction() {
+    // Mono and stereo pools summed, a sum mixed with other values, and a
+    // sum too short to bother with: the same to the bit, and the long sums
+    // no longer an add per copy.
+    let src = "
+        import \"@gen/osc\"
+        import \"@mix/stereo\"
+        rill main() [Sample; 2] {
+            let mono = sum(saw([110Hz; 64], offset: each random())) / 64
+            let freqs: [Freq; 32]
+            for i in 0..32 {
+                freqs[i] = 220Hz + i as Float * 3Hz
+            }
+            let stereo = sum(pan(sine(freqs), each random() * 2 - 1)) / 32
+            let few = sum(sine([300Hz, 400Hz, 500Hz]))
+            return stereo + [mono, few * 0.1] + [sum(sine([50Hz; 8])) * 0.01, 0]
+        }
+    ";
+    // 7 vector blocks, 4 sums (mono, left, right, the 8), the 3 left as
+    // adds, and the mixing around them: 18, against 2193 one by one.
+    let (lanes, scalar) = same_either_way(src, 2, 10_000, &[]);
+    assert!(lanes <= 18, "{lanes} vs {scalar}: the sums were not folded");
+}
+
+#[test]
 fn noise_runs_together_and_picks_the_same_numbers() {
     // White, pink and brown noise in pools: each copy keeps its own
     // generator, and takes the same numbers in the same order as alone.

@@ -124,6 +124,16 @@ pub enum Instr {
         line: u16,
         x: Operand,
     },
+    /// `dst = init + r[base] + r[base + stride] + ...`, `n` registers, added
+    /// one at a time in that order: what a chain of adds over a lane group
+    /// (`sum` of a pool's copies) becomes. See [`super::opt::sums`].
+    Sum {
+        dst: Reg,
+        init: Operand,
+        base: Reg,
+        n: u32,
+        stride: u32,
+    },
 }
 
 /// The copies of a voice pool run together: each instruction does the same
@@ -726,6 +736,13 @@ fn list(s: &mut String, instrs: &[Instr]) {
             } => format!("r{dst} = delay {line} read {}", op(time)),
             Instr::Want { slot, x, ceiling } => format!("want {slot} {} past {ceiling}", op(x)),
             Instr::DelayWrite { line, x } => format!("delay {line} write {}", op(x)),
+            Instr::Sum {
+                dst,
+                init,
+                base,
+                n,
+                stride,
+            } => format!("r{dst} = {} + sum r{base}, {n} by {stride}", op(init)),
         };
         let _ = writeln!(s, "{pc:4}: {line}");
     }
@@ -1813,6 +1830,20 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
             if x > ceiling {
                 note_want(&run.wants, slot, x);
             }
+        }
+        Instr::Sum {
+            dst,
+            init,
+            base,
+            n,
+            stride,
+        } => {
+            let mut acc = val(regs, init);
+            let (base, stride) = (base as usize, stride as usize);
+            for k in 0..n as usize {
+                acc += regs[base + k * stride];
+            }
+            regs[dst as usize] = acc;
         }
         Instr::DelayWrite { line, x } => {
             let x = val(regs, x);

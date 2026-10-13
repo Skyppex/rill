@@ -1,0 +1,72 @@
+// A classic subtractive synth: two detuned saws through a resonant lowpass,
+// with one envelope opening the filter and another shaping the level.
+
+import "@gen/osc"
+import "@effects/env"
+import "@effects/filter"
+import "@effects/delay"
+import "@mix/stereo"
+
+seq bass(step: 1/16, tempo: 100bpm, gate: 0.6, loop: true) {
+    G#1, _, _, B1,
+    _, _, A#1, _,
+    A#1, _, A1, _,
+    E2, _, D#2, _,
+}
+
+rill voice() [Sample; 2] {
+    state pitch: Pitch = A1
+    state gate: Float = 0
+    state level: Float = 0
+
+    on bass_note_on(note) claim {
+        pitch = note.pitch
+        level = note.velocity
+        gate = 1
+    }
+
+    on bass_note_off release {
+        gate = 0
+    }
+
+    let freq = pitch |> equal
+    let osc = saw(freq) + saw(freq * 1.006, offset: 0.3)
+
+    // The filter opens fast and closes over 200ms; the level holds while
+    // the note does.
+    let sweep = ahdsr(
+        gate,
+        attack: 2ms,
+        decay: 200ms,
+        sustain: 0.15,
+        release: 150ms,
+    )
+
+    let shaped = lowpass(osc, 150Hz + sweep * 3kHz * level, resonance: 0.6)
+
+    let amp = ahdsr(
+        gate,
+        attack: 2ms,
+        decay: 80ms,
+        sustain: 0.8,
+        release: 120ms,
+    )
+
+    // Lower notes a little to the left, higher ones to the right.
+    return pan(shaped * amp * 0.4, (pitch - A2) / 12st * 0.3)
+}
+
+rill main(volume: Gain = -9dB) [Sample; 2] {
+    on start {
+        invoke bass
+    }
+
+    let synth = sum([voice(); 6])
+
+    let space = [
+        comb(synth[0], 241ms, feedback: 0.3, tone: 1.5kHz),
+        comb(synth[1], 362ms, feedback: 0.3, tone: 1.5kHz),
+    ]
+
+    return synth + space * 0.3 + volume
+}

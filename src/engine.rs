@@ -419,6 +419,14 @@ impl Engine {
         )
     }
 
+    /// How the program's tick splits into stages that stream over samples
+    /// and stages that loop sample by sample.
+    pub fn stages(&self) -> Option<crate::lang::stages::Stages> {
+        self.nodes
+            .iter()
+            .find_map(|n| n.program().map(|p| p.stages().clone()))
+    }
+
     /// Whether each pool of the program runs its copies together, and why
     /// not where it does not.
     pub fn grouping(&self) -> Vec<crate::lang::vm::Grouping> {

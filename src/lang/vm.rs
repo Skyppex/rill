@@ -541,6 +541,9 @@ pub struct Code {
     /// Whether each pool (or loop) with copies to run together does, and
     /// why not if not. Filled by the vectoriser; empty without it.
     pub grouping: Vec<Grouping>,
+    /// Which parts of the tick can run over a stretch of samples at once
+    /// (see [`super::stages`]).
+    pub stages: super::stages::Stages,
     /// Per noise generator ([`Instr::Noise`]), its seed.
     pub noises: Vec<u64>,
     /// Per delay line ([`Instr::DelayRead`]), its length in samples,
@@ -2451,6 +2454,10 @@ impl Program {
     /// what they have been asked for while playing, in the same order.
     pub fn grouping(&self) -> &[Grouping] {
         &self.code.grouping
+    }
+
+    pub fn stages(&self) -> &super::stages::Stages {
+        &self.code.stages
     }
 
     pub fn ceilings(&self) -> Ceilings {

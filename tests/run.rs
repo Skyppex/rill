@@ -2280,6 +2280,89 @@ fn copies_inside_voices_that_run_alone_still_run_together() {
     assert!(alone[0].name.ends_with("y/pool#1"), "{grouping:#?}");
 }
 
+fn stages_of(src: &str) -> rill::lang::stages::Stages {
+    let (graph, _) = lang::load_with(src, &config(2), "main", &Default::default())
+        .unwrap_or_else(|d| panic!("{d:#?}"));
+    Engine::new(graph, config(2))
+        .unwrap()
+        .stages()
+        .expect("a program")
+}
+
+#[test]
+fn plain_maths_on_controls_could_stream() {
+    let s = stages_of(
+        "rill main(gain: Float = 0.5, offset: Float = 0.1) [Sample; 2] {
+            let x = tanh(gain * 3 + offset) * 0.5
+            return [x, x * 0.5]
+        }",
+    );
+    assert_eq!(s.fallback, None);
+    let (streams, loops) = s.counts();
+    assert!(streams > 0 && loops == 0, "{s:#?}");
+}
+
+#[test]
+fn a_recurrence_loops_and_what_follows_it_streams() {
+    // A one-pole filter is a cycle; a phasor's phase reads its own last
+    // value; the maths after both does not depend on the next sample.
+    let s = stages_of(
+        "rill main(cutoff: Float = 0.1) [Sample; 2] {
+            state phase: Float = 0
+            state y: Float = 0
+            phase = wrap(phase + 0.01)
+            y = y + (phase - y) * cutoff
+            let out = tanh(y * 4) * 0.25 + sin(phase * TAU) * 0.1
+            return [out, out]
+        }",
+    );
+    let (streams, loops) = s.counts();
+    assert!(streams >= 4 && loops >= 3, "{s:#?}");
+    let why: Vec<&str> = s.looping.iter().map(|(w, _)| *w).collect();
+    assert!(why.contains(&"in a cycle"), "{why:?}");
+    // Looping first (the state), then streaming (what reads it).
+    assert!(
+        !s.stages[0].streams && s.stages.last().unwrap().streams,
+        "{s:#?}"
+    );
+}
+
+#[test]
+fn a_value_from_the_last_sample_loops_without_a_cycle() {
+    // A differentiator: `prev` is read before it is written, so the read
+    // sees the last sample's value; nothing loops back, but it stays put.
+    let s = stages_of(
+        "rill main(x: Float = 0.5) [Sample; 2] {
+            state prev: Float = 0
+            let d = x - prev
+            prev = x
+            return [d, d]
+        }",
+    );
+    assert!(s.counts().1 >= 2, "{s:#?}");
+}
+
+#[test]
+fn a_tempo_that_follows_computed_values_runs_sample_by_sample() {
+    // When steps fall depends on what the tick computes, sample by sample;
+    // a tempo that is a control is known ahead, and does not need that.
+    let tempo = |t: &str| {
+        format!(
+            "seq beep(step: 1/4, tempo: 120bpm, loop: true) {{ C4 }}
+            rill main(speed: Freq = 120bpm) [Sample; 2] {{
+                state wobble: Float = 0
+                wobble = wrap(wobble + 0.0001)
+                on start {{
+                    let _ = invoke beep(tempo: {t})
+                }}
+                return [wobble, wobble]
+            }}"
+        )
+    };
+    assert!(stages_of(&tempo("speed * (1 + wobble)")).fallback.is_some());
+    assert_eq!(stages_of(&tempo("speed")).fallback, None);
+}
+
 #[test]
 fn the_report_says_which_copies_run_alone_and_why() {
     let src = "

@@ -32,6 +32,7 @@ pub mod opt;
 pub mod parser;
 pub mod prelude;
 pub mod pretty;
+pub mod stages;
 pub mod types;
 pub mod vector;
 pub mod vm;

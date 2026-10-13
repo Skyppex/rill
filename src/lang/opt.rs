@@ -343,7 +343,7 @@ pub(crate) fn sums(code: &mut Code) {
 }
 
 /// The operands a vector instruction reads.
-fn vector_regs(i: &VInstr, f: &mut impl FnMut(VArg)) {
+pub(crate) fn vector_regs(i: &VInstr, f: &mut impl FnMut(VArg)) {
     match *i {
         VInstr::Op2 { a, b, .. } => {
             f(a);
@@ -370,7 +370,7 @@ fn vector_regs(i: &VInstr, f: &mut impl FnMut(VArg)) {
 }
 
 /// The lane group a vector instruction writes.
-fn vector_dst(i: &VInstr) -> Option<Reg> {
+pub(crate) fn vector_dst(i: &VInstr) -> Option<Reg> {
     match *i {
         VInstr::Op2 { d, .. }
         | VInstr::Op1 { d, .. }

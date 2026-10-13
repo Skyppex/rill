@@ -7,9 +7,9 @@ import "@effects/filter"
 import "@mix/stereo"
 
 seq bass(step: 1/16, tempo: 100bpm, gate: 0.6, loop: true) {
-    G#1, _, _, B1,
-    _, _, A#1, _,
-    A#1, _, A1, _,
+    G#1, _, G#1@0.15, B1,
+    _, G#1@0.15, A#1, A#1,
+    A#1, A1@0.15, A1, A1,
     E2, _, D#2, _,
 }
 
@@ -52,7 +52,7 @@ rill voice() [Sample; 2] {
     )
 
     // Lower notes a little to the left, higher ones to the right.
-    return pan(shaped * amp * 0.4, (pitch - A2) / 12st * 0.3)
+    return pan(shaped * amp * 0.4, (pitch - A2) / 12st * 0.3) * level
 }
 
 rill main(volume: Gain = -9dB) [Sample; 2] {

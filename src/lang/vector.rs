@@ -136,6 +136,75 @@ pub fn vectorize(code: &mut Code) {
     }
 }
 
+/// Make every `if` in the tick straight-line code, where it can be: both
+/// sides run, and the writes of the side not taken go nowhere (the same as
+/// copies get before they run together). Code without jumps can run over
+/// many samples at once (see [`super::stages`]); a region with jumps
+/// cannot. A region with side effects on only some paths (noise, delay
+/// lines, events) stays as it is.
+pub fn straighten_branches(code: &mut Code) {
+    if !code
+        .instrs
+        .iter()
+        .any(|i| matches!(i, Instr::Jump { .. } | Instr::JumpUnless { .. }))
+    {
+        return;
+    }
+    let usage = usage(code);
+    let list = std::mem::take(&mut code.instrs);
+    let mut next = code.regs as u32;
+    let mut out: Vec<Instr> = Vec::with_capacity(list.len());
+    // Where each old position went, for the jumps that stay.
+    let mut moved = vec![0u32; list.len() + 1];
+    let mut i = 0;
+    while i < list.len() {
+        let Instr::Jump { target } | Instr::JumpUnless { target, .. } = list[i] else {
+            moved[i] = out.len() as u32;
+            out.push(list[i]);
+            i += 1;
+            continue;
+        };
+        // The region: from the jump to the furthest place it, or a jump
+        // inside it, goes.
+        let mut end = target as usize;
+        let mut p = i;
+        while p < end {
+            if let Instr::Jump { target } | Instr::JumpUnless { target, .. } = list[p] {
+                end = end.max(target as usize);
+            }
+            p += 1;
+        }
+        let end = end.min(list.len());
+        let mut tried = next;
+        match straighten(&list[i..end], i as u32, &usage, &mut tried) {
+            Ok(flat) => {
+                next = tried;
+                moved[i..end].fill(out.len() as u32);
+                out.extend(flat);
+            }
+            Err(_) => {
+                for (k, instr) in list[i..end].iter().enumerate() {
+                    moved[i + k] = out.len() as u32;
+                    out.push(*instr);
+                }
+            }
+        }
+        i = end;
+    }
+    moved[list.len()] = out.len() as u32;
+    for instr in &mut out {
+        if let Instr::Jump { target } | Instr::JumpUnless { target, .. } = instr {
+            *target = moved[*target as usize];
+        }
+    }
+    if out.len() != list.len() || next as usize != code.regs {
+        // The copy ranges no longer match the code.
+        code.lane_ranges.fill(None);
+    }
+    code.instrs = out;
+    code.regs = next as usize;
+}
+
 /// What became of a pool.
 #[derive(Clone, Debug)]
 enum Outcome {

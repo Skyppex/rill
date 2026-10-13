@@ -812,6 +812,31 @@ fn profile(
             cpu.major_faults
         );
     }
+    // How much of the tick could stream over samples (not yet used).
+    if let Some(stages) = engine.stages() {
+        match &stages.fallback {
+            Some(why) => println!("  stages:   sample by sample: {why}"),
+            None => {
+                let (streams, loops) = stages.counts();
+                let total = (streams + loops).max(1);
+                let streaming = stages.stages.iter().filter(|s| s.streams).count();
+                println!(
+                    "  stages:   {streams} of {} instructions could stream ({:.0}%); {} stages, {streaming} streaming",
+                    streams + loops,
+                    streams as f64 * 100.0 / total as f64,
+                    stages.stages.len()
+                );
+                if !stages.looping.is_empty() {
+                    let why: Vec<String> = stages
+                        .looping
+                        .iter()
+                        .map(|(why, count)| format!("{count} {why}"))
+                        .collect();
+                    println!("    looping: {}", why.join(", "));
+                }
+            }
+        }
+    }
     // Which copies run together, and why the others do not.
     let grouping = engine.grouping();
     if !grouping.is_empty() {

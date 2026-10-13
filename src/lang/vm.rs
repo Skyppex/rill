@@ -196,6 +196,25 @@ pub enum VInstr {
         source: u16,
         stride: u16,
     },
+    /// Lane `k` reads delay line `line + k * stride` as [`Instr::DelayRead`]
+    /// does, noting a time past the line in ceiling `want + k * want_stride`.
+    /// A stride of 0 has every lane read the same line (the taps of one
+    /// multi-tap delay).
+    DelayRead {
+        d: Reg,
+        line: u16,
+        stride: u16,
+        time: VArg,
+        want: u16,
+        want_stride: u16,
+    },
+    /// Lane `k` writes delay line `line + k * stride` as
+    /// [`Instr::DelayWrite`] does; every lane has its own line.
+    DelayWrite {
+        line: u16,
+        stride: u16,
+        x: VArg,
+    },
 }
 
 /// The prelude's tunings, as run by [`Instr::Tune`].
@@ -910,7 +929,13 @@ impl Program {
             }
         }
         for block in &code.vectors {
-            check_vector(block, code.regs, code.noises.len());
+            check_vector(
+                block,
+                code.regs,
+                code.noises.len(),
+                code.delays.len(),
+                code.ceilings.len(),
+            );
         }
         let claims = code
             .events
@@ -1419,7 +1444,13 @@ fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
             }
             Fast::Jump { target } => pc = target as usize,
             Fast::Vector { block } => {
-                run_vector(&code.vectors[block as usize], regs, &mut run.noise);
+                let state = LaneState {
+                    noise: &mut run.noise,
+                    delays: &mut run.delays,
+                    wants: &run.wants,
+                    rate: run.rate,
+                };
+                run_vector(&code.vectors[block as usize], regs, state);
             }
             Fast::Slow { index } => {
                 if let Some(target) = step(&instrs[index as usize], code, run) {
@@ -1431,7 +1462,7 @@ fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
 }
 
 /// Check that every register a vector block uses exists.
-fn check_vector(block: &VectorBlock, regs: usize, noises: usize) {
+fn check_vector(block: &VectorBlock, regs: usize, noises: usize, delays: usize, wants: usize) {
     let n = usize::from(block.lanes);
     assert!(n > 0, "a vector block needs lanes");
     let arg = |a: VArg| match a {
@@ -1480,9 +1511,48 @@ fn check_vector(block: &VectorBlock, regs: usize, noises: usize) {
                 );
                 d
             }
+            VInstr::DelayRead {
+                d,
+                line,
+                stride,
+                time,
+                want,
+                want_stride,
+            } => {
+                arg(time);
+                let last =
+                    |first: u16, stride: u16| usize::from(first) + (n - 1) * usize::from(stride);
+                assert!(
+                    last(line, stride) < delays,
+                    "delay lines {line}.. out of range"
+                );
+                assert!(
+                    last(want, want_stride) < wants,
+                    "ceilings {want}.. out of range"
+                );
+                d
+            }
+            VInstr::DelayWrite { line, stride, x } => {
+                arg(x);
+                assert!(stride > 0, "lanes cannot write one delay line");
+                assert!(
+                    usize::from(line) + (n - 1) * usize::from(stride) < delays,
+                    "delay lines {line}.. out of range"
+                );
+                continue;
+            }
         };
         arg(VArg::Lanes(d));
     }
+}
+
+/// What a vector block's lanes keep besides registers: noise generators,
+/// delay lines, and the ceilings they ask to grow.
+struct LaneState<'a> {
+    noise: &'a mut [u64],
+    delays: &'a mut [(Box<[f32]>, usize)],
+    wants: &'a [std::sync::atomic::AtomicU32],
+    rate: f32,
 }
 
 /// Where a vector operand's values come from, settled before a loop runs.
@@ -1499,7 +1569,7 @@ enum Src {
 /// The loops over lanes are small functions of their own, one per operation
 /// and shape of operands, kept out of this one: each is compiled on its own
 /// terms (SIMD, unrolling), however this function changes around them.
-fn run_vector(block: &VectorBlock, regs: &mut [f32], noise: &mut [u64]) {
+fn run_vector(block: &VectorBlock, regs: &mut [f32], state: LaneState) {
     let n = usize::from(block.lanes);
     let p = regs.as_mut_ptr();
     // SAFETY: `check_vector` made sure every lane group and register is
@@ -1563,9 +1633,32 @@ fn run_vector(block: &VectorBlock, regs: &mut [f32], noise: &mut [u64]) {
                     }
                 }
                 VInstr::Noise { d, source, stride } => {
-                    let states = &mut noise[usize::from(source)..];
+                    let states = &mut state.noise[usize::from(source)..];
                     noise_lanes(p.add(d as usize), states, usize::from(stride), n);
                 }
+                VInstr::DelayRead {
+                    d,
+                    line,
+                    stride,
+                    time,
+                    want,
+                    want_stride,
+                } => delay_reads(
+                    p.add(d as usize),
+                    src(time),
+                    &state.delays[usize::from(line)..],
+                    usize::from(stride),
+                    &state.wants[usize::from(want)..],
+                    usize::from(want_stride),
+                    state.rate,
+                    n,
+                ),
+                VInstr::DelayWrite { line, stride, x } => delay_writes(
+                    src(x),
+                    &mut state.delays[usize::from(line)..],
+                    usize::from(stride),
+                    n,
+                ),
             }
         }
     }
@@ -1660,6 +1753,53 @@ unsafe fn noise_lanes(d: *mut f32, states: &mut [u64], stride: usize, n: usize) 
     for (k, state) in states.iter_mut().step_by(stride).take(n).enumerate() {
         // SAFETY: as the caller promises.
         unsafe { *d.add(k) = next_noise(state) };
+    }
+}
+
+/// Lane `k` of `d` = what `lines[k * stride]` held `time` (lane `k`) ago,
+/// as [`Instr::DelayRead`]: a time past the line is noted in
+/// `wants[k * want_stride]`.
+///
+/// # Safety
+///
+/// `d` and a `Lanes` time must hold `n` lanes.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn delay_reads(
+    d: *mut f32,
+    time: Src,
+    lines: &[(Box<[f32]>, usize)],
+    stride: usize,
+    wants: &[std::sync::atomic::AtomicU32],
+    want_stride: usize,
+    rate: f32,
+    n: usize,
+) {
+    for k in 0..n {
+        // SAFETY: as the caller promises.
+        let t = unsafe { time.at(k) };
+        let (data, at) = &lines[k * stride];
+        if t > (data.len() - 2) as f32 {
+            note_want(wants, (k * want_stride) as u16, t / rate);
+        }
+        // SAFETY: as the caller promises.
+        unsafe { *d.add(k) = read_delay(data, *at, t) };
+    }
+}
+
+/// Lane `k`'s value of `x` written to `lines[k * stride]`, as
+/// [`Instr::DelayWrite`].
+///
+/// # Safety
+///
+/// A `Lanes` value must hold `n` lanes.
+#[inline(never)]
+unsafe fn delay_writes(x: Src, lines: &mut [(Box<[f32]>, usize)], stride: usize, n: usize) {
+    for k in 0..n {
+        let (data, at) = &mut lines[k * stride];
+        // SAFETY: as the caller promises.
+        data[*at] = unsafe { x.at(k) };
+        *at = if *at + 1 == data.len() { 0 } else { *at + 1 };
     }
 }
 
@@ -1782,7 +1922,13 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
         }
         Instr::Jump { target } => return Some(target as usize),
         Instr::Vector { block } => {
-            run_vector(&code.vectors[block as usize], regs, &mut run.noise);
+            let state = LaneState {
+                noise: &mut run.noise,
+                delays: &mut run.delays,
+                wants: &run.wants,
+                rate: run.rate,
+            };
+            run_vector(&code.vectors[block as usize], regs, state);
         }
         Instr::InvokeSeq { call } => invoke(call, code, run),
         Instr::InvokeEvent { event, values } => {

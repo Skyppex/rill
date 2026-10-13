@@ -162,6 +162,11 @@ enum Why {
     BranchNoise,
     /// The copies' noise generators are not evenly spaced.
     NoiseSpacing,
+    /// A delay line used on only some paths.
+    BranchDelay,
+    /// The copies' delay lines (or their ceilings) are not evenly spaced,
+    /// or several copies write one line.
+    DelaySpacing,
     /// A register would need two places, or there are none left.
     Registers,
     /// More copies than a block can hold.
@@ -184,11 +189,24 @@ impl std::fmt::Display for Why {
             Why::Unsupported(what) => write!(f, "it {what}"),
             Why::BranchNoise => write!(f, "it calls noise() on only some paths"),
             Why::NoiseSpacing => write!(f, "its noise generators are not evenly spaced"),
+            Why::BranchDelay => write!(f, "it uses a delay line on only some paths"),
+            Why::DelaySpacing => write!(f, "its delay lines are not evenly spaced"),
             Why::Registers => write!(f, "a value would need two places in the lanes"),
             Why::TooMany => write!(f, "it has more than 65,535 copies"),
             Why::Holds => write!(f, "pools inside it, with more copies, run together instead"),
         }
     }
+}
+
+/// The step between evenly spaced `values` (0 if they are all the same), if
+/// they are, in the order given.
+fn spacing(values: &[u16]) -> Option<u16> {
+    let step = values[1].checked_sub(values[0])?;
+    values
+        .iter()
+        .enumerate()
+        .all(|(k, &v)| usize::from(v) == usize::from(values[0]) + k * usize::from(step))
+        .then_some(step)
 }
 
 /// What an instruction that cannot run in lanes does, for [`Why`].
@@ -541,6 +559,64 @@ fn vectorize_pool(
                     stride: u16::try_from(stride).map_err(|_| Why::NoiseSpacing)?,
                 }
             }
+            Instr::DelayRead { .. } => {
+                let parts: Vec<(u16, u16)> = at
+                    .iter()
+                    .map(|i| match **i {
+                        Instr::DelayRead { line, want, .. } => Some((line, want)),
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()
+                    .ok_or(Why::Differ)?;
+                let (lines, wants): (Vec<u16>, Vec<u16>) = parts.into_iter().unzip();
+                let stride = spacing(&lines).ok_or(Why::DelaySpacing)?;
+                let want_stride = spacing(&wants).ok_or(Why::DelaySpacing)?;
+                let time = g
+                    .arg(&ops(&|i| match *i {
+                        Instr::DelayRead { time, .. } => time,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                let d = g
+                    .dst(&dsts(&|i| match *i {
+                        Instr::DelayRead { dst, .. } => dst,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                VInstr::DelayRead {
+                    d,
+                    line: lines[0],
+                    stride,
+                    time,
+                    want: wants[0],
+                    want_stride,
+                }
+            }
+            Instr::DelayWrite { .. } => {
+                let lines: Vec<u16> = at
+                    .iter()
+                    .map(|i| match **i {
+                        Instr::DelayWrite { line, .. } => Some(line),
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()
+                    .ok_or(Why::Differ)?;
+                // Every lane must write a line of its own.
+                let stride = spacing(&lines)
+                    .filter(|&s| s > 0)
+                    .ok_or(Why::DelaySpacing)?;
+                let x = g
+                    .arg(&ops(&|i| match *i {
+                        Instr::DelayWrite { x, .. } => x,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                VInstr::DelayWrite {
+                    line: lines[0],
+                    stride,
+                    x,
+                }
+            }
             other => return Err(Why::Unsupported(what(&other))),
         };
         instrs.push(v);
@@ -573,7 +649,9 @@ fn straighten(
             | Instr::Copy { .. }
             | Instr::Select { .. }
             | Instr::Tune { .. }
-            | Instr::Noise { .. } => {}
+            | Instr::Noise { .. }
+            | Instr::DelayRead { .. }
+            | Instr::DelayWrite { .. } => {}
             other => return Err(Why::Unsupported(what(&other))),
         }
     }
@@ -710,6 +788,16 @@ fn straighten(
             // Noise run on a path not taken would still move its generator
             // on, so only noise that always runs can go in a block.
             Instr::Noise { .. } if pred != one => return Err(Why::BranchNoise),
+            // A write on a side not taken would change the line; a read
+            // there could ask for a ceiling to grow for nothing.
+            Instr::DelayRead { .. } | Instr::DelayWrite { .. } if pred != one => {
+                return Err(Why::BranchDelay);
+            }
+            // Writes nothing to a register: as it is.
+            Instr::DelayWrite { .. } => {
+                out.push(copy[i]);
+                cur = Some(pred);
+            }
             instr => {
                 let mut d: Reg = 0;
                 writes(&instr, &mut |r| d = r);
@@ -885,6 +973,8 @@ fn rename(code: &mut Code, map: &HashMap<Reg, Reg>) {
                     pitch, setting, a4, ..
                 } => vec![pitch, setting, a4],
                 VInstr::Noise { .. } => vec![],
+                VInstr::DelayRead { time, .. } => vec![time],
+                VInstr::DelayWrite { x, .. } => vec![x],
             };
             for a in args {
                 if let VArg::Scalar(x) = a {

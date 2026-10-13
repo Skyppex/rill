@@ -2212,6 +2212,42 @@ fn consts_are_worked_out_when_building() {
 }
 
 #[test]
+fn delay_lines_run_together_and_keep_their_echoes() {
+    // Combs with feedback through state, multi-tap delays and lifted
+    // delays, in pools: each copy keeps its own line, the same to the bit
+    // as one at a time.
+    let src = "
+        import \"@gen/osc\"
+        import \"@effects/delay\"
+        rill voice(f: Freq, time: Time) Sample {
+            let x = saw(f) * 0.2
+            let taps = delay(x, [time, time * 2, time * 3], max: 40ms)
+            return comb(x, time * 0.7, feedback: 0.8, tone: 3kHz, max: 30ms) + sum(taps) * 0.3
+        }
+        // One tap: lifted over two frames, a line per pair.
+        rill echo(x: Sample, time: Time) Sample {
+            return delay(x, time, max: 10ms)
+        }
+        rill main() [Sample; 2] {
+            let freqs: [Freq; 16]
+            let times: [Time; 16]
+            for i in 0..16 {
+                freqs[i] = 110Hz + i as Float * 13Hz
+                times[i] = 2ms + i as Float * 0.5ms
+            }
+            let voices = sum(voice(freqs, times))
+            let lifted = sum(echo([saw(55Hz); 8], [1ms, 2ms, 3ms, 4ms, 5ms, 6ms, 7ms, 8ms]))
+            return [voices * 0.1, lifted * 0.1]
+        }
+    ";
+    let (lanes, scalar) = same_either_way(src, 2, 20_000, &[]);
+    assert!(
+        lanes * 10 < scalar,
+        "{lanes} vs {scalar}: the delays did not run together"
+    );
+}
+
+#[test]
 fn copies_inside_voices_that_run_alone_still_run_together() {
     // The voices read delay lines, so they run one at a time; the taps
     // inside each voice (a sine per tap) run together all the same.
@@ -2251,6 +2287,12 @@ fn the_report_says_which_copies_run_alone_and_why() {
         rill echo(x: Sample, time: Time) Sample {
             return delay(x, time, max: 50ms)
         }
+        // A delay only on some ticks, differently per copy.
+        rill now_and_then(x: Sample, every: Int) Sample {
+            state n: Int = 0
+            n = n + 1
+            return if n % every == 0 { delay(x, 5ms) } else { x }
+        }
         rill sometimes(every: Int) Sample {
             state n: Int = 0
             n = n + 1
@@ -2260,7 +2302,8 @@ fn the_report_says_which_copies_run_alone_and_why() {
             let tones = sum(saw([110Hz, 220Hz, 330Hz, 440Hz]))
             let echoes = sum(echo(tones, [10ms, 20ms, 30ms]))
             let clicks = sum(sometimes([2, 3, 5]))
-            return [tones + echoes, clicks]
+            let gaps = sum(now_and_then(tones, [2, 3, 5]))
+            return [tones + echoes + gaps, clicks]
         }
     ";
     let options = lang::build::Options {
@@ -2280,7 +2323,12 @@ fn the_report_says_which_copies_run_alone_and_why() {
             .clone()
     };
     assert_eq!(why("tones"), None, "{grouping:#?}");
-    assert!(why("echoes").unwrap().contains("reads a delay line"));
+    assert_eq!(why("echoes"), None, "{grouping:#?}");
+    assert!(
+        why("gaps")
+            .unwrap()
+            .contains("delay line on only some paths")
+    );
     assert!(
         why("clicks")
             .unwrap()

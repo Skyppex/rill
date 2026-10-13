@@ -162,6 +162,35 @@ rill main() [Sample; 2] {
 }
 
 #[test]
+fn delay_lines_running_together_carry_on_and_grow() {
+    // A pool of echoes runs as one vector block: a rebuild carries every
+    // line over, and a time past `max` in any copy grows its line.
+    let src = "
+import \"@gen/osc\"
+rill echo(x: Sample, time: Time) Sample {
+    return delay(x, time, max: 50ms)
+}
+rill main(time: Time = 10ms) [Sample; 2] {
+    let x = saw(220Hz) * 0.2
+    let echoes = echo([x; 8], [time, time * 1.5, time * 2, time * 2.5, time * 3, time * 3.5, time * 4, time * 4.5])
+    return [x, sum(echoes) * 0.1]
+}";
+    let (out, fresh) = swapped(src, src, 3_000, 10_000, 960);
+    assert_eq!(fresh, 0);
+    assert!(out == unswapped(src, 10_000));
+
+    let (mut live, mut player) = start(src);
+    live.set_fade(0);
+    render(&mut player, 2_000);
+    // 20ms: the longest tap wants 90ms, past the 50ms lines.
+    player.set_param("time", 0.02);
+    render(&mut player, 1_000);
+    live.grow().expect("a line was too short").unwrap();
+    let ceiling = live.raised().values().copied().fold(0.0, f32::max);
+    assert!((ceiling - 0.135).abs() < 1e-3, "{:?}", live.raised());
+}
+
+#[test]
 fn a_broken_edit_keeps_the_old_program() {
     let (mut live, mut player) = start(SONG);
     let mut out = render(&mut player, 5_000);

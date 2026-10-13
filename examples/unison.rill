@@ -89,7 +89,7 @@ rill main(volume: Gain = 0dB) [Sample; 2] {
 
     return (
         (
-            unison<UNISON>(freqs, 50cents)
+            unison<UNISON>(freqs, 10cents)
                 |> saw(offset: each random())
                 |> sum
                 |> unison_pan

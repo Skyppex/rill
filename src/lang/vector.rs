@@ -58,20 +58,29 @@ pub fn vectorize(code: &mut Code) {
         let lanes = code.lane_ranges[p].as_ref().map_or(0, Vec::len);
         (std::cmp::Reverse(lanes), std::cmp::Reverse(e - s))
     });
-    let mut chosen: Vec<(usize, u32, u32)> = Vec::new();
-    for r in regions {
-        match chosen.iter().find(|c| !(r.2 <= c.1 || r.1 >= c.2)) {
-            None => chosen.push(r),
-            Some(c) => outcome[r.0] = Some(Outcome::Inside(c.0)),
-        }
-    }
+    // Where the pools that run together were.
+    let mut grouped: Vec<(u32, u32)> = Vec::new();
     // Old register -> new register, for every register in a lane group.
     let mut renames: HashMap<Reg, Reg> = HashMap::new();
     // Regions already replaced by a single instruction: where they were and
     // how many instructions went.
     let mut replaced: Vec<(u32, u32)> = Vec::new();
     // In order of priority, since a register can only go in one lane group.
-    for (pool, s0, e0) in chosen {
+    // A pool inside one that runs together already does so; one inside a
+    // pool that cannot gets its own try (the voices of an echo cannot, as
+    // they read delay lines, but the taps inside each voice can).
+    for (pool, s0, e0) in regions {
+        if let Some(&(s, e)) = grouped.iter().find(|&&(s, e)| !(e0 <= s || s0 >= e)) {
+            // Inside a pool that runs together, it does too; around one (a
+            // pool with fewer copies than those inside it, tried later),
+            // it is left as it is.
+            outcome[pool] = Some(if s <= s0 && e0 <= e {
+                Outcome::Inside
+            } else {
+                Outcome::Left(Why::Holds)
+            });
+            continue;
+        }
         let shift: u32 = replaced
             .iter()
             .filter(|&&(at, _)| at < s0)
@@ -94,6 +103,7 @@ pub fn vectorize(code: &mut Code) {
                 }
             };
         outcome[pool] = Some(Outcome::Grouped);
+        grouped.push((s0, e0));
         code.regs = next as usize;
         renames.extend(new_names);
         code.state_init.extend(consts);
@@ -108,20 +118,12 @@ pub fn vectorize(code: &mut Code) {
         .filter_map(|(p, o)| {
             let o = o.as_ref()?;
             let copies = code.lane_ranges[p].as_ref().map_or(0, Vec::len);
-            let name = |p: usize| code.lane_names.get(p).cloned().unwrap_or_default();
             let why = match o {
-                Outcome::Grouped => None,
+                Outcome::Grouped | Outcome::Inside => None,
                 Outcome::Left(why) => Some(why.to_string()),
-                Outcome::Inside(outer) => match &outcome[*outer] {
-                    Some(Outcome::Grouped) => None,
-                    _ => Some(format!(
-                        "it is inside {}, which was tried instead",
-                        name(*outer)
-                    )),
-                },
             };
             Some(Grouping {
-                name: name(p),
+                name: code.lane_names.get(p).cloned().unwrap_or_default(),
                 copies,
                 why,
             })
@@ -138,9 +140,8 @@ pub fn vectorize(code: &mut Code) {
 #[derive(Clone, Debug)]
 enum Outcome {
     Grouped,
-    /// Inside the pool at this index, which was tried in its place (it has
-    /// more copies, or is bigger).
-    Inside(usize),
+    /// Inside a pool that runs together, so it does too.
+    Inside,
     Left(Why),
 }
 
@@ -165,6 +166,8 @@ enum Why {
     Registers,
     /// More copies than a block can hold.
     TooMany,
+    /// Pools inside it, with more copies, run together already.
+    Holds,
 }
 
 impl std::fmt::Display for Why {
@@ -183,6 +186,7 @@ impl std::fmt::Display for Why {
             Why::NoiseSpacing => write!(f, "its noise generators are not evenly spaced"),
             Why::Registers => write!(f, "a value would need two places in the lanes"),
             Why::TooMany => write!(f, "it has more than 65,535 copies"),
+            Why::Holds => write!(f, "pools inside it, with more copies, run together instead"),
         }
     }
 }

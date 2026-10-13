@@ -2212,6 +2212,39 @@ fn consts_are_worked_out_when_building() {
 }
 
 #[test]
+fn copies_inside_voices_that_run_alone_still_run_together() {
+    // The voices read delay lines, so they run one at a time; the taps
+    // inside each voice (a sine per tap) run together all the same.
+    let src = "
+        import \"@gen/osc\"
+        rill echoes(x: Sample, base: Time, rate: Freq) Sample {
+            let times: [Time; 8]
+            for t in 0..8 {
+                times[t] = base * (t + 1) as Float + sine(rate * (t + 1) as Float) * 1ms
+            }
+            return sum(delay(x, times, max: 100ms)) / 8
+        }
+        rill main() [Sample; 2] {
+            let x = saw(220Hz)
+            let y = sum(echoes(x, [3ms, 4ms, 5ms, 6ms], [0.2Hz, 0.3Hz, 0.4Hz, 0.5Hz]))
+            return [x, y]
+        }
+    ";
+    let (lanes, scalar) = same_either_way(src, 2, 10_000, &[]);
+    assert!(
+        lanes * 2 < scalar,
+        "{lanes} vs {scalar}: the taps did not run together"
+    );
+    let (graph, _) = lang::load_with(src, &config(2), "main", &Default::default())
+        .unwrap_or_else(|d| panic!("{d:#?}"));
+    let grouping = Engine::new(graph, config(2)).unwrap().grouping();
+    // The taps run together; the voices, holding them, do not.
+    let alone: Vec<_> = grouping.iter().filter(|g| g.why.is_some()).collect();
+    assert_eq!(alone.len(), 1, "{grouping:#?}");
+    assert!(alone[0].name.ends_with("y/pool#1"), "{grouping:#?}");
+}
+
+#[test]
 fn the_report_says_which_copies_run_alone_and_why() {
     let src = "
         import \"@gen/osc\"

@@ -1,9 +1,9 @@
 // Channel lifting: `peak` takes one sample, so applied to a stereo frame it
 // runs one independent copy per channel.
 
-import "@gen/osc"
-import "@effects/env"
-import "@mix/stereo"
+import @gen/osc
+import @effects/env
+import @mix/stereo
 
 // Stateful 1:1 rill. Body runs once per tick. Jumps up to the level of `x`
 // and falls by 60 dB over `release`.

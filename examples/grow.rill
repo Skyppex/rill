@@ -14,9 +14,9 @@
 //
 // Or both: add both `--param-event`s.
 
-import "@gen/osc"
-import "@gen/noise"
-import "@effects/filter"
+import @gen/osc
+import @gen/noise
+import @effects/filter
 
 rill main(time: Time = 10ms, slope: Slope = 12dB / 1oct) [Sample; 2] {
     let on = if phasor(1Hz) < 0.05 { 0.4 } else { 0.0 }

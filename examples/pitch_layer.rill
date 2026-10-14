@@ -1,4 +1,4 @@
-import "@gen/osc"
+import @gen/osc
 
 event press note_on
 event release note_off

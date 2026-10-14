@@ -4,8 +4,8 @@
 
 // bench: --block 16
 
-import "@gen/osc"
-import "@effects/filter"
+import @gen/osc
+import @effects/filter
 
 rill main() [Sample; 2] {
     let x = sum(saw([110Hz, 165Hz, 220Hz, 330Hz], offset: each random()))

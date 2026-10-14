@@ -4,9 +4,9 @@
 // `~` holds a note into the next step: `C2~, D#2` slides from C2 up to D#2,
 // `C2~, C2` ties the two into one long note. `@v1` is an accent.
 
-import "@gen/osc"
-import "@effects/env"
-import "@effects/filter"
+import @gen/osc
+import @effects/env
+import @effects/filter
 
 seq acid(step: 1/16, tempo: 128bpm, gate: .55, velocity: .6, loop: true) {
     C2, C2~, C3, _, D#2@v1, _, C2~, G2~,

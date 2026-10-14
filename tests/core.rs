@@ -31,7 +31,7 @@ fn render(src: &str, frames: usize) -> Vec<f32> {
 
 /// `main` returning `expr`, with `@gen/osc` imported.
 fn osc(expr: &str) -> String {
-    format!("import \"@gen/osc\"\nrill main() Sample {{\n    return {expr}\n}}")
+    format!("import @gen/osc\nrill main() Sample {{\n    return {expr}\n}}")
 }
 
 #[test]
@@ -59,17 +59,17 @@ fn core_is_there_without_any_files() {
     assert_eq!(out[0], 0.0);
     assert!((out[1] - (std::f32::consts::TAU / 48.0).sin()).abs() < 1e-5);
     // Anything else needs a file.
-    let errs = lang::compile("import \"osc\"\nrill main() Sample { return 0 }").unwrap_err();
+    let errs = lang::compile("import ./osc\nrill main() Sample { return 0 }").unwrap_err();
     assert_eq!(errs[0].message, "imports need a file to look next to");
 }
 
 #[test]
 fn unknown_core_modules() {
-    let errs = lang::compile("import \"@gen/oscs\"\nrill main() Sample { return 0 }").unwrap_err();
-    assert_eq!(errs[0].message, "there is no core module \"@gen/oscs\"");
+    let errs = lang::compile("import @gen/oscs\nrill main() Sample { return 0 }").unwrap_err();
+    assert_eq!(errs[0].message, "there is no core module `@gen/oscs`");
     assert_eq!(
         errs[0].help.as_deref(),
-        Some("did you mean \"@gen/osc\"? `rill core` lists them all")
+        Some("did you mean `@gen/osc`? `rill core` lists them all")
     );
 }
 
@@ -155,7 +155,7 @@ fn copies_keep_their_own_phase() {
 fn with(imports: &[&str], expr: &str) -> String {
     let imports: String = imports
         .iter()
-        .map(|m| format!("import \"{m}\"\n"))
+        .map(|m| format!("import {m}\n"))
         .collect();
     format!("{imports}rill main() Sample {{\n    return {expr}\n}}")
 }
@@ -181,7 +181,7 @@ fn response(imports: &[&str], filter: &str, freq: f32) -> f32 {
         "{}\nrill main() Sample {{\n    let x = sine({freq}Hz)\n    return {filter}\n}}",
         with(imports, "0").replace("rill main() Sample {\n    return 0\n}", "")
     );
-    let src = format!("import \"@gen/osc\"\n{src}");
+    let src = format!("import @gen/osc\n{src}");
     let out = render(&src, 48_000);
     let tail = &out[24_000..];
     20.0 * (rms(tail) / std::f32::consts::FRAC_1_SQRT_2).log10()
@@ -261,7 +261,7 @@ fn any_max_parameter_warns_the_same_way() {
         warnings(src),
         ["`time` changes while playing, but `max` is not given"]
     );
-    let src = "import \"@effects/filter\"\nrill main() Sample { return lowpass(noise(), 1kHz, slope: 24dB / 1oct + noise() * (12dB / 1oct)) }";
+    let src = "import @effects/filter\nrill main() Sample { return lowpass(noise(), 1kHz, slope: 24dB / 1oct + noise() * (12dB / 1oct)) }";
     assert_eq!(
         warnings(src),
         ["`slope` changes while playing, but `max` is not given"]
@@ -280,7 +280,7 @@ fn slopes_are_levels_over_intervals() {
     assert!((g - 10f32.powf(24.0 / 20.0)).abs() < 1e-3, "{g}");
     // A plain number is not a slope.
     let errs = lang::compile(
-        "import \"@effects/filter\"\nrill main() Sample { return lowpass(0, 1kHz, slope: 24) }",
+        "import @effects/filter\nrill main() Sample { return lowpass(0, 1kHz, slope: 24) }",
     )
     .unwrap_err();
     assert!(errs[0].message.contains("Slope"), "{errs:?}");
@@ -325,7 +325,7 @@ fn filters_fall_as_steeply_as_their_slope() {
 
 #[test]
 fn a_moving_slope_stays_finite() {
-    let src = "import \"@gen/osc\"\nimport \"@effects/filter\"\nrill main() Sample {\n    let s = phasor(7Hz) * 96dB / 1oct\n    let c = 200Hz + phasor(3Hz) * 8kHz\n    return lowpass(saw(110Hz), c, resonance: 0.9, slope: s, max: 96dB / 1oct)\n}";
+    let src = "import @gen/osc\nimport @effects/filter\nrill main() Sample {\n    let s = phasor(7Hz) * 96dB / 1oct\n    let c = 200Hz + phasor(3Hz) * 8kHz\n    return lowpass(saw(110Hz), c, resonance: 0.9, slope: s, max: 96dB / 1oct)\n}";
     let out = render(src, 48_000);
     assert!(out.iter().all(|x| x.is_finite() && x.abs() < 100.0));
 }
@@ -430,7 +430,7 @@ fn filters_respond_where_they_should() {
 
 #[test]
 fn a_swept_resonant_filter_stays_finite() {
-    let src = "import \"@gen/osc\"\nimport \"@effects/filter\"\nrill main() Sample {\n    let sweep = phasor(30Hz) * 20000Hz\n    return lowpass(saw(110Hz), sweep, resonance: 1)\n}";
+    let src = "import @gen/osc\nimport @effects/filter\nrill main() Sample {\n    let sweep = phasor(30Hz) * 20000Hz\n    return lowpass(saw(110Hz), sweep, resonance: 1)\n}";
     let out = render(src, 48_000);
     assert!(out.iter().all(|x| x.is_finite() && x.abs() < 100.0));
 }
@@ -438,7 +438,7 @@ fn a_swept_resonant_filter_stays_finite() {
 #[test]
 fn envelopes_take_their_times() {
     // A gate open for 0.5s: attack 10ms, decay to 0.5, release 100ms.
-    let src = "import \"@effects/env\"\nrill main() Sample {\n    state t: Float = 0\n    t = t + 1 / RATE / 1s\n    let gate = if t < 0.5 { 1.0 } else { 0.0 }\n    return ahdsr(gate, 10ms, 0s, 100ms, 0.5, 100ms)\n}";
+    let src = "import @effects/env\nrill main() Sample {\n    state t: Float = 0\n    t = t + 1 / RATE / 1s\n    let gate = if t < 0.5 { 1.0 } else { 0.0 }\n    return ahdsr(gate, 10ms, 0s, 100ms, 0.5, 100ms)\n}";
     let out = render(src, 36_000);
     let reached = out.iter().position(|&x| x >= 1.0).unwrap();
     assert!((470..=490).contains(&reached), "{reached}");
@@ -448,13 +448,13 @@ fn envelopes_take_their_times() {
     assert!((after - 0.0005).abs() < 0.0002, "{after}");
     // A hold keeps it at 1 for 50ms before the decay starts.
     let src =
-        "import \"@effects/env\"\nrill main() Sample { return ahdsr(1, 10ms, 50ms, 100ms, 0.5) }";
+        "import @effects/env\nrill main() Sample { return ahdsr(1, 10ms, 50ms, 100ms, 0.5) }";
     let out = render(src, 4_000);
     let top = out.iter().position(|&x| x >= 1.0).unwrap();
     assert!(out[top..top + 2_400].iter().all(|&x| x == 1.0));
     assert!(out[top + 2_400 + 10] < 1.0);
     // `slew` gets 99.9% of the way in its time.
-    let src = "import \"@effects/env\"\nrill main() Sample { return slew(1, 10ms, 10ms) }";
+    let src = "import @effects/env\nrill main() Sample { return slew(1, 10ms, 10ms) }";
     let out = render(src, 481);
     assert!((out[479] - 0.999).abs() < 0.001, "{}", out[479]);
 }
@@ -479,7 +479,7 @@ fn dynamics_move_levels() {
 #[test]
 fn echoes_repeat_and_fade() {
     let src = format!(
-        "import \"@effects/delay\"\n{IMPULSE}\nrill main() Sample {{\n    return comb(impulse(), 10ms, feedback: 0.5)\n}}"
+        "import @effects/delay\n{IMPULSE}\nrill main() Sample {{\n    return comb(impulse(), 10ms, feedback: 0.5)\n}}"
     );
     let out = render(&src, 2000);
     // Repeats every 480 samples, each half the last.
@@ -524,7 +524,7 @@ fn pitch(out: &[f32]) -> f32 {
 fn a_comb_rings_at_its_pitch() {
     for freq in [110.0f32, 220.0, 440.0] {
         let src = format!(
-            "import \"@effects/delay\"\n{IMPULSE}\nrill main() Sample {{\n    return comb(impulse(), 1 / {freq}Hz, feedback: 0.99)\n}}"
+            "import @effects/delay\n{IMPULSE}\nrill main() Sample {{\n    return comb(impulse(), 1 / {freq}Hz, feedback: 0.99)\n}}"
         );
         let out = render(&src, 24_000);
         let p = pitch(&out[4_800..]);
@@ -536,7 +536,7 @@ fn a_comb_rings_at_its_pitch() {
 #[test]
 fn pan_keeps_the_power() {
     let src = |pos: f32| {
-        format!("import \"@mix/stereo\"\nrill main() [Sample; 2] {{\n    return pan(1, {pos})\n}}")
+        format!("import @mix/stereo\nrill main() [Sample; 2] {{\n    return pan(1, {pos})\n}}")
     };
     for pos in [-1.0f32, -0.3, 0.0, 0.5, 1.0] {
         let config = rill::Config {
@@ -559,7 +559,7 @@ fn control_helpers() {
     let u = &["@util/control"];
     assert_eq!(render(&with(u, "map(0.5, -1, 1, 0, 10)"), 1)[0], 7.5);
     // `rising` once per rise; `sample_hold` keeps what it caught.
-    let src = "import \"@util/control\"\nimport \"@gen/osc\"\nrill main() Sample {\n    let clock = square(1kHz)\n    return sample_hold(phasor(100Hz), clock)\n}";
+    let src = "import @util/control\nimport @gen/osc\nrill main() Sample {\n    let clock = square(1kHz)\n    return sample_hold(phasor(100Hz), clock)\n}";
     let out = render(src, 480);
     let changes = out.windows(2).filter(|w| w[0] != w[1]).count();
     assert!((9..=11).contains(&changes), "{changes}");

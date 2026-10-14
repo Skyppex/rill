@@ -2,11 +2,11 @@
 // taps as you like, each its own stream. Feedback goes through `state`, and
 // whatever sits between the delay and the `state` is in the loop.
 
-import "@gen/osc"
-import "@effects/delay"
-import "@effects/filter"
-import "@mix/stereo"
-import "@util/control"
+import @gen/osc
+import @effects/delay
+import @effects/filter
+import @mix/stereo
+import @util/control
 
 // A plucked string (Karplus–Strong), built from core: a short burst of
 // noise ringing in a delay loop one period long, with a lowpass in the loop

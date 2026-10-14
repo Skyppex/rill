@@ -52,9 +52,9 @@ fn unswapped(src: &str, frames: usize) -> Vec<f32> {
 /// Oscillators, a delay full of echoes, noise, `random()`, a sequence
 /// playing and voices holding its notes.
 const SONG: &str = "
-import \"@gen/osc\"
-import \"@effects/delay\"
-import \"@effects/filter\"
+import @gen/osc
+import @effects/delay
+import @effects/filter
 
 seq riff(step: 1/16, tempo: 140bpm, loop: true) { C4, E4, G4, _, B4 }
 
@@ -125,8 +125,8 @@ fn an_edit_changes_only_what_it_touches() {
 #[test]
 fn the_crossfade_has_no_jumps() {
     // A sound that changes completely: the fade glides between them.
-    let a = "import \"@gen/osc\"\nrill main() [Sample; 2] {\n    let x = sine(220Hz) * 0.5\n    return [x, x]\n}";
-    let b = "import \"@gen/osc\"\nrill main() [Sample; 2] {\n    let x = sine(220Hz) * 0.5 + 0.4\n    return [x, x]\n}";
+    let a = "import @gen/osc\nrill main() [Sample; 2] {\n    let x = sine(220Hz) * 0.5\n    return [x, x]\n}";
+    let b = "import @gen/osc\nrill main() [Sample; 2] {\n    let x = sine(220Hz) * 0.5 + 0.4\n    return [x, x]\n}";
     let (out, _) = swapped(a, b, 1_000, 4_000, 960);
     let left: Vec<f32> = out.iter().step_by(2).copied().collect();
     let biggest = left
@@ -151,7 +151,7 @@ fn noise_running_together_carries_on_exactly() {
     // Noise in a pool runs as one vector block; a rebuild carries every
     // generator over by its key, as it does one copy at a time.
     let src = "
-import \"@gen/noise\"
+import @gen/noise
 rill main() [Sample; 2] {
     let x = sum([pink(); 32]) * 0.1
     return [x, sum([noise(); 8]) * 0.1]
@@ -166,7 +166,7 @@ fn delay_lines_running_together_carry_on_and_grow() {
     // A pool of echoes runs as one vector block: a rebuild carries every
     // line over, and a time past `max` in any copy grows its line.
     let src = "
-import \"@gen/osc\"
+import @gen/osc
 rill echo(x: Sample, time: Time) Sample {
     return delay(x, time, max: 50ms)
 }
@@ -205,8 +205,8 @@ fn a_broken_edit_keeps_the_old_program() {
 #[test]
 fn a_slope_past_its_max_grows_the_filter() {
     let src = "
-import \"@gen/osc\"
-import \"@effects/filter\"
+import @gen/osc
+import @effects/filter
 rill main(slope: Slope = 12dB / 1oct) [Sample; 2] {
     let y = lowpass(sine(2kHz), 500Hz, slope: slope, max: 24dB / 1oct)
     return [y, y]
@@ -240,7 +240,7 @@ rill main(slope: Slope = 12dB / 1oct) [Sample; 2] {
 #[test]
 fn a_delay_past_its_line_grows_and_keeps_its_echoes() {
     let src = "
-import \"@gen/osc\"
+import @gen/osc
 rill main(time: Time = 10ms) [Sample; 2] {
     let x = sine(440Hz)
     let y = delay(x, time, max: 20ms)
@@ -276,7 +276,7 @@ fn a_different_channel_count_is_refused() {
     // The device's stream is set up for two channels; the old program plays on.
     let (mut live, mut player) = start(SONG);
     let mut out = render(&mut player, 5_000);
-    let three = "import \"@gen/osc\"\nrill main() [Sample; 3] {\n    let x = sine(220Hz)\n    return [x, x, x]\n}";
+    let three = "import @gen/osc\nrill main() [Sample; 3] {\n    let x = sine(220Hz)\n    return [x, x, x]\n}";
     let Err(failed) = live.reload_text(three) else {
         panic!("a 3-channel program was swapped into a 2-channel stream");
     };

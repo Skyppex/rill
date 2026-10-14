@@ -2,7 +2,7 @@
 // one-pole filters in series, each with its own state. Nothing here can run
 // copies side by side, so this measures the cost of a single instruction.
 
-import "@gen/osc"
+import @gen/osc
 
 const STAGES = 512
 

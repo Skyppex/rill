@@ -2665,8 +2665,8 @@ fn delay_lines_run_together_and_keep_their_echoes() {
     // delays, in pools: each copy keeps its own line, the same to the bit
     // as one at a time.
     let src = "
-        import \"@gen/osc\"
-        import \"@effects/delay\"
+        import @gen/osc
+        import @effects/delay
         rill voice(f: Freq, time: Time) Sample {
             let x = saw(f) * 0.2
             let taps = delay(x, [time, time * 2, time * 3], max: 40ms)
@@ -2700,7 +2700,7 @@ fn copies_inside_voices_that_run_alone_still_run_together() {
     // The voices read delay lines, so they run one at a time; the taps
     // inside each voice (a sine per tap) run together all the same.
     let src = "
-        import \"@gen/osc\"
+        import @gen/osc
         rill echoes(x: Sample, base: Time, rate: Freq) Sample {
             let times: [Time; 8]
             for t in 0..8 {
@@ -2863,7 +2863,7 @@ fn a_tempo_that_follows_computed_values_runs_sample_by_sample() {
 #[test]
 fn the_report_says_which_copies_run_alone_and_why() {
     let src = "
-        import \"@gen/osc\"
+        import @gen/osc
         rill echo(x: Sample, time: Time) Sample {
             return delay(x, time, max: 50ms)
         }
@@ -2926,7 +2926,7 @@ fn what_copies_keep_to_stay_alike_is_folded_after_grouping() {
     // copy folding them and another not would make the copies differ);
     // after, they are folded, so the pool does the same work without them.
     let with = "
-        import \"@gen/osc\"
+        import @gen/osc
         rill voice(f: Freq, gain: Float, offset: Float) Sample {
             return saw(f) * gain + offset
         }
@@ -2951,8 +2951,8 @@ fn a_sum_over_a_pool_is_one_instruction() {
     // sum too short to bother with: the same to the bit, and the long sums
     // no longer an add per copy.
     let src = "
-        import \"@gen/osc\"
-        import \"@mix/stereo\"
+        import @gen/osc
+        import @mix/stereo
         rill main() [Sample; 2] {
             let mono = sum(saw([110Hz; 64], offset: each random())) / 64
             let freqs: [Freq; 32]
@@ -2975,7 +2975,7 @@ fn noise_runs_together_and_picks_the_same_numbers() {
     // White, pink and brown noise in pools: each copy keeps its own
     // generator, and takes the same numbers in the same order as alone.
     let src = "
-        import \"@gen/noise\"
+        import @gen/noise
         // Three generators in each copy, so the copies' generators are
         // three apart.
         rill colours() Sample {
@@ -3017,7 +3017,7 @@ fn delays_and_noise_in_voices_run_the_same_as_lanes() {
     // Every voice has its own line and its own noise, whether the voices run
     // one at a time or together.
     let src = "
-        import \"@effects/delay\"
+        import @effects/delay
         rill voice(n: Float) Sample {
             let d = delay(noise() * 0.1, [3ms * n, 7ms], max: 30ms)
             return sum(d) + comb(noise() * 0.1, 1 / (110Hz * n), feedback: 0.9, tone: 2kHz, max: 50ms)

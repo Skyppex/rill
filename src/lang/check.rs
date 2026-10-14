@@ -594,7 +594,7 @@ impl Checker {
         {
             let mut from: Vec<String> = gs
                 .iter()
-                .map(|g| format!("\"{}\"", module_name(g)))
+                .map(|g| format!("`{}`", module_name(g)))
                 .collect();
             from.dedup();
             let from = match from.split_last() {
@@ -624,21 +624,21 @@ impl Checker {
         let exported = self.exported.contains(&g);
         let path = relative_import(self.modules.name(self.module), there);
         Some(match (seen, exported) {
-            (true, _) => Diagnostic::error(span, format!("`{name}` is private to \"{there}\""))
+            (true, _) => Diagnostic::error(span, format!("`{name}` is private to `{there}`"))
                 .with_help(format!(
-                    "put `export` before it in \"{there}\" to use it in other files"
+                    "put `export` before it in `{there}` to use it in other files"
                 )),
             (false, true) => Diagnostic::error(
                 span,
-                format!("`{name}` is in \"{there}\", which this file does not import"),
+                format!("`{name}` is in `{there}`, which this file does not import"),
             )
-            .with_help(format!("add `import \"{path}\"` at the top of this file")),
+            .with_help(format!("add `import {path}` at the top of this file")),
             (false, false) => Diagnostic::error(
                 span,
-                format!("`{name}` is private to \"{there}\", which this file does not import"),
+                format!("`{name}` is private to `{there}`, which this file does not import"),
             )
             .with_help(format!(
-                "put `export` before it in \"{there}\", and add `import \"{path}\"` here"
+                "put `export` before it in `{there}`, and add `import {path}` here"
             )),
         })
     }
@@ -685,7 +685,7 @@ impl Checker {
                 self.report(
                     Diagnostic::warning(
                         import.path_span,
-                        format!("nothing from \"{}\" is used here", import.path),
+                        format!("nothing from `{}` is used here", import.path),
                     )
                     .with_help("remove this import"),
                 );
@@ -708,7 +708,7 @@ impl Checker {
                 self.report(
                     Diagnostic::warning(
                         import.path_span,
-                        format!("\"{}\" exports nothing", import.path),
+                        format!("`{}` exports nothing", import.path),
                     )
                     .with_help("put `export` before what it should share, or remove this import"),
                 );
@@ -4347,6 +4347,9 @@ fn relative_import(from: &str, to: &str) -> String {
     let to: Vec<&str> = to.split('/').collect();
     let common = from_dir.iter().zip(&to).take_while(|(a, b)| a == b).count();
     let mut parts: Vec<&str> = vec![".."; from_dir.len() - common];
+    if parts.is_empty() {
+        parts.push(".");
+    }
     parts.extend(&to[common..]);
     parts.join("/")
 }

@@ -2,7 +2,7 @@
 // taps whose times wobble every sample, and feedback through `state`.
 // Interpolated reads and writes, not maths, are the cost here.
 
-import "@gen/osc"
+import @gen/osc
 
 const N = 64
 const TAPS = 8

@@ -2,8 +2,8 @@
 // lifted through rills, picked apart by index and summed back together.
 // Copies, gathers and sums, more than maths.
 
-import "@gen/osc"
-import "@mix/stereo"
+import @gen/osc
+import @mix/stereo
 
 rill cluster(root: Freq) [[Sample; 2]; 8] {
     let freqs: [Freq; 8]

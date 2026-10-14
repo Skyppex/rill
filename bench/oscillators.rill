@@ -2,7 +2,7 @@
 // copy does the same work, so this is the best case for running copies
 // together; it measures raw throughput per copy.
 
-import "@gen/osc"
+import @gen/osc
 
 const N = 1024
 

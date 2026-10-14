@@ -2,7 +2,7 @@
 // brown filters. Every copy has its own sequence, so this is the cost of
 // `noise()` itself and of the state around it.
 
-import "@gen/noise"
+import @gen/noise
 
 const N = 512
 

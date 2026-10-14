@@ -12,7 +12,7 @@
 //
 // All of these come from the core library, which every program has.
 
-import "@gen/osc"
+import @gen/osc
 
 rill main(volume: Gain = -30dB) Sample {
     let lfo = sine(1Hz) / 2 + 0.5

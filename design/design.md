@@ -478,20 +478,20 @@ fn blep(t: Float, dt: Float) Float { ... }      // private: only osc.rill sees i
 export rill saw(freq: Freq) Sample { ... }
 
 // synth.rill
-export import "osc"                             // importers of synth get saw too
-import "fx"                                     // only synth sees fx's exports
+export import ./osc                             // importers of synth get saw too
+import ./fx                                     // only synth sees fx's exports
 export const VOICES = 4
 export rill pad(pitch: Freq) Sample { return saw(pitch) |> lowpass() }
 
 // song.rill
-import "synth"
+import ./synth
 rill main() Sample { return pad(110Hz) + saw(55Hz) * 0.1 }
 ```
 
 - **Exports.** `export` goes before `fn`, `rill`, `const`, `event`, `seq` or `import`. Everything else is private to its file. Exporting a sequence exports the events it makes and its fields.
-- **Re-exports.** `export import "b"` passes on everything `b` exports, including what `b` passes on; `b` is imported in the file as well. Importing that file gives both.
-- **Core.** A path starting with `@` names a module of the core library (see Prelude and core), wherever the file is: `import "@gen/osc"`.
-- **Paths** are relative to the importing file, with `/` between folders and `..` for the folder above: `import "lib/osc"` reads `lib/osc.rill`. The extension is never written; `import "osc.rill"` is an error, and any other extension is not a Rill file. Every part of a path is a name as in code (a letter or `_`, then letters, digits or `_`, and not a keyword), so `my-osc.rill` cannot be imported: the `-` would read as minus. A file named that way can still be run.
+- **Re-exports.** `export import ./b` passes on everything `b` exports, including what `b` passes on; `b` is imported in the file as well. Importing that file gives both.
+- **Core.** A path starting with `@` names a module of the core library (see Prelude and core), wherever the file is: `import @gen/osc`.
+- **Paths** are written as they are, without quotes, as in Nix: `./` for the importing file's folder, `../` for the one above, or `/` for an absolute path, with `/` between folders: `import ./lib/osc` reads `lib/osc.rill`. A path has letters, digits and `_ . - + /`, but no spaces, so `import ./my-osc` works. Rill has no strings. `import osc` without `./` is an error. The extension is never written; `import ./osc.rill` is an error, and any other extension is not a Rill file.
 - **Names.** Imported names are used as they are: `saw`, not `osc.saw`. A file's own declaration wins over an imported one with the same name. Two imports exporting different things by one name is an error only where the name is used; one thing reached by two routes is not a clash.
 - **One program.** The program is every file reachable from the one being run, each loaded once. A file reached by two routes is one file: its sequences and `const`s exist once.
 - **Cycles** are allowed: files can import each other, and re-export each other. Recursion across files is still recursion.
@@ -526,7 +526,7 @@ rill echo(x: Sample, time: Time, feedback: Float) Sample {
 
 **Most powerful first.** Core keeps one function where one can express another: `slew` is the one-pole filter, the smoother and the envelope follower; `dynamics` is the compressor, limiter, expander and gate; `comb` is the echo, the comb filter and the allpass. A plain convenience on top (`sine` for `phasor |> as_sine()`) stays only where it reads much better.
 
-**`core`** is the standard library: ordinary Rill modules, imported with `@` and their folder: `import "@gen/osc"`. Only core paths start with `@`, so they never clash with a file next to yours. Their sources are the files under `core/` in the compiler's repository, built into the compiler, so `core` is the same everywhere and never read from disk. A program compiled from a string, with no file, can import core too. `rill core` lists the modules and what they export; `rill core @gen/osc` prints one.
+**`core`** is the standard library: ordinary Rill modules, imported with `@` and their folder: `import @gen/osc`. Only core paths start with `@`, so they never clash with a file next to yours. Their sources are the files under `core/` in the compiler's repository, built into the compiler, so `core` is the same everywhere and never read from disk. A program compiled from a string, with no file, can import core too. `rill core` lists the modules and what they export; `rill core @gen/osc` prints one.
 
 - **`@gen`**: generators. `@gen/osc` has oscillators in two halves: `phasor(freq, offset)`, a ramp from 0 to 1 per cycle that says where in the cycle you are (not meant to be heard), and the shapes `as_sine`, `as_saw` and `as_square`, which turn a phase into a wave (the saw and square band-limited with `poly_blep`, which is exported for custom shapes). `sine`, `saw` and `square` are the two together: `saw(f)` is `phasor(f) |> as_saw()`. Anything done to the phase in between works for every shape: `warp(phase, width)` moves the middle of the cycle, which is pulse width on a square and a brighter, squeezed wave on a sine or saw.
 - **`@gen/noise`**: `pink()` and `brown()` (white is `noise()`). Instruments, such as a plucked string, are made from these parts, not kept in core (`examples/delay.rill` builds one).

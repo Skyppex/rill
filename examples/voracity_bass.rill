@@ -1,10 +1,10 @@
 // A classic subtractive synth: two detuned saws through a resonant lowpass,
 // with one envelope opening the filter and another shaping the level.
 
-import "@gen/osc"
-import "@effects/env"
-import "@effects/filter"
-import "@mix/stereo"
+import @gen/osc
+import @effects/env
+import @effects/filter
+import @mix/stereo
 
 seq bass(step: 1/16, tempo: 100bpm, gate: 0.6, loop: true) {
     G#1, _, G#1@0.15, B1,

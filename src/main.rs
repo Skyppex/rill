@@ -496,7 +496,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => {
                     let names: Vec<String> = rill::lang::core::names().collect();
                     return Err(format!(
-                        "there is no core module \"@{name}\"; there are {}",
+                        "there is no core module `@{name}`; there are {}",
                         names.join(", ")
                     )
                     .into());
@@ -1005,7 +1005,7 @@ fn core_exports(src: &str) -> Vec<String> {
         ));
     }
     for i in program.imports.iter().filter(|i| i.export.is_some()) {
-        out.push((i.span.start, format!("everything from \"{}\"", i.path)));
+        out.push((i.span.start, format!("everything from `{}`", i.path)));
     }
     out.sort();
     out.into_iter().map(|(_, s)| s).collect()

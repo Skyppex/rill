@@ -3,9 +3,9 @@
 // released and stolen all the time. Each voice is a saw, a filter and an
 // envelope, so idle voices still cost what playing ones do.
 
-import "@gen/osc"
-import "@effects/env"
-import "@effects/filter"
+import @gen/osc
+import @effects/env
+import @effects/filter
 
 seq chords(
     meter: 4/4,

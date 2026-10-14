@@ -10,9 +10,9 @@
 // playing. Every run sounds a little different; pass `--seed` (the one
 // printed at the start) to hear a run again.
 
-import "@gen/osc"
-import "@effects/filter"
-import "@mix/stereo"
+import @gen/osc
+import @effects/filter
+import @mix/stereo
 
 // A slow wave from 0 to 1.
 rill lfo(rate: Freq, offset: Float = 0) Float {

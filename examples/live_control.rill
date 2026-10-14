@@ -4,7 +4,7 @@
 // Events, declared once: a name, a kind, and which senders and channels it
 // accepts. What the numbers mean is up to whoever sends the events.
 
-import "@gen/osc"
+import @gen/osc
 
 event keys_press note_on(sender: 1)
 event keys_release note_off(sender: 1)

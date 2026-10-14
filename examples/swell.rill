@@ -5,10 +5,10 @@
 // `~` on its own goes on with the notes before it; `@p.4` there sets their
 // pressure, which reaches the voices as a `note_change`.
 
-import "@gen/osc"
-import "@effects/env"
-import "@effects/filter"
-import "@mix/stereo"
+import @gen/osc
+import @effects/env
+import @effects/filter
+import @mix/stereo
 
 seq pads(step: 1/4, tempo: 60bpm, gate: 1, release: .3, loop: true) {
     [C3, G3, D#4]@p0t.2, ~@p.4, ~@p.8, ~@p1,

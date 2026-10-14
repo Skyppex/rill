@@ -12,7 +12,7 @@ pub struct Program {
     pub seqs: Vec<SeqDecl>,
     /// Top-level constants, in source order.
     pub consts: Vec<ConstDecl>,
-    /// `import "osc"` lines, in source order.
+    /// `import ./osc` lines, in source order.
     pub imports: Vec<Import>,
     /// The files a program is made of and where each declaration comes
     /// from. Empty for a program parsed from one string: everything is in
@@ -44,7 +44,7 @@ impl Item {
     }
 }
 
-/// `import "lib/osc"`, or `export import "lib/osc"` to pass on everything
+/// `import ./lib/osc`, or `export import ./lib/osc` to pass on everything
 /// it exports.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Import {

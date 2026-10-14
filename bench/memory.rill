@@ -2,7 +2,7 @@
 // samples), read at random times every sample, so almost every read misses
 // the cache. Also how long it takes to set all of that aside when building.
 
-import "@gen/osc"
+import @gen/osc
 
 const N = 32
 

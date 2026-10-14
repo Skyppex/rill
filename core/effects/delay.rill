@@ -8,7 +8,7 @@
 //
 // For a delay without feedback, or with several taps, use `delay` itself.
 
-import "@effects/filter"
+import @effects/filter
 
 // What went in `time` ago, fed back at `feedback` (each pass that much
 // quieter) through a lowpass at `tone`, plus `blend` times what goes in

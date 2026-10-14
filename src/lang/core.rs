@@ -1,5 +1,5 @@
 //! The core library: Rill modules built into the compiler, imported with
-//! `@`, as in `import "@gen/osc"`. Their sources are the files under
+//! `@`, as in `import @gen/osc`. Their sources are the files under
 //! `core/` in the repository, embedded when the compiler is built, so every
 //! program has the same `core` wherever it runs and nothing is read from
 //! disk.

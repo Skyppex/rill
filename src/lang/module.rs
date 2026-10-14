@@ -1,7 +1,7 @@
 //! Programs made of several files.
 //!
-//! A file is a module. It names the files it uses with `import "path"` and
-//! sees what they `export`; `export import "path"` passes on everything that
+//! A file is a module. It names the files it uses with `import ./path` and
+//! sees what they `export`; `export import ./path` passes on everything that
 //! file exports. [`load_tree`] reads the file a program starts from and
 //! every file it reaches, then merges them into one [`Program`] that the
 //! checker and compiler treat like one file, with each declaration tagged
@@ -189,16 +189,6 @@ pub fn load_tree(
         .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
     // A program from a string, not a file: it can only import core.
     let no_file = root.as_os_str().is_empty();
-    if let Some((problem, fixed)) = name_problem(&stem).filter(|_| !no_file) {
-        diagnostics.push(
-            Diagnostic::warning(
-                Span::default(),
-                format!("`{stem}` is not a valid module name, so this file cannot be imported: {problem}"),
-            )
-            .with_help(format!("rename the file to `{fixed}.rill`")),
-        );
-    }
-
     let mut l = Loader {
         files: Vec::new(),
         map: SourceMap::default(),
@@ -246,7 +236,7 @@ pub fn load_tree(
             if no_file && i == 0 {
                 l.diagnostics.push(
                     Diagnostic::error(import.path_span, "imports need a file to look next to")
-                        .with_help("only core modules, such as \"@gen/osc\", can be imported by a program that is not in a file"),
+                        .with_help("only core modules, such as `@gen/osc`, can be imported by a program that is not in a file"),
                 );
                 continue;
             }
@@ -273,7 +263,7 @@ pub fn load_tree(
                 l.diagnostics.push(
                     Diagnostic::warning(
                         import.path_span,
-                        format!("\"{}\" is already imported here", import.path),
+                        format!("`{}` is already imported here", import.path),
                     )
                     .with_help("remove this line"),
                 );
@@ -294,7 +284,7 @@ pub fn load_tree(
                         l.diagnostics.push(
                             Diagnostic::error(
                                 import.path_span,
-                                format!("cannot find module \"{}\"", import.path),
+                                format!("cannot find module `{}`", import.path),
                             )
                             .with_help(format!("looked for {}", path.display())),
                         );
@@ -449,18 +439,18 @@ fn load_core(l: &mut Loader, name: &str, span: Span) -> Option<usize> {
         let names: Vec<String> = super::core::names().collect();
         let wanted = format!("@{name}");
         let help = match super::diag::suggest(&wanted, names.iter().map(String::as_str)) {
-            Some(s) => format!("did you mean \"{s}\"? `rill core` lists them all"),
+            Some(s) => format!("did you mean `{s}`? `rill core` lists them all"),
             None => format!(
                 "the core modules are {}",
                 names
                     .iter()
-                    .map(|n| format!("\"{n}\""))
+                    .map(|n| format!("`{n}`"))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
         };
         l.diagnostics.push(
-            Diagnostic::error(span, format!("there is no core module \"{wanted}\""))
+            Diagnostic::error(span, format!("there is no core module `{wanted}`"))
                 .with_help(help),
         );
         return None;
@@ -475,22 +465,16 @@ fn load_core(l: &mut Loader, name: &str, span: Span) -> Option<usize> {
     Some(l.files.len() - 1)
 }
 
-/// What is wrong with `path` in `import "path"`, as an error at `span`.
+/// What is wrong with `path` in `import path`, as an error at `span`.
 pub fn check_path(path: &str, span: Span) -> Result<(), Diagnostic> {
     let error =
         |message: String, help: String| Err(Diagnostic::error(span, message).with_help(help));
-    if path.is_empty() {
-        return error(
-            "an import needs a module's name".into(),
-            "as in `import \"osc\"` for `osc.rill` next to this file".into(),
-        );
-    }
     // A core module: `@` and its path in the core library.
     if let Some(rest) = path.strip_prefix('@') {
         let rest = rest.strip_suffix(".rill").map_or(Ok(rest), |stem| {
             Err(
                 Diagnostic::error(span, "leave out `.rill`: a module is imported by its name")
-                    .with_help(format!("write `import \"@{stem}\"`")),
+                    .with_help(format!("write `import @{stem}`")),
             )
         })?;
         if rest.is_empty()
@@ -500,7 +484,7 @@ pub fn check_path(path: &str, span: Span) -> Result<(), Diagnostic> {
         {
             return error(
                 "a core module is named by its folders in the core library".into(),
-                "as in `import \"@gen/osc\"`".into(),
+                "as in `import @gen/osc`".into(),
             );
         }
         return Ok(());
@@ -508,13 +492,7 @@ pub fn check_path(path: &str, span: Span) -> Result<(), Diagnostic> {
     if let Some(stem) = path.strip_suffix(".rill") {
         return error(
             "leave out `.rill`: a module is imported by its name".into(),
-            format!("write `import \"{stem}\"`"),
-        );
-    }
-    if path.starts_with('/') || path.contains('\\') || path.contains(':') {
-        return error(
-            "a module's path is relative to this file, with `/` between folders".into(),
-            "as in `import \"lib/osc\"` for `lib/osc.rill` next to this file".into(),
+            format!("write `import {stem}`"),
         );
     }
     let last = path.rsplit('/').next().unwrap_or(path);
@@ -527,80 +505,21 @@ pub fn check_path(path: &str, span: Span) -> Result<(), Diagnostic> {
             "a module is a `.rill` file, imported by its name without the extension".into(),
         );
     }
-    for part in path.split('/') {
-        match part {
-            ".." => {}
-            "" => {
-                return error(
-                    "a module's path names a file, with one `/` between folders".into(),
-                    "as in `import \"lib/osc\"`".into(),
-                );
-            }
-            "." => {
-                return error(
-                    "leave out `./`: a module's path is already relative to this file".into(),
-                    format!("write `import \"{}\"`", path.trim_start_matches("./")),
-                );
-            }
-            _ => {
-                if let Some((problem, fixed)) = name_problem(part) {
-                    return error(
-                        format!("`{part}` is not a valid module name: {problem}"),
-                        format!(
-                            "rename it to `{fixed}`, and import it as \"{}\"",
-                            path.replace(part, &fixed)
-                        ),
-                    );
-                }
-            }
-        }
+    let rest = path
+        .strip_prefix('/')
+        .unwrap_or(path)
+        .trim_start_matches("./");
+    if rest
+        .split('/')
+        .any(|p| p.is_empty() || (p == "." && !rest.is_empty()))
+        || matches!(last, "." | "..")
+    {
+        return error(
+            "a module's path names a file, with one `/` between folders".into(),
+            "as in `import ./lib/osc` for `lib/osc.rill` next to this file".into(),
+        );
     }
     Ok(())
-}
-
-/// Why `name` cannot name a module, and a name that can. Module names
-/// follow the rules for names in code, so a `-` can never be read as minus.
-pub fn name_problem(name: &str) -> Option<(String, String)> {
-    let fixed = || {
-        let mut s: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        if s.is_empty() || s.starts_with(|c: char| c.is_ascii_digit()) {
-            s.insert(0, '_');
-        }
-        if super::lexer::is_keyword(&s) {
-            s.push('_');
-        }
-        s
-    };
-    if name.is_empty() {
-        return Some(("a name cannot be empty".into(), "module".into()));
-    }
-    if let Some(c) = name
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
-    {
-        let what = match c {
-            '-' => "`-` would read as minus".to_owned(),
-            ' ' => "names cannot have spaces".to_owned(),
-            c => format!("`{c}` cannot be part of a name"),
-        };
-        return Some((what, fixed()));
-    }
-    if name.starts_with(|c: char| c.is_ascii_digit()) {
-        return Some(("a name cannot start with a digit".into(), fixed()));
-    }
-    if super::lexer::is_keyword(name) {
-        return Some((format!("`{name}` is a keyword"), fixed()));
-    }
-    None
 }
 
 #[cfg(test)]
@@ -618,45 +537,26 @@ mod tests {
     }
 
     #[test]
-    fn module_names() {
-        assert_eq!(name_problem("osc"), None);
-        assert_eq!(name_problem("_lib2"), None);
-        assert_eq!(
-            name_problem("my-osc"),
-            Some(("`-` would read as minus".into(), "my_osc".into()))
-        );
-        assert_eq!(
-            name_problem("2nd"),
-            Some(("a name cannot start with a digit".into(), "_2nd".into()))
-        );
-        assert_eq!(
-            name_problem("fn"),
-            Some(("`fn` is a keyword".into(), "fn_".into()))
-        );
-    }
-
-    #[test]
     fn import_paths() {
         let s = Span::default();
         let msg = |p: &str| check_path(p, s).map_err(|d| d.message);
-        assert_eq!(msg("osc"), Ok(()));
-        assert_eq!(msg("lib/osc"), Ok(()));
+        assert_eq!(msg("./osc"), Ok(()));
+        assert_eq!(msg("./lib/osc"), Ok(()));
         assert_eq!(msg("../shared/osc"), Ok(()));
+        assert_eq!(msg("./my-osc"), Ok(()));
+        assert_eq!(msg("/abs/osc"), Ok(()));
+        assert_eq!(msg("@gen/osc"), Ok(()));
         assert_eq!(
-            msg("osc.rill"),
+            msg("./osc.rill"),
             Err("leave out `.rill`: a module is imported by its name".into())
         );
         assert_eq!(
-            msg("kick.wav"),
+            msg("./kick.wav"),
             Err("only Rill files can be imported, and `kick.wav` is not one".into())
         );
-        assert_eq!(
-            msg("my-osc"),
-            Err("`my-osc` is not a valid module name: `-` would read as minus".into())
-        );
-        assert!(msg("/abs/osc").is_err());
-        assert!(msg("./osc").is_err());
-        assert!(msg("lib//osc").is_err());
-        assert!(msg("").is_err());
+        assert!(msg("./lib//osc").is_err());
+        assert!(msg("./lib/").is_err());
+        assert!(msg("..").is_err());
+        assert!(msg("@").is_err());
     }
 }

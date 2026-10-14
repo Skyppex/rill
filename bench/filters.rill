@@ -3,8 +3,8 @@
 // with its own sweeping cutoff. `tan` per stage per sample, and long chains
 // of state.
 
-import "@gen/osc"
-import "@effects/filter"
+import @gen/osc
+import @effects/filter
 
 const N = 32
 

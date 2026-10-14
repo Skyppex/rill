@@ -1,9 +1,9 @@
 // First-class rills: a rill can be named as a value, passed to another rill,
 // chosen while playing, and still behaves like a rill when called.
 
-import "@gen/osc"
-import "@effects/filter"
-import "@mix/stereo"
+import @gen/osc
+import @effects/filter
+import @mix/stereo
 
 rill bright(freq: Freq, offset: Float = 0) Sample {
     let a = saw(freq, offset)

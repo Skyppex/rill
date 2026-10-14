@@ -86,9 +86,10 @@ pub enum TokenKind {
     /// `@v.5p1rt.3`: a step's values, each flag letter with the value after
     /// it, in [`FLAGS`] order.
     Flags([Option<f32>; 4]),
-    /// `"lib/osc"`: text in double quotes, on one line, with no escapes.
-    /// Only module paths are strings.
-    Str,
+    /// `./lib/osc`, `../kick.wav`, `/abs/x.flac`, and after `import` a core
+    /// module's `@gen/osc`: a path, as written. It starts where a value
+    /// can start, so `a / b` and `0..5` are what they were.
+    Path,
     // Keywords.
     Fn,
     Rill,
@@ -148,7 +149,7 @@ impl TokenKind {
         use TokenKind::*;
         match self {
             Ident => "a name",
-            Str => "a string",
+            Path => "a path",
             Number { .. } => "a number",
             Flags(_) => "a step's values (`@v.5p1`)",
             Fn => "`fn`",
@@ -213,6 +214,12 @@ pub struct Token {
 }
 
 /// Whether `word` is always a keyword, never a name.
+/// Whether `b` can be part of a path after its first character: letters,
+/// digits and `_ . - + /`, as in Nix. There are no spaces.
+pub fn is_path_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'+' | b'/')
+}
+
 pub fn is_keyword(word: &str) -> bool {
     matches!(
         word,
@@ -345,44 +352,44 @@ impl<'a> Lexer<'a> {
                     continue;
                 }
             }
-            // `.5` is a number too, except where a `.` reads a field or
-            // part of a value (`note.velocity`, `xs[0].5` is an error).
-            let fraction = c == b'.'
-                && self.peek(1).is_ascii_digit()
-                && !self.tokens.last().is_some_and(|t| {
-                    matches!(
-                        t.kind,
-                        TokenKind::Ident
-                            | TokenKind::Number { .. }
-                            | TokenKind::RParen
-                            | TokenKind::RBracket
-                            | TokenKind::RBrace
-                            | TokenKind::True
-                            | TokenKind::False
-                            | TokenKind::Dot
-                    )
-                });
+            // Where a value can start: not right after one, where `.` reads
+            // a field and `/` divides (`note.velocity`, `a / b`).
+            let starts_value = !self.tokens.last().is_some_and(|t| {
+                matches!(
+                    t.kind,
+                    TokenKind::Ident
+                        | TokenKind::Number { .. }
+                        | TokenKind::Path
+                        | TokenKind::RParen
+                        | TokenKind::RBracket
+                        | TokenKind::RBrace
+                        | TokenKind::True
+                        | TokenKind::False
+                        | TokenKind::Dot
+                )
+            });
+            // `.5` is a number too (`xs[0].5` is an error).
+            let fraction = c == b'.' && self.peek(1).is_ascii_digit() && starts_value;
             if c.is_ascii_digit() || fraction {
                 let kind = self.number()?;
                 self.push(kind, start);
                 continue;
             }
-            if c == b'"' {
+            // A path: `./`, `../` or `/` where a value starts, or `@` and a
+            // name right after `import` (a core module).
+            let path = starts_value
+                && (self.bytes[self.pos..].starts_with(b"./")
+                    || self.bytes[self.pos..].starts_with(b"../")
+                    || c == b'/'
+                    || (c == b'@'
+                        && self.peek(1).is_ascii_alphabetic()
+                        && self.tokens.last().is_some_and(|t| t.kind == TokenKind::Import)));
+            if path {
                 self.pos += 1;
-                while !matches!(self.peek(0), b'"' | b'\n' | 0) {
+                while is_path_byte(self.peek(0)) {
                     self.pos += 1;
                 }
-                if self.peek(0) == b'"' {
-                    self.pos += 1;
-                } else {
-                    let d = Diagnostic::error(
-                        Span::new(start, self.pos),
-                        "this string is never closed",
-                    )
-                    .with_help("end it with `\"` on the same line");
-                    self.fail(d)?;
-                }
-                self.push(TokenKind::Str, start);
+                self.push(TokenKind::Path, start);
                 continue;
             }
             if c.is_ascii_alphabetic() || c == b'_' {
@@ -460,6 +467,8 @@ impl<'a> Lexer<'a> {
                             err.with_help("use `|>` to pipe or `||` for logical or")
                         } else if ch == '&' {
                             err.with_help("use `&&` for logical and")
+                        } else if ch == '"' {
+                            err.with_help("Rill has no strings; paths are written as they are, as in `import ./osc`")
                         } else if ch == '#' {
                             err.with_help("`#` only appears in note names, like `F#4`")
                         } else {
@@ -708,6 +717,37 @@ mod tests {
         assert_eq!(err("@v.5v1"), "`v` is given twice");
         assert_eq!(err("@v.5p"), "`p` needs a value after it");
         assert_eq!(err("@v.5x1"), "`x` is not one of a step's values");
+    }
+
+    #[test]
+    fn paths_where_a_value_starts() {
+        use TokenKind::*;
+        let paths = |src: &str| -> Vec<String> {
+            lex(src)
+                .unwrap()
+                .into_iter()
+                .filter(|t| t.kind == Path)
+                .map(|t| src[t.span.start as usize..t.span.end as usize].to_owned())
+                .collect()
+        };
+        assert_eq!(
+            paths("import ./lib/my-osc\nimport ../up\nimport @gen/osc"),
+            ["./lib/my-osc", "../up", "@gen/osc"]
+        );
+        assert_eq!(
+            paths("const K = ./drums/kick+1.wav\nconst A = /abs/x.flac"),
+            ["./drums/kick+1.wav", "/abs/x.flac"]
+        );
+        // After a value, `/` divides, `.` reads a field and `..` makes a
+        // range, as before.
+        assert!(paths("a / b").is_empty());
+        assert!(paths("1/16").is_empty());
+        assert!(paths("0..5").is_empty());
+        assert!(paths("riff[1].step").is_empty());
+        assert!(paths("f(x)/2").is_empty());
+        // `@` starts a path only after `import`.
+        assert!(paths("C4@v1").is_empty());
+        assert_eq!(kinds("x @ rate"), [Ident, At, Ident, Eof]);
     }
 
     #[test]

@@ -6,8 +6,8 @@
 
 // bench: --seconds 1
 
-import "@gen/osc"
-import "@effects/filter"
+import @gen/osc
+import @effects/filter
 
 rill layer(x: Sample, cutoff: Freq) Sample {
     let y = x

@@ -5,7 +5,7 @@
 //! ```text
 //! program := item*
 //! program := ("export"? (item | import))*
-//! import  := "import" STRING
+//! import  := "import" PATH
 //! item    := "fn" def | "rill" def | event | seq | const
 //! const   := "const" NAME (":" type)? "=" expr
 //! event   := "event" NAME NAME ("(" (NAME ":" expr),* ")")?
@@ -712,16 +712,20 @@ impl Parser<'_> {
             || (self.at_ident("seq") && self.peek_at(1).kind == TokenKind::Ident)
     }
 
-    /// `import "path"`, after any `export`.
+    /// `import ./path`, after any `export`.
     fn import(&mut self, export: Option<Span>) -> PResult<Import> {
         let start = self.expect(TokenKind::Import, "")?.span;
-        let Some(t) = self.eat(TokenKind::Str) else {
-            return Err(self
-                .unexpected("the module's path in quotes")
-                .with_help("as in `import \"osc\"` for `osc.rill` next to this file"));
+        let Some(t) = self.eat(TokenKind::Path) else {
+            let help = match self.peek().kind {
+                TokenKind::Ident => format!(
+                    "a path starts with `./` for a file next to this one: `import ./{}`",
+                    self.text(self.peek())
+                ),
+                _ => "as in `import ./osc` for `osc.rill` next to this file, or `import @gen/osc` for a core module".into(),
+            };
+            return Err(self.unexpected("the module's path").with_help(help));
         };
-        let text = self.text(t);
-        let path = text[1..text.len().saturating_sub(1).max(1)].to_owned();
+        let path = self.text(t).to_owned();
         if self.eat(TokenKind::Semi).is_none()
             && !self.at(TokenKind::Eof)
             && !self.peek().newline_before

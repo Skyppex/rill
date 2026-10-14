@@ -1,6 +1,6 @@
 // Dynamics: changing a signal's level by its own level.
 
-import "@effects/env"
+import @effects/env
 
 // Follows the level of `x` (rising in `attack`, falling in `release`) and
 // turns it up or down by how far it is from `threshold`, in dB:

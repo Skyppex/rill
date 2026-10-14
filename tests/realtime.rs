@@ -252,12 +252,12 @@ fn every_sequence_event_without_allocating() {
 
 /// Delays, noise and the core library built on them, in a pool of voices.
 const DELAYS: &str = "
-import \"@gen/osc\"
-import \"@gen/noise\"
-import \"@effects/delay\"
-import \"@effects/filter\"
-import \"@effects/env\"
-import \"@effects/dynamics\"
+import @gen/osc
+import @gen/noise
+import @effects/delay
+import @effects/filter
+import @effects/env
+import @effects/dynamics
 rill voice(n: Float) Sample {
     let gate = square(2Hz * n)
     let string = comb(noise() * ahdsr(gate, 1ms, 2ms, 5ms, 0, 5ms), 1 / (110Hz * n), feedback: 0.98, tone: 3kHz, max: 50ms)

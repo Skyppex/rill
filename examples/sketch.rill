@@ -2,10 +2,10 @@
 
 // Pure function on one value. Auto-lifted over streams and channels.
 
-import "@gen/osc"
-import "@effects/env"
-import "@gen/noise"
-import "@effects/filter"
+import @gen/osc
+import @effects/env
+import @gen/noise
+import @effects/filter
 
 fn abs(x: Sample) Sample {
     if x < 0 { -x } else { x }

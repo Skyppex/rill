@@ -109,7 +109,7 @@ fn an_import_gives_what_is_exported() {
     assert_ok(&[
         (
             "song.rill",
-            "import \"osc\"\nrill main() Sample { return saw(110Hz) }",
+            "import ./osc\nrill main() Sample { return saw(110Hz) }",
         ),
         ("osc.rill", OSC),
     ]);
@@ -120,16 +120,16 @@ fn what_is_not_exported_stays_in_its_file() {
     let files = [
         (
             "song.rill",
-            "import \"osc\"\nrill main() Sample { return blep(0.5) }",
+            "import ./osc\nrill main() Sample { return blep(0.5) }",
         ),
         ("osc.rill", OSC),
     ];
     let (_, result) = compile(&files);
     let diags = result.unwrap_err();
-    assert_eq!(diags[0].message, "`blep` is private to \"osc\"");
+    assert_eq!(diags[0].message, "`blep` is private to `osc`");
     assert_eq!(
         diags[0].help.as_deref(),
-        Some("put `export` before it in \"osc\" to use it in other files")
+        Some("put `export` before it in `osc` to use it in other files")
     );
 }
 
@@ -138,9 +138,9 @@ fn a_file_that_is_not_imported_says_so() {
     let files = [
         (
             "song.rill",
-            "import \"synth\"\nrill main() Sample { return lowpass(0) }",
+            "import ./synth\nrill main() Sample { return lowpass(0) }",
         ),
-        ("synth.rill", "import \"fx\"\nexport fn x() Float { 1 }"),
+        ("synth.rill", "import ./fx\nexport fn x() Float { 1 }"),
         (
             "fx.rill",
             "export rill lowpass(x: Sample) Sample { return x }",
@@ -150,11 +150,11 @@ fn a_file_that_is_not_imported_says_so() {
     let d = &result.unwrap_err()[0];
     assert_eq!(
         d.message,
-        "`lowpass` is in \"fx\", which this file does not import"
+        "`lowpass` is in `fx`, which this file does not import"
     );
     assert_eq!(
         d.help.as_deref(),
-        Some("add `import \"fx\"` at the top of this file")
+        Some("add `import ./fx` at the top of this file")
     );
 }
 
@@ -165,11 +165,11 @@ fn export_import_passes_everything_on() {
     let files = [
         (
             "song.rill",
-            "import \"synth\"\nrill main() Sample { return saw(110Hz) + pad(220Hz) }",
+            "import ./synth\nrill main() Sample { return saw(110Hz) + pad(220Hz) }",
         ),
         (
             "synth.rill",
-            "export import \"osc\"\nexport rill pad(f: Freq) Sample { return saw(f) * 0.5 }",
+            "export import ./osc\nexport rill pad(f: Freq) Sample { return saw(f) * 0.5 }",
         ),
         ("osc.rill", OSC),
     ];
@@ -178,24 +178,24 @@ fn export_import_passes_everything_on() {
     assert_ok(&[
         (
             "a.rill",
-            "import \"b\"\nrill main() Sample { return saw(110Hz) }",
+            "import ./b\nrill main() Sample { return saw(110Hz) }",
         ),
-        ("b.rill", "export import \"c\""),
-        ("c.rill", "export import \"osc\""),
+        ("b.rill", "export import ./c"),
+        ("c.rill", "export import ./osc"),
         ("osc.rill", OSC),
     ]);
     // Without `export`, it is not passed on.
     let errs = errors(&[
         (
             "song.rill",
-            "import \"synth\"\nrill main() Sample { return saw(110Hz) }",
+            "import ./synth\nrill main() Sample { return saw(110Hz) }",
         ),
-        ("synth.rill", "import \"osc\"\nexport fn x() Float { 1 }"),
+        ("synth.rill", "import ./osc\nexport fn x() Float { 1 }"),
         ("osc.rill", OSC),
     ]);
     assert_eq!(
         errs,
-        ["`saw` is in \"osc\", which this file does not import"]
+        ["`saw` is in `osc`, which this file does not import"]
     );
 }
 
@@ -204,20 +204,20 @@ fn paths_are_relative_to_the_importing_file() {
     assert_ok(&[
         (
             "songs/a.rill",
-            "import \"../lib/synth\"\nrill main() Sample { return saw(110Hz) }",
+            "import ../lib/synth\nrill main() Sample { return saw(110Hz) }",
         ),
-        ("lib/synth.rill", "export import \"osc/saw\""),
+        ("lib/synth.rill", "export import ./osc/saw"),
         ("lib/osc/saw.rill", OSC),
     ]);
 }
 
 #[test]
-fn import_paths_are_names() {
+fn import_paths_are_checked() {
     let errs = |path: &str| {
         errors(&[
             (
                 "song.rill",
-                &format!("import \"{path}\"\nrill main() Sample {{ return 0 }}"),
+                &format!("import ./{path}\nrill main() Sample {{ return 0 }}"),
             ),
             ("osc.rill", OSC),
         ])
@@ -230,23 +230,35 @@ fn import_paths_are_names() {
         errs("kick.wav"),
         ["only Rill files can be imported, and `kick.wav` is not one"]
     );
-    assert_eq!(
-        errs("my-osc"),
-        ["`my-osc` is not a valid module name: `-` would read as minus"]
-    );
-    assert_eq!(errs("nothere"), ["cannot find module \"nothere\""]);
+    assert_eq!(errs("nothere"), ["cannot find module `./nothere`"]);
     assert_eq!(errs("song"), ["a file cannot import itself"]);
 }
 
 #[test]
-fn a_file_name_that_is_not_a_name_is_a_warning() {
-    let w = warnings(&[("my-song.rill", "rill main() Sample { return 0 }")]);
-    assert_eq!(
-        w,
-        [
-            "`my-song` is not a valid module name, so this file cannot be imported: `-` would read as minus"
-        ]
-    );
+fn any_file_name_can_be_imported() {
+    let files = [
+        (
+            "song.rill",
+            "import ./my-osc\nrill main() Sample { return saw(110Hz) }",
+        ),
+        ("my-osc.rill", OSC),
+    ];
+    assert!(errors(&files).is_empty(), "{:?}", errors(&files));
+    assert!(warnings(&[("my-song.rill", "rill main() Sample { return 0 }")]).is_empty());
+}
+
+#[test]
+fn a_bare_name_or_a_quoted_path_says_how_to_write_it() {
+    let errs = |line: &str| {
+        errors(&[
+            ("song.rill", &format!("{line}\nrill main() Sample {{ return 0 }}")),
+            ("osc.rill", OSC),
+        ])
+    };
+    let e = errs("import osc");
+    assert_eq!(e, ["expected the module's path, found `osc`"]);
+    let e = errs("import \"osc\"");
+    assert!(e[0].starts_with("unexpected character `\"`"), "{e:?}");
 }
 
 #[test]
@@ -254,7 +266,7 @@ fn errors_in_imported_files_are_shown_there() {
     let files = [
         (
             "song.rill",
-            "import \"osc\"\nrill main() Sample { return 0 }",
+            "import ./osc\nrill main() Sample { return 0 }",
         ),
         ("osc.rill", "export fn oops( Float { 1 }"),
     ];
@@ -269,7 +281,7 @@ fn errors_in_imported_files_are_shown_there() {
 
 #[test]
 fn spans_in_the_root_file_stay_where_they_are() {
-    let src = "import \"osc\"\nrill main() Sample { return saw(110Hz) }";
+    let src = "import ./osc\nrill main() Sample { return saw(110Hz) }";
     let (map, result) = compile(&[("song.rill", src), ("osc.rill", OSC)]);
     let (program, _) = result.unwrap();
     let main = program
@@ -290,7 +302,7 @@ fn a_files_own_definition_wins() {
     assert_ok(&[
         (
             "song.rill",
-            "import \"osc\"\nrill saw(f: Freq) Sample { return 0 }\nrill main() Sample { return saw(1Hz) }",
+            "import ./osc\nrill saw(f: Freq) Sample { return 0 }\nrill main() Sample { return saw(1Hz) }",
         ),
         ("osc.rill", OSC),
     ]);
@@ -302,7 +314,7 @@ fn two_imports_with_one_name_clash_only_where_it_is_used() {
         [
             (
                 "song.rill",
-                format!("import \"a\"\nimport \"b\"\nrill main() Sample {{ return {use_it} }}"),
+                format!("import ./a\nimport ./b\nrill main() Sample {{ return {use_it} }}"),
             ),
             (
                 "a.rill",
@@ -323,16 +335,16 @@ fn two_imports_with_one_name_clash_only_where_it_is_used() {
     assert_eq!(check("only_a()"), Vec::<String>::new());
     assert_eq!(
         check("shared(1)"),
-        ["`shared` is exported by both \"a\" and \"b\""]
+        ["`shared` is exported by both `a` and `b`"]
     );
     // One thing reached by two routes is not a clash.
     assert_ok(&[
         (
             "song.rill",
-            "import \"a\"\nimport \"b\"\nrill main() Sample { return saw(1Hz) }",
+            "import ./a\nimport ./b\nrill main() Sample { return saw(1Hz) }",
         ),
-        ("a.rill", "export import \"osc\""),
-        ("b.rill", "export import \"osc\""),
+        ("a.rill", "export import ./osc"),
+        ("b.rill", "export import ./osc"),
         ("osc.rill", OSC),
     ]);
 }
@@ -344,7 +356,7 @@ fn private_names_in_different_files_are_different_things() {
     let files = [
         (
             "song.rill",
-            "import \"a\"\nfn helper(x: Float) Float { x + 1 }\nrill main() Sample { return helper(a(1)) }",
+            "import ./a\nfn helper(x: Float) Float { x + 1 }\nrill main() Sample { return helper(a(1)) }",
         ),
         (
             "a.rill",
@@ -360,7 +372,7 @@ fn fns_passed_between_files_keep_their_own_meaning() {
     let files = [
         (
             "song.rill",
-            "import \"apply\"\nfn twice(x: Float) Float { x * 2 }\nrill main() Sample { return apply(twice, 3) }",
+            "import ./apply\nfn twice(x: Float) Float { x * 2 }\nrill main() Sample { return apply(twice, 3) }",
         ),
         (
             "apply.rill",
@@ -375,11 +387,11 @@ fn imports_can_go_round_in_a_circle() {
     let files = [
         (
             "a.rill",
-            "import \"b\"\nexport fn one() Float { 1 }\nrill main() Sample { return two() }",
+            "import ./b\nexport fn one() Float { 1 }\nrill main() Sample { return two() }",
         ),
         (
             "b.rill",
-            "import \"a\"\nexport fn two() Float { one() + 1 }",
+            "import ./a\nexport fn two() Float { one() + 1 }",
         ),
     ];
     assert_eq!(render(&files, 1), [2.0]);
@@ -387,19 +399,19 @@ fn imports_can_go_round_in_a_circle() {
     assert_ok(&[
         (
             "song.rill",
-            "import \"a\"\nrill main() Sample { return x() + y() }",
+            "import ./a\nrill main() Sample { return x() + y() }",
         ),
-        ("a.rill", "export import \"b\"\nexport fn x() Float { 1 }"),
-        ("b.rill", "export import \"a\"\nexport fn y() Float { 2 }"),
+        ("a.rill", "export import ./b\nexport fn x() Float { 1 }"),
+        ("b.rill", "export import ./a\nexport fn y() Float { 2 }"),
     ]);
     // Recursion across files is still recursion.
     assert_eq!(
         errors(&[
             (
                 "a.rill",
-                "import \"b\"\nexport fn one() Float { two() }\nrill main() Sample { return one() }"
+                "import ./b\nexport fn one() Float { two() }\nrill main() Sample { return one() }"
             ),
-            ("b.rill", "import \"a\"\nexport fn two() Float { one() }"),
+            ("b.rill", "import ./a\nexport fn two() Float { one() }"),
         ]),
         ["recursion is not allowed: `one` -> `two` -> `one`"]
     );
@@ -411,10 +423,10 @@ fn a_file_reached_twice_is_loaded_once() {
     let files = [
         (
             "song.rill",
-            "import \"a\"\nimport \"b\"\nrill main() Sample { return 0 }",
+            "import ./a\nimport ./b\nrill main() Sample { return 0 }",
         ),
-        ("a.rill", "export import \"tune\""),
-        ("b.rill", "export import \"tune\""),
+        ("a.rill", "export import ./tune"),
+        ("b.rill", "export import ./tune"),
         ("tune.rill", "export seq riff { C4, E4 }"),
     ];
     let (map, result) = compile(&files);
@@ -429,7 +441,7 @@ fn a_sequence_brings_its_events_and_fields() {
         (
             "song.rill",
             "
-import \"tune\"
+import ./tune
 rill voice() Sample {
     state level: Float = 0
     on riff_note_on(note) claim { level = note.velocity }
@@ -453,7 +465,7 @@ fn exported_events_and_consts() {
         (
             "song.rill",
             "
-import \"setup\"
+import ./setup
 rill main() Sample {
     state x: Float = 0
     on keys(note) { x = note.velocity }
@@ -472,14 +484,14 @@ rill main() Sample {
         errors(&[
             (
                 "song.rill",
-                "import \"setup\"\nrill main() Sample { return HALF }"
+                "import ./setup\nrill main() Sample { return HALF }"
             ),
             (
                 "setup.rill",
                 "export const VOICES = HALF * 2\nconst HALF = 2"
             ),
         ]),
-        ["`HALF` is private to \"setup\""]
+        ["`HALF` is private to `setup`"]
     );
 }
 
@@ -488,7 +500,7 @@ fn exports_are_never_unused() {
     let w = warnings(&[
         (
             "song.rill",
-            "import \"tune\"\nrill main() Sample {\n    on start { invoke riff }\n    return 0\n}",
+            "import ./tune\nrill main() Sample {\n    on start { invoke riff }\n    return 0\n}",
         ),
         (
             "tune.rill",
@@ -503,16 +515,16 @@ fn an_import_nothing_uses_is_a_warning() {
     let w = warnings(&[
         (
             "song.rill",
-            "import \"osc\"\nimport \"lib\"\nrill main() Sample { return 0 }",
+            "import ./osc\nimport ./lib\nrill main() Sample { return 0 }",
         ),
         ("osc.rill", OSC),
-        ("lib.rill", "export import \"osc\""),
+        ("lib.rill", "export import ./osc"),
     ]);
     assert_eq!(
         w,
         [
-            "nothing from \"osc\" is used here",
-            "nothing from \"lib\" is used here"
+            "nothing from `./osc` is used here",
+            "nothing from `./lib` is used here"
         ]
     );
     // Using what an import passes on counts.
@@ -520,10 +532,10 @@ fn an_import_nothing_uses_is_a_warning() {
         warnings(&[
             (
                 "song.rill",
-                "import \"lib\"\nrill main() Sample { return saw(1Hz) }"
+                "import ./lib\nrill main() Sample { return saw(1Hz) }"
             ),
             ("osc.rill", OSC),
-            ("lib.rill", "export import \"osc\""),
+            ("lib.rill", "export import ./osc"),
         ]),
         Vec::<String>::new()
     );
@@ -534,11 +546,11 @@ fn an_import_of_a_file_that_exports_nothing_is_a_warning() {
     let w = warnings(&[
         (
             "song.rill",
-            "import \"empty\"\nrill main() Sample { return 0 }",
+            "import ./empty\nrill main() Sample { return 0 }",
         ),
         ("empty.rill", "fn private() Float { 1 }"),
     ]);
-    assert_eq!(w, ["\"empty\" exports nothing"]);
+    assert_eq!(w, ["`./empty` exports nothing"]);
 }
 
 #[test]
@@ -546,7 +558,7 @@ fn the_entry_can_be_imported() {
     let files = Files::new(&[
         (
             "song.rill",
-            "import \"osc\"\nrill main() Sample { return 0 }",
+            "import ./osc\nrill main() Sample { return 0 }",
         ),
         (
             "osc.rill",
@@ -581,7 +593,7 @@ rill main() Sample { return saw(ROOT) + saw(ROOT * 1.5) * 0.5 }
     let split = [
         (
             "song.rill",
-            "import \"osc\"\nimport \"tuning\"\nrill main() Sample { return saw(ROOT) + saw(ROOT * 1.5) * 0.5 }",
+            "import ./osc\nimport ./tuning\nrill main() Sample { return saw(ROOT) + saw(ROOT * 1.5) * 0.5 }",
         ),
         ("osc.rill", OSC),
         ("tuning.rill", "export const ROOT = 110Hz"),
@@ -591,14 +603,14 @@ rill main() Sample { return saw(ROOT) + saw(ROOT * 1.5) * 0.5 }
 
 #[test]
 fn a_string_with_imports_needs_a_file() {
-    let errs = lang::compile("import \"osc\"\nrill main() Sample { return 0 }").unwrap_err();
+    let errs = lang::compile("import ./osc\nrill main() Sample { return 0 }").unwrap_err();
     assert_eq!(errs[0].message, "imports need a file to look next to");
 }
 
 #[test]
 fn import_and_export_only_at_the_top_level() {
     let errs =
-        lang::parse("rill main() Sample {\n    import \"osc\"\n    return 0\n}").unwrap_err();
+        lang::parse("rill main() Sample {\n    import ./osc\n    return 0\n}").unwrap_err();
     assert_eq!(
         errs[0].help.as_deref(),
         Some("`import` only works at the top level of a file, outside any definition")

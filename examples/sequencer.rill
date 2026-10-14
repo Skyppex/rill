@@ -16,7 +16,7 @@
 
 // Eighth notes at 120bpm in 4/4. `@` sets a step's velocity; `_` is a rest.
 
-import "@gen/osc"
+import @gen/osc
 
 seq riff(meter: 4/4, step: 1/8, tempo: 120bpm, gate: 0.6, velocity: 0.7) {
     C4, _, E4@0.4, _, [G4, B4]@1, E4, _, C5,

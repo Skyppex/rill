@@ -2,7 +2,7 @@
 // logarithms, powers and roots on 256 copies. The functions themselves are
 // the cost here, not the program around them.
 
-import "@gen/osc"
+import @gen/osc
 
 const N = 256
 

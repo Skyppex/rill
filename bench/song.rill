@@ -2,13 +2,13 @@
 // through filters, a sequenced bass, noise percussion, echoes and a
 // compressor on the mix. The number to watch for overall progress.
 
-import "@gen/osc"
-import "@gen/noise"
-import "@effects/env"
-import "@effects/filter"
-import "@effects/delay"
-import "@effects/dynamics"
-import "@mix/stereo"
+import @gen/osc
+import @gen/noise
+import @effects/env
+import @effects/filter
+import @effects/delay
+import @effects/dynamics
+import @mix/stereo
 
 seq changes(
     meter: 4/4,

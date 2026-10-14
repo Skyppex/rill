@@ -3,10 +3,10 @@
 // The oscillators come from the core library, which every program has.
 // `export import` passes on everything it exports: a file importing `synth`
 // gets `saw` and `sine` too. `synth` can use them itself as well.
-export import "@gen/osc"
+export import @gen/osc
 
 // A plain import: only this file sees `lowpass`.
-import "fx"
+import ./fx
 
 export const VOICES = 4
 

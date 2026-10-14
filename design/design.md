@@ -306,7 +306,13 @@ rill main(speed: Freq = 120bpm) Sample {
 ```
 
 - **Steps** are separated by commas: a pitch, a chord (`[G4, B4]`) or a rest (`_`). Each note starts with its step and ends `gate` × `step` later.
-- **A step's values** follow `@` as flags, each a letter and a value from 0 to 1: `v` velocity, `p` pressure, `t` timbre, `r` release. Letters written together share the value after them, so `G3@v.5p1rt.3` is velocity 0.5, pressure 1, and release and timbre 0.3. A bare value is the velocity: `E4@0.5`. Velocity goes with the `note_on`, pressure and timbre with its `note_change`, and release with the `note_off`. On a chord, the values go to every note.
+- **Holding:** `~` after a step (`C2~`) holds its notes into the next step, which says what happens to them: the same pitch ties them (one note, no new `note_on`), another pitch slides them (a `note_change` with `slide` true, and no new `note_on`), a rest ends them. A `~` on its own as a step goes on with the notes before it, so `C2, ~, ~` is one note three steps long. Chords pair up by place: `[C3, E3]~, [D3, F3]` slides C3 to D3 and E3 to F3; extra notes start, notes without a partner end. A held note ends at the gate of the last step that holds it. The last step holds into the first when the pattern goes round again, and ends with the pattern otherwise.
+
+  ```rill
+  seq acid(step: 1/16, gate: .5) { C2~, C2, _, D#2~, F2~, G2, _, C3 }
+  seq pad(step: 1/4) { C3@p.2~, ~@p.6~, ~@p1, _ }   // a note swelling in pressure
+  ```
+- **A step's values** follow `@` as flags, each a letter and a value from 0 to 1: `v` velocity, `p` pressure, `t` timbre, `r` release. Letters written together share the value after them, so `G3@v.5p1rt.3` is velocity 0.5, pressure 1, and release and timbre 0.3. A bare value is the velocity: `E4@0.5`. Velocity goes with the `note_on`, pressure and timbre with its `note_change`, and release with the `note_off`. On a chord, the values go to every note. On a step that holds notes (a tie, a slide or `~`), `p` and `t` change them with a `note_change`, `r` sets the release of their note-off to come, and `v` is an error: they have started already.
 - **Settings** are all optional:
 
   | Setting | Default | When |
@@ -347,11 +353,11 @@ For `seq riff`, these events exist without being declared. The name says what ha
 | `riff_rest` | a step without notes | `instance`, `step`, `pass` |
 | `riff_note_on` | a note starts | `pitch`, `velocity`, `instance` (a `NoteOn`) |
 | `riff_note_off` | a note ends | `pitch`, `release`, `instance` (a `NoteOff`) |
-| `riff_note_change` | right after each `note_on`, with its starting values | a `NoteChange` |
+| `riff_note_change` | right after each `note_on`, with its starting values; a slide; a held step that changes pressure or timbre | a `NoteChange` |
 
 - Everything counts from 1. Every start is followed, eventually, by exactly one of the three stops and then `end`; reaching the last step is not stopping, and a looping sequence only stops when halted or replaced.
 - **Bars and beats** follow the meter and count from the start of each pass: step 1 is always bar 1, beat 1. A beat can fall between steps (`step: 3/16` in 4/4). A pattern that does not fill its last bar ends on a short bar. After `trigger N`, the first beat is the next one in the pattern, or at once if step N starts one.
-- **Order in one sample:** note-offs; a stop and `end`; `start` or `repeated`; `bar`; `beat`; `step`; `rest`; note-ons, each followed by its `note_change`. So a step's handler sees the notes before it already released.
+- **Order in one sample:** note-offs; a stop and `end`; `start` or `repeated`; `bar`; `beat`; `step`; `rest`; slides and changes of held notes; note-ons, each followed by its `note_change`. So a step's handler sees the notes before it already released.
 - They are ordinary events: `claim` and `release` work on the note events, plain handlers run in every voice. They cannot be invoked, and a written event cannot take one of their names. Declarations can still filter a sequence's notes, as in `event lead note_on(sender: riff, channel: 2)`; one with no `sender` hears every sequence and the host.
 - A handler that could start again what runs it, in the same sample, is an error: `on riff_start { invoke riff }` would never end. Starting, the first step and its notes happen at once; so do the note-offs, `halted` and `end` of a `halt` or a restarting `trigger`. Later events (`finished`, `repeated`, later steps) are fine: `on riff_finished { invoke riff }` plays it again and again.
 

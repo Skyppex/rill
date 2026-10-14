@@ -565,7 +565,12 @@ pub fn seq_tables(
                 values[0] = Some(c.constant(v)?);
             }
             let values = values.map(|v| v.map(|v| v.clamp(0.0, 1.0)));
-            table.steps.push(SeqStep { pitches, values });
+            table.steps.push(SeqStep {
+                pitches,
+                values,
+                held: st.held.is_some(),
+                hold: st.hold.is_some(),
+            });
         }
         tables.push(table);
     }

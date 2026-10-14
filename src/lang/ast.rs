@@ -169,8 +169,14 @@ pub struct SeqDecl {
 /// One step of a sequence.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Step {
-    /// `None` for a rest (`_`); otherwise a pitch or a chord of pitches.
+    /// `None` for a rest (`_`) or a held step (`~`); otherwise a pitch or a
+    /// chord of pitches.
     pub notes: Option<Expr>,
+    /// `~` on its own: the notes of the step before go on through this one.
+    pub held: Option<Span>,
+    /// `C2~`: this step's notes go on into the next step, which ties them
+    /// (the same pitch, or `~`), slides them (another pitch) or ends them.
+    pub hold: Option<Span>,
     /// `@0.5`
     pub velocity: Option<Expr>,
     /// `@v.5p1rt.3`: velocity, pressure, timbre and release, in

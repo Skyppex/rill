@@ -1311,7 +1311,47 @@ impl Checker {
                     }
                 }
             }
-            for step in &seq.steps {
+            let rest = |st: &Step| st.notes.is_none() && st.held.is_none();
+            for (i, step) in seq.steps.iter().enumerate() {
+                if let Some(span) = step.hold
+                    && rest(step)
+                {
+                    let e = self
+                        .error(span, "a rest has nothing to hold")
+                        .with_help("`~` after a note holds it into the next step, as in `C2~, D2`");
+                    self.report(e);
+                }
+                if let Some(span) = step.held {
+                    // What it goes on with: the closest step before that
+                    // has notes, going round to the end.
+                    let n = seq.steps.len();
+                    let before = (1..n)
+                        .map(|k| &seq.steps[(i + n - k) % n])
+                        .find(|st| st.held.is_none());
+                    if before.is_none_or(&rest) {
+                        let e = self
+                            .error(
+                                span,
+                                "nothing is held into this `~`: the step before is a rest",
+                            )
+                            .with_help(
+                                "`~` on its own goes on with the notes of the step before it",
+                            );
+                        self.report(e);
+                    }
+                    let velocity = step.velocity.as_ref().map(|v| v.span).or(step
+                        .flags
+                        .and_then(|(span, values)| values[0].map(|_| span)));
+                    if let Some(span) = velocity {
+                        let e = self
+                            .error(
+                                span,
+                                "a held note has started already: it has no velocity here",
+                            )
+                            .with_help("`p`, `t` and `r` change a held note, as in `~@p.6`");
+                        self.report(e);
+                    }
+                }
                 if let Some(notes) = &step.notes {
                     let t = self.expr(notes);
                     let ok = match &t {
@@ -1343,13 +1383,13 @@ impl Checker {
                     } else {
                         self.check_setting_range("velocity", v);
                     }
-                    if step.notes.is_none() {
+                    if rest(step) {
                         let e = self.error(v.span, "a rest has no velocity");
                         self.report(e);
                     }
                 }
                 if let Some((span, values)) = step.flags {
-                    if step.notes.is_none() {
+                    if rest(step) {
                         let e = self.error(span, "a rest has no notes to give values to");
                         self.report(e);
                     } else if values.iter().flatten().any(|v| !(0.0..=1.0).contains(v)) {

@@ -641,6 +641,10 @@ pub struct SeqStep {
     /// The step's own velocity, pressure, timbre and release, where it
     /// gives them (in [`VELOCITY`]... [`RELEASE`] order, from index 0).
     pub values: [Option<f32>; 4],
+    /// `~` on its own: the notes held into it go on through it.
+    pub held: bool,
+    /// `C2~`: its notes go on into the next step.
+    pub hold: bool,
 }
 
 /// Index of each followed setting, in [`SeqTable::settings`] and
@@ -831,16 +835,33 @@ struct Slot {
     finishing: bool,
     /// The `note_change` that follows the `note_on` just sent.
     change: Option<Payload>,
+    /// The notes carried into the current step are settled: tied, slid or
+    /// ended.
+    settled: bool,
+    /// Which of the current step's pitches carried notes took (by place in
+    /// the chord), so they do not start again.
+    taken: u64,
+    /// Notes went on through the current step (so it is not a rest).
+    went_on: bool,
 }
 
 /// A note a sequence instance is sounding.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Held {
     pitch: f32,
-    /// The position its note-off is due.
+    /// The position its note-off is due: never, while it goes on into the
+    /// next step (see [`Held::carried`]).
     off: f64,
     /// The release its note-off has.
     release: f32,
+    pressure: f32,
+    timbre: f32,
+    /// Where it is in its step's chord, for pairing with the next step's.
+    index: usize,
+    /// It goes on into the next step, which ties, slides or ends it.
+    carried: bool,
+    /// A `note_change` is due, from this pitch.
+    changed_from: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1717,7 +1738,8 @@ fn val(regs: &[f32], o: Operand) -> f32 {
 /// The next thing `slot` (an instance of a sequence with `table`) does
 /// now, moving it on; `None` when nothing more is due this tick. At the same
 /// moment, in order: note-offs; finishing (`finished`, `end`) or going round
-/// (`repeated`); `bar`; `beat`; `step`; `rest`; note-ons.
+/// (`repeated`); `bar`; `beat`; `step`; `rest`; slides and changes of held
+/// notes; note-ons, each followed by its `note_change`.
 fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
     let sb = table.step_beats;
     let len = table.steps.len();
@@ -1778,6 +1800,42 @@ fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
             slot.active = false;
             return seq(EventKind::End, [id, step, 0, 0]);
         }
+        // The notes carried into a step that is due: tied or slid to the
+        // pitch in the same place of its chord (or all going on, for `~`),
+        // or ended now. Their note-offs come before anything else.
+        if steps_left && step_at <= pos + EPS && !slot.settled {
+            slot.settled = true;
+            let step = &table.steps[slot.next];
+            let (carries, end) = step_end(table, slot, slot.next);
+            for h in slot.held.iter_mut().filter(|h| h.carried) {
+                let to = if step.held {
+                    Some(h.pitch)
+                } else {
+                    step.pitches.get(h.index).copied()
+                };
+                let Some(to) = to else {
+                    h.carried = false;
+                    h.off = step_at;
+                    continue;
+                };
+                if !step.held && h.index < 64 {
+                    slot.taken |= 1 << h.index;
+                }
+                slot.went_on = true;
+                let pressure = step.values[PRESSURE - VELOCITY].unwrap_or(h.pressure);
+                let timbre = step.values[TIMBRE - VELOCITY].unwrap_or(h.timbre);
+                if to != h.pitch || pressure != h.pressure || timbre != h.timbre {
+                    h.changed_from = Some(h.pitch);
+                }
+                h.pitch = to;
+                h.pressure = pressure;
+                h.timbre = timbre;
+                h.release = step.values[RELEASE - VELOCITY].unwrap_or(h.release);
+                h.carried = carries;
+                h.off = end;
+            }
+            continue;
+        }
         // A beat comes before a step starting at the same moment.
         if beats_left && (!steps_left || beat_at <= step_at + EPS) {
             if beat_at > pos + EPS {
@@ -1801,24 +1859,49 @@ fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
         }
         let step = &table.steps[slot.next];
         let number = slot.next as i32 + 1;
+        let (carries, end) = step_end(table, slot, slot.next);
         if !slot.step_sent {
             slot.step_sent = true;
             slot.current = slot.next;
             return seq(EventKind::Step, [id, number, pass, 0]);
         }
-        if step.pitches.is_empty() && !slot.rest_sent {
+        if step.pitches.is_empty() && !slot.went_on && !slot.rest_sent {
             slot.rest_sent = true;
             return seq(EventKind::Rest, [id, number, pass, 0]);
         }
-        if let Some(&pitch) = step.pitches.get(slot.chord) {
+        // Slides and changes of held notes, before new notes start.
+        if let Some(h) = slot.held.iter_mut().find(|h| h.changed_from.is_some()) {
+            let from = h.changed_from.take().expect("found");
+            return Some(Payload::NoteChange {
+                pitch: h.pitch,
+                pressure: h.pressure,
+                timbre: h.timbre,
+                slide: true,
+                instance: id,
+                from,
+            });
+        }
+        // Pitches carried notes took do not start again.
+        while slot.chord < step.pitches.len()
+            && slot.chord < 64
+            && slot.taken & (1 << slot.chord) != 0
+        {
             slot.chord += 1;
-            let gate = f64::from(slot.values[GATE].clamp(1e-6, 1.0));
+        }
+        if let Some(&pitch) = step.pitches.get(slot.chord) {
+            let index = slot.chord;
+            slot.chord += 1;
             // The step's own values, else the instance's.
             let value = |k: usize| step.values[k - VELOCITY].unwrap_or(slot.values[k]);
             slot.held.push(Held {
                 pitch,
-                off: step_at + gate * sb,
+                off: end,
                 release: value(RELEASE),
+                pressure: value(PRESSURE),
+                timbre: value(TIMBRE),
+                index,
+                carried: carries,
+                changed_from: None,
             });
             slot.change = Some(Payload::NoteChange {
                 pitch,
@@ -1838,7 +1921,31 @@ fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
         slot.chord = 0;
         slot.step_sent = false;
         slot.rest_sent = false;
+        slot.settled = false;
+        slot.taken = 0;
+        slot.went_on = false;
     }
+}
+
+/// Whether the notes of step `n` go on into the next step (it ends in `~`,
+/// or the next is `~`), and so the position they end at: never, or the
+/// step's gate.
+fn step_end(table: &SeqTable, slot: &Slot, n: usize) -> (bool, f64) {
+    let steps = &table.steps;
+    let round = slot.looping || slot.repeats > 1;
+    let next = match steps.get(n + 1) {
+        Some(s) => Some(s),
+        None if round => steps.first(),
+        None => None,
+    };
+    let carries = next.is_some_and(|s| steps[n].hold || s.held);
+    let gate = f64::from(slot.values[GATE].clamp(1e-6, 1.0));
+    let end = if carries {
+        f64::INFINITY
+    } else {
+        (n as f64 + gate) * table.step_beats
+    };
+    (carries, end)
 }
 
 /// Stop `slot` (an instance of sequence `seq`) for `reason` (`halted` or
@@ -2606,6 +2713,9 @@ fn invoke(call_index: u16, code: &Code, run: &mut Run) {
     slot.rest_sent = false;
     slot.finishing = false;
     slot.change = None;
+    slot.settled = false;
+    slot.taken = 0;
+    slot.went_on = false;
     run.send(
         seq,
         Payload::Seq {
@@ -3049,6 +3159,9 @@ fn copy_slot(dst: &mut Slot, src: &Slot) {
     dst.rest_sent = src.rest_sent;
     dst.finishing = src.finishing;
     dst.change = src.change;
+    dst.settled = src.settled;
+    dst.taken = src.taken;
+    dst.went_on = src.went_on;
     dst.captures.clear();
     let room = dst.captures.capacity();
     dst.captures.extend(src.captures.iter().take(room));

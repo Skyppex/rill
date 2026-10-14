@@ -2400,6 +2400,152 @@ fn step_flags_that_make_no_sense() {
     assert!(errors(&src("C4@v.5, [C4, E4]@rt.3, _"), 1).is_empty());
 }
 
+/// What a sequence of `steps` sent, sample by sample: note-ons, note-offs,
+/// note changes, slides among them, and the last change's pitch (in
+/// semitones from C4) and pressure. A step is 6000 samples; notes last half
+/// of one.
+fn holds(settings: &str, steps: &str, frames: usize) -> Vec<[f32; 6]> {
+    let src = format!(
+        "seq riff(step: 1/4, tempo: 480bpm, gate: .5{settings}) {{ {steps} }}
+        rill main() [Sample; 6] {{
+            state ons: Float = 0
+            state offs: Float = 0
+            state changes: Float = 0
+            state slides: Float = 0
+            state pitch: Float = 0
+            state press: Float = 0
+            on start {{ invoke riff }}
+            on riff_note_on {{ ons = ons + 1 }}
+            on riff_note_off {{ offs = offs + 1 }}
+            on riff_note_change(n) {{
+                changes = changes + 1
+                slides = slides + if n.slide {{ 1 }} else {{ 0 }}
+                pitch = (n.pitch - C4) / 1st
+                press = n.pressure
+            }}
+            return [ons, offs, changes, slides, pitch, press]
+        }}"
+    );
+    render_with(&src, 6, frames, Blocks::Fixed(64))
+        .chunks(6)
+        .map(|c| c.try_into().unwrap())
+        .collect()
+}
+
+#[test]
+fn a_tie_is_one_note_two_steps_long() {
+    for steps in ["C4~, C4, _", "C4, ~, _", "C4~, ~, _"] {
+        let out = holds("", steps, 13_000);
+        // One note, started once, ending at the second step's gate.
+        assert_eq!(out[8_999], [1.0, 0.0, 1.0, 0.0, 0.0, 0.0], "{steps}");
+        assert_eq!(out[9_000], [1.0, 1.0, 1.0, 0.0, 0.0, 0.0], "{steps}");
+    }
+    // `~` steps chain: three steps long.
+    let out = holds("", "C4, ~, ~, _", 16_000);
+    assert_eq!(out[14_999][1], 0.0);
+    assert_eq!(out[15_000][1], 1.0);
+}
+
+#[test]
+fn a_held_note_slides_to_the_next_pitch() {
+    let out = holds("", "C4~, D4, _", 10_000);
+    // Before the second step: one note, its starting change.
+    assert_eq!(out[5_999], [1.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
+    // At it: no new note, a slide to D4, and the note ends at its gate.
+    assert_eq!(out[6_000], [1.0, 0.0, 2.0, 1.0, 2.0, 0.0]);
+    assert_eq!(out[9_000], [1.0, 1.0, 2.0, 1.0, 2.0, 0.0]);
+}
+
+#[test]
+fn a_rest_ends_a_held_note_where_it_starts() {
+    let out = holds("", "C4~, _, _", 7_000);
+    assert_eq!(out[5_999][1], 0.0);
+    assert_eq!(out[6_000][1], 1.0);
+}
+
+#[test]
+fn chords_hold_note_by_note() {
+    // C4 slides to D4; E4 has no partner and ends; F4 starts.
+    let out = holds("", "[C4, E4]~, [D4], [D4, F4], _", 13_000);
+    assert_eq!(out[6_000], [2.0, 1.0, 3.0, 1.0, 2.0, 0.0]);
+    // The third step does not hold the second's: D4 ended at its gate, and
+    // both start fresh.
+    assert_eq!(out[12_000][0], 4.0);
+    // A held D4 meeting [D4, F4]: a tie, and F4 starts.
+    let out = holds("", "[C4, E4]~, [D4]~, [D4, F4], _", 13_000);
+    assert_eq!(out[12_000][0], 3.0);
+    assert_eq!(out[12_000][3], 1.0, "only the slide at step 2");
+}
+
+#[test]
+fn a_held_step_changes_the_held_note() {
+    let out = holds("", "C4@p.2~, ~@p.6, _", 10_000);
+    assert_eq!(out[5_999][5], 0.2);
+    // Pressure up, same pitch: a change, not a note.
+    assert_eq!(out[6_000], [1.0, 0.0, 2.0, 1.0, 0.0, 0.6]);
+    assert_eq!(out[9_000][1], 1.0);
+}
+
+#[test]
+fn holding_goes_round_a_looping_pattern() {
+    // The last step holds into the first when it loops: one slide at the
+    // pass's end, no new note.
+    let out = holds(", loop: true", "D4, C4~", 13_000);
+    assert_eq!(out[11_999][0], 2.0);
+    assert_eq!(out[12_000][0], 2.0, "no new note");
+    assert_eq!(out[12_000][3], 1.0, "a slide to D4");
+    assert_eq!(out[12_000][4], 2.0);
+    // Without looping, it ends with the pattern.
+    let out = holds("", "D4, C4~", 13_000);
+    assert_eq!(out[12_000][1], 2.0);
+}
+
+#[test]
+fn slides_reach_the_voices_holding_the_notes() {
+    let src = "
+        seq riff(step: 1/4, tempo: 480bpm, gate: .5) { [C4, E4]~, [D4, G4], _ }
+        rill voice() Sample {
+            state pitch: Float = 0
+            state gate: Float = 0
+            on riff_note_on claim { gate = 1 }
+            on riff_note_change(n) { pitch = (n.pitch - C4) / 1st + 1 }
+            on riff_note_off release { gate = 0 }
+            return pitch * gate
+        }
+        rill main() [Sample; 2] {
+            on start { invoke riff }
+            return [voice(); 2]
+        }
+    ";
+    let out = render_with(src, 2, 10_000, Blocks::Fixed(64));
+    let at = |i: usize| [out[i * 2], out[i * 2 + 1]];
+    assert_eq!(at(5_999), [1.0, 5.0]);
+    // Each voice slid its own note, without starting again.
+    assert_eq!(at(6_000), [3.0, 8.0]);
+    // And each slid note's note-off found its voice.
+    assert_eq!(at(9_000), [0.0, 0.0]);
+}
+
+#[test]
+fn holding_that_makes_no_sense() {
+    let src = |steps: &str| {
+        format!(
+            "seq riff {{ {steps} }}\nrill main() Sample {{ on start {{ invoke riff }} return 0 }}"
+        )
+    };
+    let first = |steps: &str| errors(&src(steps), 1).first().cloned().unwrap_or_default();
+    assert_eq!(first("C4, _~"), "a rest has nothing to hold");
+    assert_eq!(
+        first("C4, _, ~"),
+        "nothing is held into this `~`: the step before is a rest"
+    );
+    assert_eq!(
+        first("C4~, ~@v.5"),
+        "a held note has started already: it has no velocity here"
+    );
+    assert!(errors(&src("C4~, D4@p.5, ~@rt.3~, E4, [C4, E4]~, ~"), 1).is_empty());
+}
+
 #[test]
 fn restarting_when_finished() {
     // Each run finishes, and its handler starts the next one.

@@ -862,8 +862,12 @@ impl Parser<'_> {
         let mut steps = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let at = self.peek().span;
+            let mut held = None;
             let notes = if self.at_ident("_") {
                 self.bump();
+                None
+            } else if let Some(t) = self.eat(TokenKind::Tilde) {
+                held = Some(t.span);
                 None
             } else {
                 Some(self.expr()?)
@@ -878,8 +882,11 @@ impl Parser<'_> {
                     None => None,
                 }
             };
+            let hold = self.eat(TokenKind::Tilde).map(|t| t.span);
             steps.push(Step {
                 notes,
+                held,
+                hold,
                 velocity,
                 flags,
                 span: self.span_from(at),

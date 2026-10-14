@@ -28,6 +28,7 @@ use super::prelude;
 use super::types::{
     Align, DefKind, ParamSig, Signature, Size, Type, align, coerces, frame_shape, join,
 };
+use super::module::Sources;
 use crate::event::{EventDecl as Declared, EventKind, Sender};
 
 /// Result of a successful check.
@@ -69,7 +70,7 @@ pub struct Checked {
     pub scopes: Vec<Scope>,
     /// The audio file each path in an expression names, by expression id:
     /// the file itself, from the folder of the file the path is written in.
-    pub audio: HashMap<u32, std::path::PathBuf>,
+    pub audio: HashMap<u32, crate::audio::AudioRef>,
 }
 
 /// What a top-level name stands for.
@@ -196,8 +197,15 @@ pub enum Resolution {
 }
 
 /// Check `program`. On failure the list holds the errors and any warnings.
+/// The files it reads are read from the disk.
 pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
-    let (checked, diags) = check_partial(program);
+    check_with(program, &super::Disk)
+}
+
+/// [`check`], reading the files the program names (audio files) through
+/// `sources`.
+pub fn check_with(program: &Program, sources: &dyn Sources) -> Result<Checked, Vec<Diagnostic>> {
+    let (checked, diags) = check_partial_with(program, sources);
     if diags.iter().any(Diagnostic::is_error) {
         Err(diags)
     } else {
@@ -209,8 +217,15 @@ pub fn check(program: &Program) -> Result<Checked, Vec<Diagnostic>> {
 /// such as editors. Where something is wrong, types are
 /// [`Type::Error`]. The list holds the errors and warnings, by position.
 pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
+    check_partial_with(program, &super::Disk)
+}
+
+/// [`check_partial`], reading the files the program names through
+/// `sources`.
+pub fn check_partial_with(program: &Program, sources: &dyn Sources) -> (Checked, Vec<Diagnostic>) {
     let (own, module_scopes, exported) = build_scopes(program);
     let mut c = Checker {
+        sources,
         own,
         module_scopes,
         exported,
@@ -408,7 +423,9 @@ pub(crate) type OpError = (String, Option<String>);
 /// What [`Checker::const_value`] gives.
 type ConstVal = Result<f64, Option<String>>;
 
-struct Checker {
+struct Checker<'s> {
+    /// Where the files the program names are read from.
+    sources: &'s dyn Sources,
     /// Per module, its own top-level declarations by name, for spotting
     /// names declared twice.
     own: Vec<OwnNames>,
@@ -480,7 +497,7 @@ struct Checker {
     seq_facts: Vec<SeqFacts>,
     const_values: HashMap<u32, f64>,
     /// See [`Checked::audio`].
-    audio: HashMap<u32, std::path::PathBuf>,
+    audio: HashMap<u32, crate::audio::AudioRef>,
 }
 
 /// Something that runs handlers, for the invoke-loop check.
@@ -495,7 +512,7 @@ enum Node {
     SeqStops(usize),
 }
 
-impl Checker {
+impl Checker<'_> {
     fn resolve(&mut self, span: Span, r: Resolution) {
         let g = match r {
             Resolution::Def(i) => Some(Global::Def(i)),
@@ -2653,10 +2670,11 @@ impl Checker {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         let file = super::module::normalize(&dir.join(path));
-        match crate::audio::load(&file) {
+        match crate::audio::load(self.sources, &file) {
             Ok(audio) => {
-                self.audio.insert(e.id, file);
-                Type::Audio(Some(Size::Const(audio.channels() as u32)))
+                let channels = audio.audio.channels() as u32;
+                self.audio.insert(e.id, audio);
+                Type::Audio(Some(Size::Const(channels)))
             }
             Err(why) => {
                 let d = self

@@ -89,7 +89,7 @@ pub fn compile(src: &str) -> Result<(ast::Program, Checked), Vec<Diagnostic>> {
     }
     // Only core modules can be imported without a file to look next to.
     let loaded = module::load_tree(Path::new(""), Some(src), &module::NoFiles, false);
-    check_loaded(loaded.program, loaded.diagnostics)
+    check_loaded(loaded.program, loaded.diagnostics, &module::NoFiles)
 }
 
 /// Parse and type-check the program starting at the file `path`, with every
@@ -102,21 +102,23 @@ pub fn compile_file(
     let loaded = module::load_tree(path, None, sources, false);
     (
         loaded.sources,
-        check_loaded(loaded.program, loaded.diagnostics),
+        check_loaded(loaded.program, loaded.diagnostics, sources),
     )
 }
 
 /// Check a program read by [`module::load_tree`], unless reading it already
-/// went wrong; `found` is what reading it found.
+/// went wrong; `found` is what reading it found. The files it names are
+/// read through `sources`.
 fn check_loaded(
     program: ast::Program,
     mut found: Vec<Diagnostic>,
+    sources: &dyn Sources,
 ) -> Result<(ast::Program, Checked), Vec<Diagnostic>> {
     if found.iter().any(Diagnostic::is_error) {
         found.sort_by_key(|d| d.span.start);
         return Err(found);
     }
-    match check::check(&program) {
+    match check::check_with(&program, sources) {
         Ok(mut checked) => {
             found.extend(checked.warnings);
             found.sort_by_key(|d| d.span.start);

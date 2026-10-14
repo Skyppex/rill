@@ -19,14 +19,45 @@ use super::ast::{ModuleInfo, Modules, Program};
 use super::diag::{Diagnostic, Span};
 use super::{lexer, parser};
 
-/// Where files are read from: the disk, or an editor's open buffers.
+/// Where the files a program is built from come from: the disk, an
+/// editor's open buffers, memory, or anything else. Every file is read
+/// through here in the build stage (when a program is checked, built or
+/// reloaded), never while it plays.
 pub trait Sources {
+    /// A module's text.
     fn read(&self, path: &Path) -> io::Result<String>;
 
     /// The one path a file is known by, so a file reached by two routes is
     /// loaded once.
     fn canonical(&self, path: &Path) -> PathBuf {
         normalize(path)
+    }
+
+    /// A file's bytes, as for an audio file. From the disk unless said
+    /// otherwise.
+    fn read_bytes(&self, path: &Path) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
+    /// A version of a file: while it stays the same, what was read from it
+    /// is kept. `None` reads it every time. From the disk unless said
+    /// otherwise.
+    fn stamp(&self, path: &Path) -> Option<u64> {
+        crate::audio::disk_stamp(path)
+    }
+
+    /// An audio file, decoded: by default its bytes through the decoder
+    /// (see [`crate::audio`]). Give samples from anywhere by overriding it;
+    /// then no decoder is needed.
+    fn audio(&self, path: &Path) -> Result<std::sync::Arc<crate::audio::Audio>, String> {
+        let bytes = self.read_bytes(path).map_err(|e| format!("cannot read it: {e}"))?;
+        crate::audio::decode_bytes(bytes, path).map(std::sync::Arc::new)
+    }
+
+    /// What to watch for changes to the file at `path`, for hot reload:
+    /// the file itself unless said otherwise, or nothing.
+    fn watch(&self, path: &Path) -> Option<PathBuf> {
+        Some(path.to_owned())
     }
 }
 

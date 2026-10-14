@@ -487,7 +487,8 @@ rill main() Sample {
 - **Formats:** WAV, AIFF, CAF, FLAC, ALAC, MP1/2/3, Vorbis and AAC, in RIFF, AIFF, CAF, OGG, MP4/M4A and Matroska/WebM; the extension says which. Opus is not one of them. Decoding is pure Rust, behind the `audio-files` cargo feature (on by default).
 - **The type** has the channels in it: `./kick.wav` is an `Audio<1>`, a stereo file an `Audio<2>`. A rill takes any file with a size parameter, `rill twice<N>(a: Audio<N>) [Sample; N]`, and `Audio` alone takes any file whose channels it does not need. An audio file is fixed when the program is built, so it cannot be `state`, a frame element, or a parameter of the entry rill.
 - **Rate:** every file is resampled to the host rate when the program is built (a windowed sinc), so a second of the file is a second while playing and its pitch is its own. The rate syntax of rate-changing rills is a different thing: it is relative to the host rate, and does not apply.
-- **Built again only when changed:** a file is kept by path and by when it last changed, so a hot reload of the program does not read it again; replacing the file reloads the program, which plays the new sound.
+- **Where files come from:** every file a program reads, modules and audio, comes through the `Sources` handler of whatever builds it, in the build stage only (`rill play`, `render`, `profile`, `check`, every hot reload, an editor checking as you type), never while it plays. The disk is the default; an embedder can serve bytes from memory or a bundle, or hand over samples it made itself (`Sources::audio`), which needs no decoder at all, and says what hot reload should watch (`Sources::watch`).
+- **Built again only when changed:** a file is kept by its path while its source gives it the same stamp (on disk, when it last changed), so a hot reload of the program does not read it again; replacing the file reloads the program, which plays the new sound.
 
 **Fields**, all constants:
 

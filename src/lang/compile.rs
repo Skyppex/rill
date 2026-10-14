@@ -30,8 +30,9 @@ pub enum CVal {
     Frame(Vec<CVal>),
     Event(Vec<(String, Operand)>),
     Fn(FnVal),
-    /// An audio file, known when the program is built: the file itself.
-    Audio(std::path::PathBuf),
+    /// An audio file, known when the program is built, as the checker read
+    /// it.
+    Audio(crate::audio::AudioRef),
 }
 
 /// A function value, known at build time.
@@ -106,7 +107,7 @@ impl CVal {
                     .collect(),
             ),
             CVal::Fn(f) => CVal::Fn(f.clone()),
-            CVal::Audio(p) => CVal::Audio(p.clone()),
+            CVal::Audio(a) => CVal::Audio(a.clone()),
         }
     }
 
@@ -157,7 +158,7 @@ pub struct Defs<'a> {
     /// expressions, by expression id.
     const_values: &'a HashMap<u32, f64>,
     /// The audio file each path names, as the checker read it.
-    audio: &'a HashMap<u32, std::path::PathBuf>,
+    audio: &'a HashMap<u32, crate::audio::AudioRef>,
     /// The top-level `const`s, filled in by [`const_table`].
     consts: Vec<Option<CVal>>,
 }
@@ -1099,13 +1100,13 @@ impl<'a> Compiler<'a> {
             };
         }
         // An audio file is fixed when the program is built.
-        if let CVal::Audio(path) = v {
+        if let CVal::Audio(file) = v {
             return match slot {
                 None => {
                     *slot = Some(v.clone());
                     Ok(())
                 }
-                Some(CVal::Audio(prev)) if prev == path => Ok(()),
+                Some(CVal::Audio(prev)) if prev == file => Ok(()),
                 Some(_) => Err(Diagnostic::error(
                     self.span,
                     "choosing between audio files while playing is not supported yet",
@@ -1623,7 +1624,7 @@ impl<'a> Compiler<'a> {
             } => self.call(e, callee, sizes, args),
             ExprKind::If { cond, then, els } => self.if_expr(e, cond, then, els.as_deref()),
             ExprKind::Path(_) => match self.defs.audio.get(&e.id) {
-                Some(path) => Ok(CVal::Audio(path.clone())),
+                Some(file) => Ok(CVal::Audio(file.clone())),
                 None => Err(internal(e.span, "a path the checker did not read")),
             },
             ExprKind::Block(b) => Ok(self.block(b)?.0.unwrap_or_else(CVal::unit)),
@@ -1718,7 +1719,7 @@ impl<'a> Compiler<'a> {
             ExprKind::Field(base, field) => {
                 let fields = match self.expr(base)? {
                     CVal::Event(fields) => fields,
-                    CVal::Audio(path) => return self.audio_field(&path, field),
+                    CVal::Audio(file) => return self.audio_field(&file, field),
                     _ => return Err(internal(e.span, "field access on a non-event value")),
                 };
                 fields
@@ -2818,28 +2819,23 @@ impl<'a> Compiler<'a> {
     }
 
     /// A prelude function applied to its arguments, in parameter order.
-    /// The index of `path` in [`Code::audios`], read at the host rate the
-    /// first time.
-    fn audio_index(&mut self, span: Span, path: &std::path::Path) -> CResult<u16> {
-        if let Some(i) = self.audio_files.iter().position(|p| p == path) {
+    /// The index of `file` in [`Code::audios`], resampled to the host rate
+    /// the first time.
+    fn audio_index(&mut self, span: Span, file: &crate::audio::AudioRef) -> CResult<u16> {
+        if let Some(i) = self.audio_files.iter().position(|p| *p == file.path) {
             return Ok(i as u16);
         }
-        let rate = self.sample_rate.round() as u32;
-        let data = crate::audio::at_rate(path, rate).map_err(|why| {
-            Diagnostic::error(span, format!("cannot read {}: {why}", path.display()))
-        })?;
+        let data = crate::audio::at_rate(file, self.sample_rate.round() as u32);
         let i = u16::try_from(self.audio_files.len())
             .map_err(|_| Diagnostic::error(span, "too many audio files"))?;
-        self.audio_files.push(path.to_owned());
+        self.audio_files.push(file.path.clone());
         self.audio_data.push(data);
         Ok(i)
     }
 
-    /// `field` of the audio file at `path`: a constant.
-    fn audio_field(&mut self, path: &std::path::Path, field: &Ident) -> CResult<CVal> {
-        let audio = crate::audio::load(path).map_err(|why| {
-            Diagnostic::error(field.span, format!("cannot read {}: {why}", path.display()))
-        })?;
+    /// `field` of `file`: a constant.
+    fn audio_field(&mut self, file: &crate::audio::AudioRef, field: &Ident) -> CResult<CVal> {
+        let audio = &file.audio;
         let (loop_start, loop_end) = audio.loop_seconds();
         let value = match field.name.as_str() {
             "channels" => audio.channels() as f64,
@@ -2853,7 +2849,7 @@ impl<'a> Compiler<'a> {
                 None => {
                     return Err(Diagnostic::error(
                         field.span,
-                        format!("{} does not say which note it plays", path.display()),
+                        format!("{} does not say which note it plays", file.path.display()),
                     )
                     .with_help("it has no sampler chunk with a root note; write the note yourself, as in `C3`"));
                 }
@@ -2906,8 +2902,8 @@ impl<'a> Compiler<'a> {
             }
             // At a time, or at a frame (at the host rate) and a part of
             // one, which stays exact far into a long file.
-            ("read", [CVal::Audio(path), rest @ ..]) => {
-                let audio = self.audio_index(span, path)?;
+            ("read", [CVal::Audio(file), rest @ ..]) => {
+                let audio = self.audio_index(span, file)?;
                 let channels = self.audio_data[usize::from(audio)].len();
                 let (at, part) = match rest {
                     [time] => {

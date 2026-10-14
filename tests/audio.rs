@@ -20,6 +20,10 @@ fn folder(name: &str) -> PathBuf {
 /// A 16-bit WAV of `channels` (one buffer each) at `rate`, with a `smpl`
 /// chunk for `sampler` (root note, and a loop's first and last frame).
 fn wav(path: &Path, rate: u32, channels: &[Vec<f32>], sampler: Option<(u32, Option<(u32, u32)>)>) {
+    std::fs::write(path, wav_bytes(rate, channels, sampler)).unwrap();
+}
+
+fn wav_bytes(rate: u32, channels: &[Vec<f32>], sampler: Option<(u32, Option<(u32, u32)>)>) -> Vec<u8> {
     let chunk = |id: &[u8], body: &[u8]| {
         let mut c = id.to_vec();
         c.extend((body.len() as u32).to_le_bytes());
@@ -63,7 +67,7 @@ fn wav(path: &Path, rate: u32, channels: &[Vec<f32>], sampler: Option<(u32, Opti
     let mut file = b"RIFF".to_vec();
     file.extend((body.len() as u32).to_le_bytes());
     file.extend(body);
-    std::fs::write(path, file).unwrap();
+    file
 }
 
 /// A sine of `freq` and `amp`, `frames` long at `rate`.
@@ -340,4 +344,139 @@ fn audio_files_have_their_own_errors() {
     std::fs::write(dir.join("bad.wav"), b"not a wav at all").unwrap();
     let e = errors(&dir, "rill main() Sample { return read(./bad.wav, 0s) }");
     assert!(e.iter().any(|m| m.starts_with("cannot read `./bad.wav`")), "{e:?}");
+}
+
+/// A program and its files, all in memory: no disk at all.
+struct Memory {
+    files: std::collections::HashMap<PathBuf, Vec<u8>>,
+    /// The stamp every file gets, if any.
+    stamp: Option<u64>,
+    /// Samples made up for `./made.wav`, instead of reading a file.
+    made: bool,
+    /// How often `audio` was asked for, to see the cache.
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl Memory {
+    fn new(files: &[(&str, Vec<u8>)]) -> Memory {
+        Memory {
+            files: files.iter().map(|(p, b)| (PathBuf::from(p), b.clone())).collect(),
+            stamp: None,
+            made: false,
+            asked: Default::default(),
+        }
+    }
+}
+
+impl lang::Sources for Memory {
+    fn read(&self, path: &Path) -> std::io::Result<String> {
+        let bytes = self.read_bytes(path)?;
+        String::from_utf8(bytes).map_err(|_| std::io::ErrorKind::InvalidData.into())
+    }
+
+    fn read_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+    }
+
+    fn stamp(&self, _: &Path) -> Option<u64> {
+        self.stamp
+    }
+
+    fn audio(&self, path: &Path) -> Result<std::sync::Arc<rill::audio::Audio>, String> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.made && path.ends_with("made.wav") {
+            // A ramp, made here: no bytes, no decoder.
+            return Ok(std::sync::Arc::new(rill::audio::Audio {
+                rate: RATE,
+                samples: vec![(0..100).map(|i| i as f32 / 100.0).collect()],
+                root: Some(60.0),
+                looped: None,
+            }));
+        }
+        let bytes = self.read_bytes(path).map_err(|e| format!("cannot read it: {e}"))?;
+        rill::audio::decode_bytes(bytes, path).map(std::sync::Arc::new)
+    }
+
+    fn watch(&self, _: &Path) -> Option<PathBuf> {
+        None
+    }
+}
+
+fn render_from(sources: &Memory, frames: usize) -> Vec<f32> {
+    let options = lang::build::Options {
+        seed: Some(0),
+        ..Default::default()
+    };
+    let path = Path::new("/mem/song.rill");
+    let (map, result) = lang::load_file(path, sources, &config(1), "main", &options);
+    let (graph, _) = result.unwrap_or_else(|d| {
+        panic!("{}", d.iter().map(|d| map.render(d)).collect::<String>())
+    });
+    let mut engine = Engine::new(graph, config(1)).unwrap();
+    offline::render(&mut engine, frames, &Blocks::Fixed(64))
+}
+
+#[test]
+fn files_come_from_the_sources_a_program_is_built_with() {
+    let x: Vec<f32> = (0..64).map(|i| (i as f32 / 64.0) - 0.5).collect();
+    let song = "rill main() Sample {
+        state frame: Float = 0
+        let out = read(./hit.wav, frame, 0)
+        frame = frame + 1
+        return out
+    }";
+    let mut memory = Memory::new(&[
+        ("/mem/song.rill", song.as_bytes().to_vec()),
+        ("/mem/hit.wav", wav_bytes(RATE, std::slice::from_ref(&x), None)),
+    ]);
+    let out = render_from(&memory, 64);
+    for (got, want) in out.iter().zip(&x) {
+        assert!((got - (want * 32767.0).round() / 32768.0).abs() < 1e-6);
+    }
+    // Without a stamp, every build reads it again; with one, once.
+    let asked = |m: &Memory| m.asked.load(std::sync::atomic::Ordering::Relaxed);
+    let before = asked(&memory);
+    render_from(&memory, 1);
+    assert_eq!(asked(&memory), before + 1);
+    memory.stamp = Some(7);
+    render_from(&memory, 1);
+    render_from(&memory, 1);
+    assert_eq!(asked(&memory), before + 2);
+}
+
+#[test]
+fn sources_can_make_audio_with_no_file_at_all() {
+    let song = "rill main() Sample {
+        state frame: Float = 0
+        let out = read(./made.wav, frame, 0) + ((./made.wav).root - C4) / 1st
+        frame = frame + 1
+        return out
+    }";
+    let mut memory = Memory::new(&[("/mem/song.rill", song.as_bytes().to_vec())]);
+    memory.made = true;
+    let out = render_from(&memory, 100);
+    for (i, v) in out.iter().enumerate() {
+        assert!((v - i as f32 / 100.0).abs() < 1e-6, "{i}: {v}");
+    }
+}
+
+#[test]
+fn sources_say_what_hot_reload_watches() {
+    let song = "rill main() Sample { return read(./hit.wav, 0s) }";
+    let memory = Memory::new(&[
+        ("/mem/song.rill", song.as_bytes().to_vec()),
+        ("/mem/hit.wav", wav_bytes(RATE, &[vec![0.5; 10]], None)),
+    ]);
+    let (live, _player, _) = rill::live::Live::from_file_with(
+        Path::new("/mem/song.rill"),
+        config(1),
+        "main",
+        lang::build::Options::default(),
+        Box::new(memory),
+    )
+    .unwrap_or_else(|f| panic!("{:?}", f.errors));
+    assert!(live.files().is_empty());
 }

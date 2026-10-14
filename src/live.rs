@@ -288,6 +288,9 @@ pub struct Live {
     config: Config,
     entry: String,
     options: lang::build::Options,
+    /// Where its files are read from: the disk, unless
+    /// [`Live::from_file_with`] says otherwise.
+    sources: Box<dyn lang::Sources + Send + Sync>,
     /// The running program's keys, to plan the next takeover.
     keys: EngineKeys,
     /// The files the running program was built from.
@@ -319,7 +322,19 @@ impl Live {
         entry: &str,
         options: lang::build::Options,
     ) -> Result<(Live, Player, Reloaded), Failed> {
-        Live::start(Origin::File(path.to_owned()), config, entry, options)
+        Live::from_file_with(path, config, entry, options, Box::new(lang::Disk))
+    }
+
+    /// [`Live::from_file`], reading the program's files (its modules and
+    /// the audio files it names) through `sources`, on every reload too.
+    pub fn from_file_with(
+        path: &Path,
+        config: Config,
+        entry: &str,
+        options: lang::build::Options,
+        sources: Box<dyn lang::Sources + Send + Sync>,
+    ) -> Result<(Live, Player, Reloaded), Failed> {
+        Live::start(Origin::File(path.to_owned()), config, entry, options, sources)
     }
 
     /// [`Live::from_file`] for a program in a string.
@@ -329,7 +344,13 @@ impl Live {
         entry: &str,
         options: lang::build::Options,
     ) -> Result<(Live, Player, Reloaded), Failed> {
-        Live::start(Origin::Text(src.to_owned()), config, entry, options)
+        Live::start(
+            Origin::Text(src.to_owned()),
+            config,
+            entry,
+            options,
+            Box::new(lang::Disk),
+        )
     }
 
     fn start(
@@ -337,6 +358,7 @@ impl Live {
         config: Config,
         entry: &str,
         mut options: lang::build::Options,
+        sources: Box<dyn lang::Sources + Send + Sync>,
     ) -> Result<(Live, Player, Reloaded), Failed> {
         options.seed.get_or_insert_with(lang::build::new_seed);
         let mut live = Live {
@@ -349,6 +371,7 @@ impl Live {
             config,
             entry: entry.to_owned(),
             options,
+            sources,
             keys: EngineKeys::default(),
             files: Vec::new(),
             raised: HashMap::new(),
@@ -368,10 +391,14 @@ impl Live {
         let (sources, result) = match &self.origin {
             Origin::File(path) => {
                 let (sources, result) =
-                    lang::load_file(path, &lang::Disk, &self.config, &self.entry, &self.options);
+                    lang::load_file(path, &*self.sources, &self.config, &self.entry, &self.options);
                 let result = result.map(|(graph, checked)| {
                     let random = checked.uses_prelude("random");
-                    let audio: Vec<PathBuf> = checked.audio.into_values().collect();
+                    let audio: Vec<PathBuf> = checked
+                        .audio
+                        .into_values()
+                        .filter_map(|a| self.sources.watch(&a.path))
+                        .collect();
                     (graph, checked.warnings, random, audio)
                 });
                 (sources, result)
@@ -396,7 +423,8 @@ impl Live {
         self.files = sources
             .files
             .iter()
-            .filter_map(|f| f.path.clone())
+            .filter_map(|f| f.path.as_deref())
+            .filter_map(|p| self.sources.watch(p))
             .collect();
         for file in audio {
             if !self.files.contains(&file) {

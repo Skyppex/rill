@@ -16,7 +16,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+
+use crate::lang::Sources;
 
 /// The extensions of the formats that can be read, in lower case.
 pub const EXTENSIONS: &[&str] = &[
@@ -75,16 +76,28 @@ impl Audio {
     }
 }
 
-/// When a file was last changed, and how long it is: a different stamp
-/// means it is read again.
-type Stamp = (Option<SystemTime>, u64);
-
-fn stamp(path: &Path) -> Stamp {
-    std::fs::metadata(path).map_or((None, 0), |m| (m.modified().ok(), m.len()))
+/// An audio file a program names: where it is, and what it holds. Two are
+/// the same file when their paths are.
+#[derive(Clone)]
+pub struct AudioRef {
+    pub path: PathBuf,
+    pub audio: Arc<Audio>,
 }
 
-type Decoded = HashMap<PathBuf, (Stamp, Arc<Audio>)>;
-type Resampled = HashMap<(PathBuf, u32), (Stamp, Arc<[Box<[f32]>]>)>;
+impl PartialEq for AudioRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl std::fmt::Debug for AudioRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AudioRef({})", self.path.display())
+    }
+}
+
+type Decoded = HashMap<PathBuf, (u64, Arc<Audio>)>;
+type Resampled = HashMap<(PathBuf, u32), (Arc<Audio>, Arc<[Box<[f32]>]>)>;
 
 fn decoded() -> &'static Mutex<Decoded> {
     static CACHE: OnceLock<Mutex<Decoded>> = OnceLock::new();
@@ -96,44 +109,61 @@ fn resampled() -> &'static Mutex<Resampled> {
     CACHE.get_or_init(Default::default)
 }
 
-/// The audio file at `path`, decoded, or why it cannot be.
-pub fn load(path: &Path) -> Result<Arc<Audio>, String> {
-    let now = stamp(path);
-    if let Some((s, audio)) = decoded().lock().ok().and_then(|c| c.get(path).cloned())
-        && s == now
+/// The audio file at `path`, from `sources`, or why it cannot be read.
+/// Kept by its canonical path while `sources` gives it the same stamp; a
+/// file without a stamp is read every time.
+pub fn load(sources: &dyn Sources, path: &Path) -> Result<AudioRef, String> {
+    let key = sources.canonical(path);
+    let stamp = sources.stamp(path);
+    if let Some(stamp) = stamp
+        && let Some((s, audio)) = decoded().lock().ok().and_then(|c| c.get(&key).cloned())
+        && s == stamp
     {
-        return Ok(audio);
+        return Ok(AudioRef { path: path.to_owned(), audio });
     }
-    let audio = Arc::new(decode(path)?);
-    if let Ok(mut cache) = decoded().lock() {
-        cache.insert(path.to_owned(), (now, Arc::clone(&audio)));
+    let audio = sources.audio(path)?;
+    if let Some(stamp) = stamp
+        && let Ok(mut cache) = decoded().lock()
+    {
+        cache.insert(key, (stamp, Arc::clone(&audio)));
     }
-    Ok(audio)
+    Ok(AudioRef { path: path.to_owned(), audio })
 }
 
-/// The audio file at `path` at `rate`, one buffer per channel, or why it
-/// cannot be read.
-pub fn at_rate(path: &Path, rate: u32) -> Result<Arc<[Box<[f32]>]>, String> {
-    let now = stamp(path);
-    let key = (path.to_owned(), rate);
-    if let Some((s, samples)) = resampled().lock().ok().and_then(|c| c.get(&key).cloned())
-        && s == now
+/// `file` at `rate`, one buffer per channel. Resampled once per file and
+/// rate, for as long as the file is the one [`load`] gives.
+pub fn at_rate(file: &AudioRef, rate: u32) -> Arc<[Box<[f32]>]> {
+    let key = (file.path.clone(), rate);
+    if let Some((audio, samples)) = resampled().lock().ok().and_then(|c| c.get(&key).cloned())
+        && Arc::ptr_eq(&audio, &file.audio)
     {
-        return Ok(samples);
+        return samples;
     }
-    let audio = load(path)?;
+    let audio = &file.audio;
     let samples: Arc<[Box<[f32]>]> = resample(&audio.samples, audio.rate, rate)
         .into_iter()
         .map(Vec::into_boxed_slice)
         .collect();
     if let Ok(mut cache) = resampled().lock() {
-        cache.insert(key, (now, Arc::clone(&samples)));
+        cache.insert(key, (Arc::clone(audio), Arc::clone(&samples)));
     }
-    Ok(samples)
+    samples
 }
 
+/// A stamp for a file on disk, from when it last changed and its length.
+pub fn disk_stamp(path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(path).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    meta.modified().ok().hash(&mut h);
+    meta.len().hash(&mut h);
+    Some(h.finish())
+}
+
+/// Audio from the bytes of a file; `path` gives the format a hint by its
+/// extension.
 #[cfg(feature = "audio-files")]
-fn decode(path: &Path) -> Result<Audio, String> {
+pub fn decode_bytes(bytes: Vec<u8>, path: &Path) -> Result<Audio, String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
     use symphonia::core::errors::Error;
@@ -142,8 +172,8 @@ fn decode(path: &Path) -> Result<Audio, String> {
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    let file = std::fs::File::open(path).map_err(|e| format!("cannot read it: {e}"))?;
-    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let (root, looped) = sampler_chunks(&bytes);
+    let stream = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
@@ -205,7 +235,6 @@ fn decode(path: &Path) -> Result<Audio, String> {
     if samples.is_empty() {
         return Err("it has no audio in it".into());
     }
-    let (root, looped) = std::fs::read(path).map_or((None, None), |bytes| sampler_chunks(&bytes));
     let frames = samples[0].len();
     Ok(Audio {
         rate,
@@ -216,7 +245,7 @@ fn decode(path: &Path) -> Result<Audio, String> {
 }
 
 #[cfg(not(feature = "audio-files"))]
-fn decode(_: &Path) -> Result<Audio, String> {
+pub fn decode_bytes(_: Vec<u8>, _: &Path) -> Result<Audio, String> {
     Err("this build of Rill reads no audio files: it was built without the `audio-files` feature".into())
 }
 

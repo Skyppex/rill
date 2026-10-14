@@ -1884,6 +1884,9 @@ fn sequence_fields() {
     assert_eq!(h.unwrap(), "did you mean `step_count`?");
     let (m, h) = error(&format!("{RIFF}\n{}", body("let x = riff.tempo")));
     assert_eq!(m, "sequence `riff` has no field `tempo`");
+    assert!(h.unwrap().starts_with("every instance has its own: `riff[id].tempo`"));
+    let (m, h) = error(&format!("{RIFF}\n{}", body("let x = riff.swing")));
+    assert_eq!(m, "sequence `riff` has no field `swing`");
     assert!(h.unwrap().starts_with("a sequence has `step_count`"));
     // A local of the same name hides the sequence.
     assert!(

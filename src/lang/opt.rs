@@ -35,6 +35,7 @@ fn pure_dst(i: &Instr) -> Option<Reg> {
         | Instr::Op2 { dst, .. }
         | Instr::Tune { dst, .. }
         | Instr::Copy { dst, .. }
+        | Instr::SeqRead { dst, .. }
         | Instr::Sum { dst, .. } => Some(dst),
         _ => None,
     }
@@ -46,6 +47,7 @@ fn pure_dst_mut(i: &mut Instr) -> Option<&mut Reg> {
         | Instr::Op2 { dst, .. }
         | Instr::Tune { dst, .. }
         | Instr::Copy { dst, .. }
+        | Instr::SeqRead { dst, .. }
         | Instr::Sum { dst, .. } => Some(dst),
         _ => None,
     }
@@ -62,6 +64,7 @@ pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(Reg)) {
         | Instr::LoadCapture { dst, .. }
         | Instr::Noise { dst, .. }
         | Instr::DelayRead { dst, .. }
+        | Instr::SeqRead { dst, .. }
         | Instr::Sum { dst, .. } => f(dst),
         Instr::DelayWrite { .. }
         | Instr::Want { .. }
@@ -108,6 +111,7 @@ pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(Reg)) {
         Instr::Halt { id, .. } => id.into_iter().for_each(op),
         Instr::SetSlot { value, .. } => op(value),
         Instr::DelayRead { time, .. } => op(time),
+        Instr::SeqRead { id, .. } => op(id),
         Instr::DelayWrite { x, .. } => op(x),
         Instr::Jump { .. }
         | Instr::InvokeSeq { .. }
@@ -366,6 +370,7 @@ pub(crate) fn vector_regs(i: &VInstr, f: &mut impl FnMut(VArg)) {
             f(a4);
         }
         VInstr::DelayRead { time, .. } => f(time),
+        VInstr::SeqRead { id, .. } => f(id),
         VInstr::DelayWrite { x, .. } => f(x),
         VInstr::Noise { .. } => {}
     }
@@ -380,7 +385,8 @@ pub(crate) fn vector_dst(i: &VInstr) -> Option<Reg> {
         | VInstr::Select { d, .. }
         | VInstr::Tune { d, .. }
         | VInstr::Noise { d, .. }
-        | VInstr::DelayRead { d, .. } => Some(d),
+        | VInstr::DelayRead { d, .. }
+        | VInstr::SeqRead { d, .. } => Some(d),
         VInstr::DelayWrite { .. } => None,
     }
 }
@@ -554,7 +560,8 @@ fn set_vector_dst(i: &mut VInstr, to: Reg) {
         | VInstr::Select { d, .. }
         | VInstr::Tune { d, .. }
         | VInstr::Noise { d, .. }
-        | VInstr::DelayRead { d, .. } => *d = to,
+        | VInstr::DelayRead { d, .. }
+        | VInstr::SeqRead { d, .. } => *d = to,
         VInstr::DelayWrite { .. } => {}
     }
 }
@@ -581,6 +588,7 @@ fn vector_args_mut(i: &mut VInstr, f: &mut impl FnMut(&mut VArg)) {
             f(a4);
         }
         VInstr::DelayRead { time, .. } => f(time),
+        VInstr::SeqRead { id, .. } => f(id),
         VInstr::DelayWrite { x, .. } => f(x),
         VInstr::Noise { .. } => {}
     }

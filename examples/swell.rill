@@ -10,7 +10,7 @@ import "@effects/env"
 import "@effects/filter"
 import "@mix/stereo"
 
-seq pads(step: 1/4, tempo: 70bpm, gate: 1, release: .3, loop: true) {
+seq pads(step: 1/4, tempo: 60bpm, gate: 1, release: .3, loop: true) {
     [C3, G3, D#4]@p0t.2, ~@p.4, ~@p.8, ~@p1,
     [G#2, D#3, C4]@p.2t.8, ~@p.5, ~@p.9, ~@p.6,
 }
@@ -20,9 +20,11 @@ rill voice() [Sample; 2] {
     state gate: Float = 0
     state press: Float = 0
     state spread: Float = 0
+    state pad: Int = 0
 
-    on pads_note_on claim {
+    on pads_note_on(n) claim {
         gate = 1
+        pad = n.instance
     }
 
     on pads_note_change(n) {
@@ -35,8 +37,9 @@ rill voice() [Sample; 2] {
         gate = 0
     }
 
-    // Pressure moves a step at a time; this turns the steps into a swell.
-    let p = slew(press, 400ms, 400ms)
+    // Pressure moves a step at a time; gliding over a whole step, at the
+    // tempo it plays at now, turns the steps into a swell.
+    let p = slew(press, pads[pad].step_time, pads[pad].step_time)
 
     let freq = pitch |> equal
     let osc = saw(freq) + saw(freq * (1 + spread * .008), offset: .5)

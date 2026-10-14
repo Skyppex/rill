@@ -184,6 +184,7 @@ pub fn analyze(code: &Code) -> Stages {
                 Instr::Vector { .. } => "vector blocks",
                 Instr::Noise { .. } => "noise",
                 Instr::DelayRead { .. } | Instr::DelayWrite { .. } => "delay lines",
+                Instr::SeqRead { .. } => "reading playing sequences",
                 _ => "doing something besides maths",
             }
         } else if lagged_self[k] {

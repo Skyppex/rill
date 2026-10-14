@@ -16,8 +16,8 @@ use super::check::{Checked, Resolution, operand_alignment};
 use super::diag::{Diagnostic, Span};
 use super::types::{Align, Signature, Size, Type, align, frame_shape};
 use super::vm::{
-    Code, EventCode, Handles, Instr, InvokeCall, Mode, Operand, Reg, SeqStep, SeqTable, Source,
-    StateKeys, Tuning,
+    Code, EventCode, Handles, Instr, InvokeCall, Mode, Operand, Reg, SeqInfo, SeqStep, SeqTable,
+    Source, StateKeys, Tuning,
 };
 use crate::event::{EventDecl as Declared, EventId, EventKind};
 use crate::ops::{Op1, Op2};
@@ -1632,6 +1632,22 @@ impl<'a> Compiler<'a> {
                     id,
                 });
                 Ok(CVal::unit())
+            }
+            // `seq[id].field`: what an instance is doing.
+            ExprKind::Field(base, field)
+                if matches!(&base.kind, ExprKind::Index(b, _) if self.defs.seq_at(b.span).is_some()) =>
+            {
+                let ExprKind::Index(b, id) = &base.kind else {
+                    unreachable!("matched")
+                };
+                let seq = self.defs.seq_at(b.span).expect("matched") as u16;
+                let info = SeqInfo::from_name(&field.name).ok_or_else(|| {
+                    internal(field.span, &format!("unknown instance field `{}`", field.name))
+                })?;
+                let id = self.expr(id)?.scalar();
+                let dst = self.reg()?;
+                self.emit(Instr::SeqRead { dst, seq, info, id });
+                Ok(CVal::Scalar(Operand::Reg(dst)))
             }
             // A sequence's field, worked out by the checker.
             ExprKind::Field(..) if self.defs.const_values.contains_key(&e.id) => Ok(CVal::Scalar(

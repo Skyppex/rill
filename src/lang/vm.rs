@@ -89,6 +89,14 @@ pub enum Instr {
         slot: u16,
         index: u8,
     },
+    /// `dst` = `info` of the instance of `seq` whose id is `id`, as it is
+    /// at this sample (see [`seq_read`]).
+    SeqRead {
+        dst: Reg,
+        seq: u16,
+        info: SeqInfo,
+        id: Operand,
+    },
     /// Set setting `setting` (see [`Source`]) of instance slot `slot` of
     /// `seq`, if call `call` started it.
     SetSlot {
@@ -212,6 +220,14 @@ pub enum VInstr {
         time: VArg,
         want: u16,
         want_stride: u16,
+    },
+    /// Lane `k` reads `info` of the instance of `seq` whose id is lane `k`
+    /// of `id`, as [`Instr::SeqRead`] does.
+    SeqRead {
+        d: Reg,
+        seq: u16,
+        info: SeqInfo,
+        id: VArg,
     },
     /// Lane `k` writes delay line `line + k * stride` as
     /// [`Instr::DelayWrite`] does; every lane has its own line.
@@ -658,6 +674,83 @@ pub const RELEASE: usize = 5;
 /// How many settings a sequence has that can follow streams.
 pub const SETTINGS: usize = 6;
 
+/// What [`Instr::SeqRead`] reads of a playing instance: `seq[id].field`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeqInfo {
+    Tempo,
+    StepTime,
+    BeatTime,
+    Step,
+    Pass,
+    Progress,
+    Playing,
+}
+
+impl SeqInfo {
+    /// The field named `name`.
+    pub fn from_name(name: &str) -> Option<SeqInfo> {
+        Some(match name {
+            "tempo" => SeqInfo::Tempo,
+            "step_time" => SeqInfo::StepTime,
+            "beat_time" => SeqInfo::BeatTime,
+            "step" => SeqInfo::Step,
+            "pass" => SeqInfo::Pass,
+            "progress" => SeqInfo::Progress,
+            "playing" => SeqInfo::Playing,
+            _ => return None,
+        })
+    }
+}
+
+/// What a step or beat lasts while a sequence holds still (a tempo of 0 or
+/// below): long enough to mean "not moving", and finite.
+const STILL: f32 = 3600.0;
+
+/// [`Instr::SeqRead`]: `info` of the instance of `table` with id `id`, among
+/// `slots`. `at` is the sample of the segment being run, if one is: a
+/// segment moves its sequences on before its tick runs, so they kept their
+/// position and tempo for each sample in [`Slot::trail`].
+fn seq_read(table: &SeqTable, slots: &[Slot], at: Option<usize>, info: SeqInfo, id: f32) -> f32 {
+    let lasts = |beats: f64, tempo: f32| {
+        if tempo > 0.0 {
+            (beats / f64::from(tempo)) as f32
+        } else {
+            STILL
+        }
+    };
+    let id = id as i32;
+    let slot = (id != 0)
+        .then(|| slots.iter().find(|s| s.active && s.id == id))
+        .flatten();
+    let Some(slot) = slot else {
+        // Not playing: the sequence's own tempo, so a release tail does not
+        // jump.
+        let tempo = table.settings[TEMPO];
+        return match info {
+            SeqInfo::Tempo => tempo,
+            SeqInfo::StepTime => lasts(table.step_beats, tempo),
+            SeqInfo::BeatTime => lasts(1.0, tempo),
+            SeqInfo::Step | SeqInfo::Pass | SeqInfo::Progress | SeqInfo::Playing => 0.0,
+        };
+    };
+    let (pos, tempo) = match at {
+        Some(j) if !slot.trail.is_empty() => slot.trail[j],
+        _ => (slot.pos, slot.values[TEMPO]),
+    };
+    match info {
+        SeqInfo::Tempo => tempo,
+        SeqInfo::StepTime => lasts(table.step_beats, tempo),
+        SeqInfo::BeatTime => lasts(1.0, tempo),
+        SeqInfo::Step => (slot.current + 1) as f32,
+        SeqInfo::Pass => slot.pass as f32,
+        SeqInfo::Progress => {
+            let into = pos - slot.current as f64 * table.step_beats;
+            ((into / table.step_beats) as f32).clamp(0.0, 1.0 - f32::EPSILON / 2.0)
+        }
+        SeqInfo::Playing => 1.0,
+    }
+}
+
 /// Where a playing sequence takes a setting from.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Source {
@@ -762,6 +855,9 @@ fn list(s: &mut String, instrs: &[Instr]) {
                 slot,
                 index,
             } => format!("r{dst} = capture {index} of seq {seq} slot {slot}"),
+            Instr::SeqRead { dst, seq, info, id } => {
+                format!("r{dst} = {info:?} of seq {seq} instance {}", op(id))
+            }
             Instr::SetSlot {
                 seq,
                 slot,
@@ -843,6 +939,10 @@ struct Slot {
     taken: u64,
     /// Notes went on through the current step (so it is not a rest).
     went_on: bool,
+    /// Its position and tempo at each sample of the segment being run, as
+    /// its tick sees them; empty unless something reads them (see
+    /// [`seq_read`]).
+    trail: Box<[(f64, f32)]>,
 }
 
 /// A note a sequence instance is sounding.
@@ -925,6 +1025,9 @@ struct Run {
     /// The values of the next event a handler sends (see
     /// [`Instr::EventArg`]).
     event_args: [f32; crate::event::MAX_FIELDS],
+    /// The sample of the segment whose tick is running, if one is (see
+    /// [`seq_read`]).
+    at: Option<usize>,
 }
 
 impl Run {
@@ -1240,6 +1343,16 @@ impl Program {
                 .max()
                 .unwrap_or(0)
         };
+        // Whether the tick reads where instances of sequence `seq` are.
+        let reads = |seq: usize| {
+            let seq = seq as u16;
+            code.instrs
+                .iter()
+                .any(|i| matches!(*i, Instr::SeqRead { seq: s, .. } if s == seq))
+                || code.vectors.iter().flat_map(|v| &v.instrs).any(
+                    |i| matches!(*i, VInstr::SeqRead { seq: s, .. } if s == seq),
+                )
+        };
         let slots = code
             .seqs
             .iter()
@@ -1251,6 +1364,7 @@ impl Program {
                 (0..t.instances)
                     .map(|_| Slot {
                         captures: vec![0.0; captures(j)],
+                        trail: vec![(0.0, 0.0); if reads(j) { SEGMENT } else { 0 }].into(),
                         // A note can still be held when the next step starts.
                         held: Vec::with_capacity(chord * 2),
                         ..Slot::default()
@@ -1318,6 +1432,7 @@ impl Program {
                 wanted,
                 noise: code.noises.clone(),
                 event_args: [0.0; crate::event::MAX_FIELDS],
+                at: None,
                 wants: (0..code.ceilings.len())
                     .map(|_| std::sync::atomic::AtomicU32::new(0))
                     .collect(),
@@ -1585,7 +1700,7 @@ impl Program {
                 // Sequences move on by what the inputs say; what the tick
                 // computes they cannot follow here (see `stages::fallback`).
                 if sequences {
-                    self.advance_sequences_at(inputs, i + n);
+                    self.advance_sequences_at(inputs, i, n);
                 }
                 n += 1;
                 if n == SEGMENT || i + n == ctx.frames || (sequences && self.sequences_due()) {
@@ -1597,13 +1712,19 @@ impl Program {
         }
     }
 
-    /// [`Program::advance_sequences`] for sample `i`, with the values it
-    /// follows taken from the inputs.
-    fn advance_sequences_at(&mut self, inputs: &Inputs, i: usize) {
+    /// [`Program::advance_sequences`] for sample `j` of the segment
+    /// starting at sample `i`, with the values it follows taken from the
+    /// inputs. Where the tick reads them, each instance first notes where
+    /// it is, which is what the tick sees at that sample.
+    fn advance_sequences_at(&mut self, inputs: &Inputs, i: usize, j: usize) {
         let rate = f64::from(self.run.rate);
         let (code, run) = (&self.code, &mut self.run);
+        let i = i + j;
         for slots in &mut run.slots {
             for slot in slots.iter_mut().filter(|s| s.active) {
+                if let Some(t) = slot.trail.get_mut(j) {
+                    *t = (slot.pos, slot.values[TEMPO]);
+                }
                 for s in 0..SETTINGS {
                     if let Source::Follow(r) = slot.sources[s] {
                         slot.values[s] = match code.input_regs.iter().position(|&x| x == r) {
@@ -1667,6 +1788,9 @@ impl Program {
                         delays: &mut run.delays,
                         wants: &run.wants,
                         rate: run.rate,
+                        seqs: &code.seqs,
+                        slots: &run.slots,
+                        at: None,
                     };
                     run_lanes(block, n, &mut run.regs, state);
                 }
@@ -1680,11 +1804,13 @@ impl Program {
                         for &(r, b) in loads {
                             run.regs[r as usize] = run.regs[b as usize + j];
                         }
+                        run.at = Some(j);
                         exec(fast, instrs, code, run);
                         for &(r, b) in stores {
                             run.regs[b as usize + j] = run.regs[r as usize];
                         }
                     }
+                    run.at = None;
                 }
             }
         }
@@ -2037,6 +2163,9 @@ fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
                     delays: &mut run.delays,
                     wants: &run.wants,
                     rate: run.rate,
+                    seqs: &code.seqs,
+                    slots: &run.slots,
+                    at: run.at,
                 };
                 run_vector(&code.vectors[block as usize], regs, state);
             }
@@ -2120,6 +2249,10 @@ fn check_vector(block: &VectorBlock, regs: usize, noises: usize, delays: usize, 
                 );
                 d
             }
+            VInstr::SeqRead { d, id, .. } => {
+                arg(id);
+                d
+            }
             VInstr::DelayWrite { line, stride, x } => {
                 arg(x);
                 assert!(stride > 0, "lanes cannot write one delay line");
@@ -2141,6 +2274,11 @@ struct LaneState<'a> {
     delays: &'a mut [(Box<[f32]>, usize)],
     wants: &'a [std::sync::atomic::AtomicU32],
     rate: f32,
+    /// The sequences and their instances, for [`VInstr::SeqRead`], and the
+    /// sample of the segment being run (see [`seq_read`]).
+    seqs: &'a [SeqTable],
+    slots: &'a [Vec<Slot>],
+    at: Option<usize>,
 }
 
 /// Where a vector operand's values come from, settled before a loop runs.
@@ -2247,6 +2385,14 @@ fn run_lanes(block: &VectorBlock, n: usize, regs: &mut [f32], state: LaneState) 
                     state.rate,
                     n,
                 ),
+                VInstr::SeqRead { d, seq, info, id } => {
+                    let (dp, id) = (p.add(d as usize), src(id));
+                    let seq = usize::from(seq);
+                    let (table, slots) = (&state.seqs[seq], &state.slots[seq]);
+                    for k in 0..n {
+                        *dp.add(k) = seq_read(table, slots, state.at, info, id.at(k));
+                    }
+                }
                 VInstr::DelayWrite { line, stride, x } => delay_writes(
                     src(x),
                     &mut state.delays[usize::from(line)..],
@@ -2521,6 +2667,9 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
                 delays: &mut run.delays,
                 wants: &run.wants,
                 rate: run.rate,
+                seqs: &code.seqs,
+                slots: &run.slots,
+                at: run.at,
             };
             run_vector(&code.vectors[block as usize], regs, state);
         }
@@ -2543,6 +2692,11 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
                     stop(run, seq, k, EventKind::Halted);
                 }
             }
+        }
+        Instr::SeqRead { dst, seq, info, id } => {
+            let seq = usize::from(seq);
+            regs[dst as usize] =
+                seq_read(&code.seqs[seq], &run.slots[seq], run.at, info, val(regs, id));
         }
         Instr::LoadCapture {
             dst,

@@ -291,6 +291,7 @@ fn what(i: &Instr) -> &'static str {
         Instr::Halt { .. } => "stops a sequence",
         Instr::InvokeEvent { .. } | Instr::EventArg { .. } => "sends an event",
         Instr::LoadCapture { .. } | Instr::SetSlot { .. } => "follows a playing sequence",
+        Instr::SeqRead { .. } => "reads a playing sequence",
         Instr::Vector { .. } => "holds copies that already run together",
         Instr::Sum { .. } => "sums",
         Instr::Noise { .. } => "calls noise()",
@@ -664,6 +665,26 @@ fn vectorize_pool(
                     want_stride,
                 }
             }
+            Instr::SeqRead { seq, info, .. } => {
+                if !at.iter().all(
+                    |i| matches!(**i, Instr::SeqRead { seq: s, info: f, .. } if s == seq && f == info),
+                ) {
+                    return Err(Why::Differ);
+                }
+                let id = g
+                    .arg(&ops(&|i| match *i {
+                        Instr::SeqRead { id, .. } => id,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                let d = g
+                    .dst(&dsts(&|i| match *i {
+                        Instr::SeqRead { dst, .. } => dst,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                VInstr::SeqRead { d, seq, info, id }
+            }
             Instr::DelayWrite { .. } => {
                 let lines: Vec<u16> = at
                     .iter()
@@ -723,7 +744,8 @@ fn straighten(
             | Instr::Tune { .. }
             | Instr::Noise { .. }
             | Instr::DelayRead { .. }
-            | Instr::DelayWrite { .. } => {}
+            | Instr::DelayWrite { .. }
+            | Instr::SeqRead { .. } => {}
             other => return Err(Why::Unsupported(what(&other))),
         }
     }
@@ -1012,6 +1034,10 @@ fn rename(code: &mut Code, map: &HashMap<Reg, Reg>) {
             r(dst);
             op(time);
         }
+        Instr::SeqRead { dst, id, .. } => {
+            r(dst);
+            op(id);
+        }
         Instr::DelayWrite { x, .. } | Instr::Want { x, .. } => op(x),
         // Made after renaming (see `opt::sums`), so its registers are
         // already the new ones.
@@ -1074,6 +1100,7 @@ fn rename(code: &mut Code, map: &HashMap<Reg, Reg>) {
                 } => vec![pitch, setting, a4],
                 VInstr::Noise { .. } => vec![],
                 VInstr::DelayRead { time, .. } => vec![time],
+                VInstr::SeqRead { id, .. } => vec![id],
                 VInstr::DelayWrite { x, .. } => vec![x],
             };
             for a in args {

@@ -3029,3 +3029,130 @@ fn delays_and_noise_in_voices_run_the_same_as_lanes() {
     ";
     same_either_way(src, 2, 4_000, &[]);
 }
+
+/// `riff[id]`'s fields, as numbers: tempo (Hz), step and beat time (s),
+/// step, pass, progress and playing.
+fn instance(seq: &str, invoke: &str, frames: usize) -> Vec<[f32; 7]> {
+    let src = format!(
+        "seq riff({seq}) {{ C4, D4, E4 }}
+        rill main(speed: Freq = 480bpm) [Sample; 7] {{
+            state id: Int = 0
+            on start {{ id = {invoke} }}
+            let r = [
+                riff[id].tempo / 1Hz,
+                riff[id].step_time / 1s,
+                riff[id].beat_time / 1s,
+                riff[id].step as Float,
+                riff[id].pass as Float,
+                riff[id].progress,
+                if riff[id].playing {{ 1 }} else {{ 0 }},
+            ]
+            return r
+        }}"
+    );
+    render_with(&src, 7, frames, Blocks::Fixed(64))
+        .chunks(7)
+        .map(|c| c.try_into().unwrap())
+        .collect()
+}
+
+#[test]
+fn an_instance_says_where_it_is() {
+    // A step is a beat: 6000 samples at 480bpm.
+    let out = instance("step: 1/4, tempo: 480bpm", "invoke riff(repeat: 2)", 40_000);
+    assert_eq!(out[0], [8.0, 0.125, 0.125, 1.0, 1.0, 0.0, 1.0]);
+    close(&out[3_000][..], &[8.0, 0.125, 0.125, 1.0, 1.0, 0.5, 1.0], 1e-5);
+    assert_eq!(out[6_000][3..5], [2.0, 1.0]);
+    assert!(out[6_000][5] < 1e-5);
+    assert!(out[5_999][5] > 0.999 && out[5_999][5] < 1.0);
+    // The second pass.
+    assert_eq!(out[18_000][3..5], [1.0, 2.0]);
+    // Done after two: its own tempo, nothing else.
+    assert_eq!(out[37_000], [8.0, 0.125, 0.125, 0.0, 0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn an_instance_that_is_not_playing_has_its_sequences_tempo() {
+    // Id 0 is never a sequence's.
+    let out = instance("step: 1/8, tempo: 90bpm", "0", 10);
+    assert_eq!(out[0], [1.5, 1.0 / 3.0, 2.0 / 3.0, 0.0, 0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn an_instance_follows_its_tempo() {
+    let src = "
+        seq riff(step: 1/4) { C4, D4, E4, F4 }
+        rill main(speed: Freq = 480bpm) [Sample; 2] {
+            state id: Int = 0
+            on start { id = invoke riff(tempo: speed, loop: true) }
+            return [riff[id].step_time / 1s, riff[id].progress]
+        }";
+    let events = |frame_offset| ParamEvent {
+        frame_offset,
+        name: "speed",
+        value: 4.0,
+    };
+    let run = |stream: bool, blocks: usize| {
+        let mut engine = engine_streaming(src, 2, stream);
+        let mut out = Vec::new();
+        for b in 0..40 {
+            let mut l = vec![0.0f32; blocks];
+            let mut r = vec![0.0f32; blocks];
+            let ev = if b == 3 { vec![events(5)] } else { vec![] };
+            engine.render_planar_with_events(&mut [&mut l, &mut r], &ev);
+            out.extend(l.iter().zip(&r).flat_map(|(a, b)| [*a, *b]));
+        }
+        out
+    };
+    let reference = run(false, 256);
+    assert!((reference[0] - 0.125).abs() < 1e-6);
+    // Smoothed from 8 to 4 beats a second: a step lasts 0.25s after.
+    let end = reference.len() - 2;
+    assert!((reference[end] - 0.25).abs() < 1e-5);
+    // Read sample by sample, while the segments run ahead of the tick.
+    assert!(run(true, 256) == reference);
+}
+
+#[test]
+fn every_voice_reads_the_instance_it_plays() {
+    let src = "
+        seq slow(step: 1/4, tempo: 60bpm) { C4, _ }
+        seq fast(step: 1/4, tempo: 240bpm) { D4, _ }
+        rill voice() Sample {
+            state id: Int = 0
+            on slow_note_on(n) claim { id = n.instance }
+            on fast_note_on(n) claim { id = n.instance }
+            return if id < 0 { slow[id].step_time / 1s + fast[id].step_time / 1s } else { 0 }
+        }
+        rill main() [Sample; 2] {
+            on start {
+                invoke slow
+                invoke fast
+            }
+            return [voice(); 2]
+        }";
+    let out = render_with(src, 2, 100, Blocks::Fixed(64));
+    // Each copy finds its id in one sequence; the other gives its own
+    // tempo's step for an id it does not have.
+    let mut got = [out[98], out[99]];
+    got.sort_by(f32::total_cmp);
+    close(&got, &[1.0 + 0.25, 1.0 + 0.25], 1e-6);
+}
+
+#[test]
+fn reading_an_instance_has_its_own_errors() {
+    let seq = "seq riff { C4 }\n";
+    let e = errors(&format!("{seq}rill main() Sample {{ return riff[1] }}"), 1);
+    assert!(e.iter().any(|m| m.contains("an instance of `riff` is not a value")), "{e:?}");
+    let e = errors(&format!("{seq}rill main() Sample {{ return riff[1].step_count }}"), 1);
+    assert!(e.iter().any(|m| m.contains("an instance of `riff` has no field `step_count`")), "{e:?}");
+    let e = errors(&format!("{seq}rill main() Sample {{ return riff.step_time / 1s }}"), 1);
+    assert!(e.iter().any(|m| m.contains("has no field `step_time`")), "{e:?}");
+    let e = errors(&format!("{seq}rill main() Sample {{ return riff[.5].progress }}"), 1);
+    assert!(e.iter().any(|m| m.contains("an id you pick")), "{e:?}");
+    let e = errors(
+        &format!("{seq}fn f(id: Int) Float {{ riff[id].progress }}\nrill main() Sample {{ return f(1) }}"),
+        1,
+    );
+    assert!(e.iter().any(|m| m.contains("only a rill can read it")), "{e:?}");
+}

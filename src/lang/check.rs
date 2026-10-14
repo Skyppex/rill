@@ -2342,6 +2342,19 @@ impl Checker {
                     _ => Type::Error,
                 }
             }
+            ExprKind::Index(base, index) if self.seq_of(base).is_some() => {
+                let j = self.seq_of(base).expect("matched");
+                self.resolve(base.span, Resolution::Seq(j));
+                self.instance_id(index);
+                let seq = self.seq_names[j].clone();
+                let d = self
+                    .error(e.span, format!("an instance of `{seq}` is not a value"))
+                    .with_help(format!(
+                        "read one of its fields, as in `{seq}[id].step_time`"
+                    ));
+                self.report(d);
+                Type::Error
+            }
             ExprKind::Index(base, index) => {
                 let tb = self.expr(base);
                 let ti = self.expr(index);
@@ -2438,6 +2451,38 @@ impl Checker {
                 let to = self.resolve_type(te, &self.generics());
                 self.cast(e.span, &from, to)
             }
+            ExprKind::Field(base, field) if self.instance_of(base).is_some() => {
+                let (j, name, id) = self.instance_of(base).expect("matched");
+                self.resolve(name, Resolution::Seq(j));
+                self.instance_id(id);
+                self.instance_place(e.span, j);
+                match instance_field(&field.name) {
+                    Some(ty) => ty,
+                    None => {
+                        let seq = self.seq_names[j].clone();
+                        let mut d = self.error(
+                            field.span,
+                            format!("an instance of `{seq}` has no field `{}`", field.name),
+                        );
+                        d = if seq_field(&self.seq_facts[j], &field.name).is_some() {
+                            d.with_help(format!(
+                                "`{0}` is the same for every instance: `{seq}.{0}`",
+                                field.name
+                            ))
+                        } else {
+                            match suggest(&field.name, INSTANCE_FIELDS.iter().map(|(n, _)| *n)) {
+                                Some(s) => d.with_help(format!("did you mean `{s}`?")),
+                                None => d.with_help(format!(
+                                    "an instance has {}",
+                                    listing(&INSTANCE_FIELDS.iter().map(|(n, _)| *n).collect::<Vec<_>>())
+                                )),
+                            }
+                        };
+                        self.report(d);
+                        Type::Error
+                    }
+                }
+            }
             ExprKind::Field(base, field) if self.seq_of(base).is_some() => {
                 let j = self.seq_of(base).expect("matched");
                 self.resolve(base.span, Resolution::Seq(j));
@@ -2456,9 +2501,16 @@ impl Checker {
                                 self.seq_names[j], field.name
                             ),
                         );
-                        d = match suggest(&field.name, SEQ_FIELDS.iter().map(|(n, _)| *n)) {
-                            Some(s) => d.with_help(format!("did you mean `{s}`?")),
-                            None => d.with_help(format!("a sequence has {fields}")),
+                        d = if instance_field(&field.name).is_some() {
+                            d.with_help(format!(
+                                "every instance has its own: `{}[id].{}`, with `id` from `invoke` or a note's `instance`",
+                                self.seq_names[j], field.name
+                            ))
+                        } else {
+                            match suggest(&field.name, SEQ_FIELDS.iter().map(|(n, _)| *n)) {
+                                Some(s) => d.with_help(format!("did you mean `{s}`?")),
+                                None => d.with_help(format!("a sequence has {fields}")),
+                            }
                         };
                         self.report(d);
                         Type::Error
@@ -3285,6 +3337,29 @@ impl Checker {
     }
 
     /// The sequence `e` names, if it is a name that is not shadowed.
+    /// `seq[id]`: the sequence, its name and the id.
+    fn instance_of<'e>(&self, e: &'e Expr) -> Option<(usize, Span, &'e Expr)> {
+        let ExprKind::Index(base, id) = &e.kind else {
+            return None;
+        };
+        Some((self.seq_of(base)?, base.span, id))
+    }
+
+    /// Where `seq[id].field` can be read: what an instance does changes
+    /// while playing, so not in fns.
+    fn instance_place(&mut self, span: Span, j: usize) {
+        let in_fn_body = self.current.is_some() || self.lambda_floor.is_some();
+        if self.place == Place::Fn && in_fn_body {
+            let d = self
+                .error(
+                    span,
+                    format!("what an instance of `{}` is doing changes while it plays, so only a rill can read it", self.seq_names[j]),
+                )
+                .with_help("fns are pure; read it in the rill and pass the value in");
+            self.report(d);
+        }
+    }
+
     fn seq_of(&self, e: &Expr) -> Option<usize> {
         match &e.kind {
             ExprKind::Name(n) if self.lookup(n).is_none() => self.seq_named(n),
@@ -4730,6 +4805,33 @@ pub const SEQ_FIELDS: &[(&str, &str)] = &[
     ),
     ("instances", "How many instances can play at once."),
 ];
+
+/// What an instance of a sequence is doing, read with `seq[id].field`, with
+/// what each means.
+pub const INSTANCE_FIELDS: &[(&str, &str)] = &[
+    ("tempo", "Its tempo now."),
+    ("step_time", "How long one step lasts at its tempo now."),
+    ("beat_time", "How long one beat lasts at its tempo now."),
+    ("step", "The step it is on, from 1; 0 when it is not playing."),
+    ("pass", "The pass it is on, from 1; 0 when it is not playing."),
+    (
+        "progress",
+        "How far it is through its step, from 0 up to just under 1; 0 when it is not playing.",
+    ),
+    ("playing", "Whether it is playing."),
+];
+
+/// The type of field `name` of an instance of a sequence.
+pub fn instance_field(name: &str) -> Option<Type> {
+    Some(match name {
+        "tempo" => Type::Freq,
+        "step_time" | "beat_time" => Type::Time,
+        "step" | "pass" => Type::Int,
+        "progress" => Type::Float,
+        "playing" => Type::Bool,
+        _ => return None,
+    })
+}
 
 /// The type and value of field `name` of a sequence with `facts`.
 pub fn seq_field(facts: &SeqFacts, name: &str) -> Option<(Type, f64)> {

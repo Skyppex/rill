@@ -380,6 +380,34 @@ For `seq riff`, these events exist without being declared. The name says what ha
 
 Settings an invocation can change (`tempo`, `gate`, `velocity`, `pressure`, `timbre`, `release`, `repeat`, `loop`) are not fields.
 
+### What an instance is doing
+
+`riff[id].field` reads instance `id` of a sequence as it plays: every instance has its own tempo, which can follow a stream, so these are read every sample, not fixed. The id is what `invoke` returned, or a note's `instance`, kept in `state` by the voice that claimed it:
+
+```rill
+rill pad() Sample {
+    state id: Int = 0
+    state press: Float = 0
+    on pads_note_on(n) claim { id = n.instance }
+    on pads_note_change(n) { press = n.pressure }
+    let p = slew(press, pads[id].step_time, pads[id].step_time)   // glide over one step
+    ...
+}
+```
+
+| Field | Type | |
+| --- | --- | --- |
+| `tempo` | `Freq` | its tempo now |
+| `step_time` | `Time` | one step at that tempo |
+| `beat_time` | `Time` | one beat at that tempo |
+| `step`, `pass` | `Int` | where it is, from 1 |
+| `progress` | `Float` | how far through its step, from 0 up to just under 1 |
+| `playing` | `Bool` | |
+
+- An instance that is not playing (never started, stopped, or id 0, which host notes carry) has the sequence's own tempo, so a voice's release does not jump; `step`, `pass` and `progress` are 0. A sequence holding still (tempo 0 or below) gives an hour for `step_time` and `beat_time`.
+- `riff[id]` alone is not a value, and fns cannot read it: what it gives changes while playing.
+- A segment ends at every step, so `progress` and a followed tempo are read sample by sample in a looping stage, exactly as running the tick sample by sample would.
+
 ## Voices
 
 A pool of voices is a frame of separate rill instances, written like the frame type: `[lead(); 8]` is eight `lead`s, each with its own state. Lifting a rill over a frame makes a pool too.

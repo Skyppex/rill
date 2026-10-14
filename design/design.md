@@ -161,6 +161,8 @@ Optional channel layouts name positions without changing the type: `type Surroun
 
 ## Pitch and tuning
 
+A note name is a letter from `C` to `B`, a sharp (`#` or `s`) or a flat (`b`) if it has one, and an octave, 4 if left out: `C4`, `F#3`, `Fs3`, `Eb4`, `Bb`. Any letter takes either, so `B#3` is `C4` and `Cb4` is `B3`.
+
 A note name is an abstract `Pitch`, not a frequency; it becomes `Freq` only when it goes through a tuning. A tuning is an ordinary function from `Pitch` to `Freq`. Raw `Hz` literals bypass tuning entirely.
 
 ```rill

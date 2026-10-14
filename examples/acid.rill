@@ -1,0 +1,55 @@
+// An acid bassline: one voice whose notes slide into each other without
+// starting again, with accents that open the filter.
+//
+// `~` holds a note into the next step: `C2~, D#2` slides from C2 up to D#2,
+// `C2~, C2` ties the two into one long note. `@v1` is an accent.
+
+import "@gen/osc"
+import "@effects/env"
+import "@effects/filter"
+
+seq acid(step: 1/16, tempo: 128bpm, gate: .55, velocity: .6, loop: true) {
+    C2, C2~, C3, _, D#2@v1, _, C2~, G2~,
+    A#2, C2, _, C3@v1~, C2, F2~, F#2~, G2,
+}
+
+rill bass() Sample {
+    state pitch: Pitch = C2
+    state gate: Float = 0
+    state accent: Float = 0
+    state glide: Time = 0ms
+
+    // `note_on` and `note_off` are the gate; the pitch comes with
+    // `note_change`, once when a note starts and again on every slide.
+    on acid_note_on(n) claim {
+        gate = 1
+        accent = n.velocity
+    }
+    on acid_note_change(n) {
+        pitch = n.pitch
+        // Glide into a slide; jump to a fresh note.
+        glide = if n.slide { 60ms } else { 0ms }
+    }
+    on acid_note_off release {
+        gate = 0
+    }
+
+    // The glide moves in semitones, so it takes as long up as down.
+    let semitones = slew((pitch - C2) / 1st, glide, glide)
+    let freq = (C2 + semitones * 1st) |> equal
+
+    let sweep = ahdsr(gate, attack: 1ms, decay: 180ms, sustain: 0, release: 30ms)
+    let cutoff = 180Hz + sweep * (900Hz + accent * 2.5kHz)
+    let amp = ahdsr(gate, attack: 2ms, decay: 300ms, sustain: .7, release: 40ms)
+
+    return lowpass(saw(freq), cutoff, resonance: .8) * amp * (.4 + accent * .4)
+}
+
+rill main(volume: Gain = -8dB) [Sample; 2] {
+    on start {
+        invoke acid
+    }
+
+    let x = bass()
+    return [x, x] + volume
+}

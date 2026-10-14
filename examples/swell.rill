@@ -1,0 +1,54 @@
+// Pads that swell: each chord is held for four steps while its pressure
+// rises, the way pressing harder into the keys would. Pressure opens the
+// filter and brings the level up; timbre spreads the two oscillators.
+//
+// `~` on its own goes on with the notes before it; `@p.4` there sets their
+// pressure, which reaches the voices as a `note_change`.
+
+import "@gen/osc"
+import "@effects/env"
+import "@effects/filter"
+import "@mix/stereo"
+
+seq pads(step: 1/4, tempo: 70bpm, gate: 1, release: .3, loop: true) {
+    [C3, G3, D#4]@p0t.2, ~@p.4, ~@p.8, ~@p1,
+    [G#2, D#3, C4]@p.2t.8, ~@p.5, ~@p.9, ~@p.6,
+}
+
+rill voice() [Sample; 2] {
+    state pitch: Pitch = C3
+    state gate: Float = 0
+    state press: Float = 0
+    state spread: Float = 0
+
+    on pads_note_on claim {
+        gate = 1
+    }
+    on pads_note_change(n) {
+        pitch = n.pitch
+        press = n.pressure
+        spread = n.timbre
+    }
+    on pads_note_off release {
+        gate = 0
+    }
+
+    // Pressure moves a step at a time; this turns the steps into a swell.
+    let p = slew(press, 400ms, 400ms)
+
+    let freq = pitch |> equal
+    let osc = saw(freq) + saw(freq * (1 + spread * .008), offset: .5)
+    let amp = ahdsr(gate, attack: 300ms, decay: 0ms, sustain: 1, release: 800ms)
+    let shaped = lowpass(osc, 300Hz + p * 2.5kHz, resonance: .2)
+
+    // Lower notes a little to the left, higher ones to the right.
+    return pan(shaped * amp * (.15 + p * .15), (pitch - C4) / 12st * .4)
+}
+
+rill main(volume: Gain = -10dB) [Sample; 2] {
+    on start {
+        invoke pads
+    }
+
+    return sum([voice(); 6]) + volume
+}

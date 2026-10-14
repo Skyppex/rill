@@ -237,7 +237,21 @@ rill synth() Sample {
 | --- | --- | --- |
 | `note_on` | `NoteOn` | `pitch: Pitch`, `velocity: Float` (0–1), `instance: Int` |
 | `note_off` | `NoteOff` | `pitch: Pitch`, `release: Float` (0–1), `instance: Int` |
+| `note_change` | `NoteChange` | `pitch: Pitch`, `pressure: Float` (0–1), `timbre: Float` (0–1), `slide: Bool`, `instance: Int`, `from: Pitch` |
 | `control_change` | `Float` | the value, as sent |
+
+A note is split in two, the way a voice uses it:
+
+- **`note_on` and `note_off` are the gate:** a key going down and how hard, a key coming up and how fast. `note_on` still says which pitch, for telling notes apart.
+- **`note_change` is the note's state:** its pitch, pressure (aftertouch) and timbre (MPE's third dimension). It comes right after every `note_on`, with the note's starting values and `slide` false, and again whenever one of them changes while the note is held (`slide` true). `from` is the pitch the note was held at, which says which note changes; a host sending one without `from` changes the note at its own pitch. A host's notes start with pressure 0 and timbre 0.5.
+
+So a voice keeps its pitch in one handler, and can tell a fresh note (jump) from a slide (glide):
+
+```rill
+on keys_on(n) claim { gate = 1; level = n.velocity }
+on keys_change(n) { pitch = n.pitch; glide = if n.slide { 40ms } else { 0ms } }
+on keys_off release { gate = 0 }
+```
 
 Rules:
 
@@ -246,7 +260,7 @@ Rules:
 - An incoming event runs the handlers of every declaration it matches, in declaration order. A host can also send straight to a declaration by name, skipping its filters; tests and the sequencer do that.
 - `on NAME(param)` takes at most one parameter, typed by the event's kind whatever it is called; `on NAME { ... }` ignores the payload. Each payload has only its own kind's fields: `note.release` in a `note_on` handler is an error.
 - Handlers live in rills. Every instance handles the event, so a lifted rill reacts once per copy.
-- Pitch bend, aftertouch and any other controller are control changes on their own channel.
+- Per-note pitch, pressure (aftertouch) and timbre are `note_change`s. Channel-wide pitch bend and any other controller are control changes on their own channel.
 - A declaration nothing handles is a warning.
 - `on start { ... }` is built in: it runs once, before the first sample, in every rill instance that has it.
 
@@ -331,10 +345,11 @@ For `seq riff`, these events exist without being declared. The name says what ha
 | `riff_rest` | a step without notes | `instance`, `step`, `pass` |
 | `riff_note_on` | a note starts | `pitch`, `velocity`, `instance` (a `NoteOn`) |
 | `riff_note_off` | a note ends | `pitch`, `release`, `instance` (a `NoteOff`) |
+| `riff_note_change` | right after each `note_on`, with its starting values | a `NoteChange` |
 
 - Everything counts from 1. Every start is followed, eventually, by exactly one of the three stops and then `end`; reaching the last step is not stopping, and a looping sequence only stops when halted or replaced.
 - **Bars and beats** follow the meter and count from the start of each pass: step 1 is always bar 1, beat 1. A beat can fall between steps (`step: 3/16` in 4/4). A pattern that does not fill its last bar ends on a short bar. After `trigger N`, the first beat is the next one in the pattern, or at once if step N starts one.
-- **Order in one sample:** note-offs; a stop and `end`; `start` or `repeated`; `bar`; `beat`; `step`; `rest`; note-ons. So a step's handler sees the notes before it already released.
+- **Order in one sample:** note-offs; a stop and `end`; `start` or `repeated`; `bar`; `beat`; `step`; `rest`; note-ons, each followed by its `note_change`. So a step's handler sees the notes before it already released.
 - They are ordinary events: `claim` and `release` work on the note events, plain handlers run in every voice. They cannot be invoked, and a written event cannot take one of their names. Declarations can still filter a sequence's notes, as in `event lead note_on(sender: riff, channel: 2)`; one with no `sender` hears every sequence and the host.
 - A handler that could start again what runs it, in the same sample, is an error: `on riff_start { invoke riff }` would never end. Starting, the first step and its notes happen at once; so do the note-offs, `halted` and `end` of a `halt` or a restarting `trigger`. Later events (`finished`, `repeated`, later steps) are fine: `on riff_finished { invoke riff }` plays it again and again.
 
@@ -378,6 +393,7 @@ rill lead() Sample {
 ```
 
 - `on EVENT claim { ... }` (on a `note_on` event) runs in **one** copy, which then holds the note. `on EVENT release { ... }` (on a `note_off` event) runs only in the copy holding a note with the same pitch, sender and instance.
+- A `note_change` handler runs only in the copy holding the note it changes (the one at `from`), without a keyword; that copy then holds the note at its new pitch, so the `note_off` that comes later finds it.
 - A released copy stays busy while it still makes sound: it is free once its output has stayed below -90dB for its tail, 100ms unless `claim(tail: 2s)` says otherwise. Effects inside the voice (a reverb tail) keep it busy; effects after the pool do not.
 - A new note goes to a free copy; else the copy released longest ago; else the one that has held its note longest.
 - Plain `on` handlers run in every copy, as before. Outside a pool, `claim` and `release` behave like plain handlers.

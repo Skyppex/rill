@@ -283,6 +283,7 @@ fn fallback(code: &Code) -> Option<String> {
             i,
             Instr::InvokeSeq { .. }
                 | Instr::InvokeEvent { .. }
+                | Instr::EventArg { .. }
                 | Instr::Halt { .. }
                 | Instr::SetSlot { .. }
         )

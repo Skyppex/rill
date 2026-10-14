@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::denormal::FlushDenormals;
-use crate::event::{Dispatch, Event, EventDecl, EventId, Payload, Sender};
+use crate::event::{Dispatch, Event, EventDecl, EventId, EventKind, Payload, Sender};
 use crate::format::OutSample;
 use crate::graph::{Graph, Input, Output};
 use crate::node::{Context, Inputs, Node, Outputs, Port};
@@ -509,7 +509,20 @@ impl Engine {
 
     /// Run the handlers of every declaration `event` matches, in
     /// declaration order. Returns whether any ran.
+    /// A `note_on` is followed by its `note_change`, from the same sender
+    /// and channel, with the note's pitch (see [`Payload::starting_change`]).
     pub fn send(&mut self, event: &Event) -> bool {
+        let mut handled = self.send_one(event);
+        if let Some(change) = event.payload.starting_change() {
+            handled |= self.send_one(&Event {
+                payload: change,
+                ..*event
+            });
+        }
+        handled
+    }
+
+    fn send_one(&mut self, event: &Event) -> bool {
         let mut handled = false;
         for i in 0..self.events.len() {
             if self.events[i].matches(event) {
@@ -524,12 +537,28 @@ impl Engine {
     /// Returns `false` if there is no such event, the payload is of another
     /// kind, or nothing handles it.
     /// It counts as sent by host sender 0.
+    ///
+    /// A `note_on` is followed by its `note_change`, sent to every
+    /// `note_change` declaration with the same filters: what the same
+    /// sender would have made.
     pub fn send_to(&mut self, id: EventId, payload: Payload) -> bool {
-        match self.events.get(usize::from(id.0)) {
-            Some(decl) if decl.kind == payload.kind() => {}
+        let decl = match self.events.get(usize::from(id.0)) {
+            Some(decl) if decl.kind == payload.kind() => decl.clone(),
             _ => return false,
+        };
+        let mut handled = self.deliver(id, payload, Sender::Host(0));
+        if let Some(change) = payload.starting_change() {
+            for i in 0..self.events.len() {
+                let d = &self.events[i];
+                if d.kind == EventKind::NoteChange
+                    && d.sender == decl.sender
+                    && d.channel == decl.channel
+                {
+                    handled |= self.deliver(EventId(i as u16), change, Sender::Host(0));
+                }
+            }
         }
-        self.deliver(id, payload, Sender::Host(0))
+        handled
     }
 
     fn deliver(&mut self, id: EventId, payload: Payload, from: Sender) -> bool {

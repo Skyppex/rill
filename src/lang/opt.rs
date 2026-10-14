@@ -69,6 +69,7 @@ pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(Reg)) {
         | Instr::Jump { .. }
         | Instr::InvokeSeq { .. }
         | Instr::InvokeEvent { .. }
+        | Instr::EventArg { .. }
         | Instr::Halt { .. }
         | Instr::SetSlot { .. }
         | Instr::Vector { .. } => {}
@@ -102,7 +103,8 @@ pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(Reg)) {
             op(b);
         }
         Instr::JumpUnless { cond, .. } => op(cond),
-        Instr::InvokeEvent { values, .. } => values.into_iter().for_each(op),
+        Instr::EventArg { value, .. } => op(value),
+        Instr::InvokeEvent { .. } => {}
         Instr::Halt { id, .. } => id.into_iter().for_each(op),
         Instr::SetSlot { value, .. } => op(value),
         Instr::DelayRead { time, .. } => op(time),

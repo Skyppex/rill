@@ -12,12 +12,17 @@ use std::fmt;
 use crate::lang::types::Type;
 use crate::lang::value::Value;
 
-/// The kinds of event. The first three can be declared and sent by hosts;
+/// The kinds of event. The first four can be declared and sent by hosts;
 /// the rest are made by sequences only (see [`EventKind::SEQ`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EventKind {
+    /// A key goes down: the gate opens.
     NoteOn,
+    /// A key comes up: the gate closes.
     NoteOff,
+    /// A held note's pitch, pressure or timbre changes; also sent right
+    /// after every `note_on`, with its starting values.
+    NoteChange,
     ControlChange,
     /// An instance starts playing.
     Start,
@@ -40,17 +45,19 @@ pub enum EventKind {
 
 impl EventKind {
     /// The kinds a program can declare, as in `event keys note_on`.
-    pub const ALL: [EventKind; 3] = [
+    pub const ALL: [EventKind; 4] = [
         EventKind::NoteOn,
         EventKind::NoteOff,
+        EventKind::NoteChange,
         EventKind::ControlChange,
     ];
 
     /// The events every sequence makes, named after it: `riff_note_on`,
     /// `riff_start` and so on (see [`EventKind::suffix`]).
-    pub const SEQ: [EventKind; 12] = [
+    pub const SEQ: [EventKind; 13] = [
         EventKind::NoteOn,
         EventKind::NoteOff,
+        EventKind::NoteChange,
         EventKind::Start,
         EventKind::Finished,
         EventKind::Halted,
@@ -69,6 +76,7 @@ impl EventKind {
         match self {
             EventKind::NoteOn => "note_on",
             EventKind::NoteOff => "note_off",
+            EventKind::NoteChange => "note_change",
             EventKind::ControlChange => "control_change",
             EventKind::Start => "seq_start",
             EventKind::Finished => "seq_finished",
@@ -94,6 +102,7 @@ impl EventKind {
         match self {
             EventKind::NoteOn => "NoteOn",
             EventKind::NoteOff => "NoteOff",
+            EventKind::NoteChange => "NoteChange",
             EventKind::ControlChange => "Float",
             EventKind::Start => "SeqStart",
             EventKind::Finished => "SeqFinished",
@@ -123,6 +132,7 @@ impl EventKind {
         match self {
             EventKind::NoteOn => &["pitch", "velocity", "instance"],
             EventKind::NoteOff => &["pitch", "release", "instance"],
+            EventKind::NoteChange => &["pitch", "pressure", "timbre", "slide", "instance", "from"],
             EventKind::ControlChange => &["value"],
             EventKind::Start
             | EventKind::Finished
@@ -143,11 +153,20 @@ impl fmt::Display for EventKind {
     }
 }
 
-/// The most values a payload has.
-pub const MAX_FIELDS: usize = 4;
+/// The most values a payload has: a `note_change`'s.
+pub const MAX_FIELDS: usize = 6;
+
+/// The most values an event only sequences make has.
+pub const SEQ_FIELDS: usize = 4;
+
+/// A `note_change`'s values that a host leaves out: no pressure, timbre in
+/// the middle.
+pub const DEFAULT_PRESSURE: f32 = 0.0;
+pub const DEFAULT_TIMBRE: f32 = 0.5;
 
 /// What happened. Pitches are Rill `Pitch` values, which count semitones
-/// like MIDI note numbers (A4 is 69); velocities and releases are 0–1.
+/// like MIDI note numbers (A4 is 69); velocities, releases, pressures and
+/// timbres are 0–1.
 /// `instance` is the id of the sequence instance that played a note, and 0
 /// for notes from the host. A control change's value is passed on as it is.
 /// The events only sequences make carry whole numbers, in
@@ -164,10 +183,21 @@ pub enum Payload {
         release: f32,
         instance: i32,
     },
+    /// The held note at `from` is now at `pitch`, with this pressure and
+    /// timbre. `slide` is whether it was sounding already: false for the
+    /// change that comes with a `note_on`.
+    NoteChange {
+        pitch: f32,
+        pressure: f32,
+        timbre: f32,
+        slide: bool,
+        instance: i32,
+        from: f32,
+    },
     Control(f32),
     Seq {
         kind: EventKind,
-        values: [i32; MAX_FIELDS],
+        values: [i32; SEQ_FIELDS],
     },
 }
 
@@ -176,6 +206,7 @@ impl Payload {
         match self {
             Payload::NoteOn { .. } => EventKind::NoteOn,
             Payload::NoteOff { .. } => EventKind::NoteOff,
+            Payload::NoteChange { .. } => EventKind::NoteChange,
             Payload::Control(_) => EventKind::ControlChange,
             Payload::Seq { kind, .. } => *kind,
         }
@@ -188,14 +219,32 @@ impl Payload {
                 pitch,
                 velocity,
                 instance,
-            } => [pitch, velocity, instance as f32, 0.0],
+            } => [pitch, velocity, instance as f32, 0.0, 0.0, 0.0],
             Payload::NoteOff {
                 pitch,
                 release,
                 instance,
-            } => [pitch, release, instance as f32, 0.0],
-            Payload::Control(value) => [value, 0.0, 0.0, 0.0],
-            Payload::Seq { values, .. } => values.map(|v| v as f32),
+            } => [pitch, release, instance as f32, 0.0, 0.0, 0.0],
+            Payload::NoteChange {
+                pitch,
+                pressure,
+                timbre,
+                slide,
+                instance,
+                from,
+            } => [
+                pitch,
+                pressure,
+                timbre,
+                f32::from(u8::from(slide)),
+                instance as f32,
+                from,
+            ],
+            Payload::Control(value) => [value, 0.0, 0.0, 0.0, 0.0, 0.0],
+            Payload::Seq {
+                values: [a, b, c, d],
+                ..
+            } => [a as f32, b as f32, c as f32, d as f32, 0.0, 0.0],
         }
     }
 
@@ -213,15 +262,24 @@ impl Payload {
                 release: values[1],
                 instance: values[2] as i32,
             },
+            EventKind::NoteChange => Payload::NoteChange {
+                pitch: values[0],
+                pressure: values[1],
+                timbre: values[2],
+                slide: values[3] != 0.0,
+                instance: values[4] as i32,
+                from: values[5],
+            },
             EventKind::ControlChange => Payload::Control(values[0]),
             kind => Payload::Seq {
                 kind,
-                values: values.map(|v| v as i32),
+                values: [0, 1, 2, 3].map(|i| values[i] as i32),
             },
         }
     }
 
-    /// The pitch and instance of a note, for telling notes apart.
+    /// The pitch and instance of a note, for telling notes apart. For a
+    /// `note_change`, the note it changes: the pitch it is held at.
     pub fn note(&self) -> Option<(f32, i32)> {
         match *self {
             Payload::NoteOn {
@@ -230,7 +288,26 @@ impl Payload {
             | Payload::NoteOff {
                 pitch, instance, ..
             } => Some((pitch, instance)),
+            Payload::NoteChange { from, instance, .. } => Some((from, instance)),
             Payload::Control(_) | Payload::Seq { .. } => None,
+        }
+    }
+
+    /// The `note_change` that follows a `note_on` from a host: its pitch,
+    /// with no pressure and timbre in the middle.
+    pub fn starting_change(&self) -> Option<Payload> {
+        match *self {
+            Payload::NoteOn {
+                pitch, instance, ..
+            } => Some(Payload::NoteChange {
+                pitch,
+                pressure: DEFAULT_PRESSURE,
+                timbre: DEFAULT_TIMBRE,
+                slide: false,
+                instance,
+                from: pitch,
+            }),
+            _ => None,
         }
     }
 }
@@ -318,13 +395,17 @@ pub fn parse_dispatch(
         },
     };
     let mut values = [0.0f32; MAX_FIELDS];
+    if kind == EventKind::NoteChange {
+        values[1] = DEFAULT_PRESSURE;
+        values[2] = DEFAULT_TIMBRE;
+        values[5] = f32::NAN;
+    }
     let (mut sender, mut channel) = (0u32, 0u32);
     for (name, value) in fields {
         // A pitch is a `Pitch`; every other field a plain number.
-        let ty = if name == "pitch" {
-            Type::Pitch
-        } else {
-            Type::Float
+        let ty = match name.as_str() {
+            "pitch" | "from" => Type::Pitch,
+            _ => Type::Float,
         };
         let value = &value
             .resolve(Some(&ty))
@@ -354,6 +435,11 @@ pub fn parse_dispatch(
                 }
             },
         }
+    }
+    // The pitch the changed note is held at: its own pitch if left out (a
+    // change of pressure or timbre only).
+    if kind == EventKind::NoteChange && values[5].is_nan() {
+        values[5] = values[0];
     }
     let payload = Payload::from_values(kind, values);
     Ok(match to {
@@ -456,5 +542,35 @@ mod tests {
         );
         let unit = parse_dispatch(&decls(), "keys", &written("velocity", "-6dB")).unwrap_err();
         assert!(unit.starts_with("`velocity`: "), "{unit}");
+        // A change names the note it changes by `from`; without it, its
+        // own pitch.
+        let fields = |xs: &[(&str, &str)]| -> Vec<(String, Value)> {
+            xs.iter()
+                .map(|(f, v)| ((*f).to_owned(), Value::parse(v).unwrap()))
+                .collect()
+        };
+        let change = |xs: &[(&str, &str)]| match parse_dispatch(&[], "note_change", &fields(xs)) {
+            Ok(Dispatch::Incoming(Event { payload, .. })) => payload,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            change(&[("from", "C2"), ("pitch", "D2")]),
+            Payload::NoteChange {
+                pitch: 38.0,
+                pressure: DEFAULT_PRESSURE,
+                timbre: DEFAULT_TIMBRE,
+                slide: false,
+                instance: 0,
+                from: 36.0,
+            }
+        );
+        assert!(matches!(
+            change(&[("pitch", "D2"), ("pressure", ".5")]),
+            Payload::NoteChange {
+                from: 38.0,
+                pressure: 0.5,
+                ..
+            }
+        ));
     }
 }

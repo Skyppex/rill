@@ -1685,6 +1685,8 @@ impl<'a> Compiler<'a> {
             self.bind(&param.name, value, false);
         }
         let mode = match mode {
+            // A change goes to the copy holding the note it changes.
+            HandlerMode::Plain if kind == Some(EventKind::NoteChange) => Mode::Held,
             HandlerMode::Plain => Mode::Plain,
             HandlerMode::Release => Mode::Release,
             HandlerMode::Claim { tail } => {
@@ -1778,15 +1780,33 @@ impl<'a> Compiler<'a> {
         args: &[Arg],
     ) -> CResult<CVal> {
         if let Some((event, kind)) = self.defs.event_at(target.span) {
-            let mut values = [Operand::Const(0.0); 3];
+            let fields = kind.fields();
+            let mut values: Vec<Option<Operand>> = vec![None; fields.len()];
             for a in args {
                 let Some(name) = &a.name else { continue };
                 let v = self.expr(&a.value)?.scalar();
-                if let Some(i) = kind.fields().iter().position(|f| *f == name.name) {
-                    values[i] = v;
+                if let Some(i) = fields.iter().position(|f| *f == name.name) {
+                    values[i] = Some(v);
                 }
             }
-            self.emit(Instr::InvokeEvent { event, values });
+            for (i, v) in values.iter().enumerate() {
+                let value = v.unwrap_or_else(|| match (kind, fields[i]) {
+                    (EventKind::NoteChange, "timbre") => {
+                        Operand::Const(crate::event::DEFAULT_TIMBRE)
+                    }
+                    (EventKind::NoteChange, "pressure") => {
+                        Operand::Const(crate::event::DEFAULT_PRESSURE)
+                    }
+                    // The note it changes: its own pitch, unless it says.
+                    (EventKind::NoteChange, "from") => values[0].unwrap_or(Operand::Const(0.0)),
+                    _ => Operand::Const(0.0),
+                });
+                self.emit(Instr::EventArg {
+                    index: i as u8,
+                    value,
+                });
+            }
+            self.emit(Instr::InvokeEvent { event });
             return Ok(CVal::unit());
         }
         let seq = self

@@ -289,7 +289,7 @@ fn what(i: &Instr) -> &'static str {
         Instr::Want { .. } => "checks a ceiling (a growing max)",
         Instr::InvokeSeq { .. } => "starts a sequence",
         Instr::Halt { .. } => "stops a sequence",
-        Instr::InvokeEvent { .. } => "sends an event",
+        Instr::InvokeEvent { .. } | Instr::EventArg { .. } => "sends an event",
         Instr::LoadCapture { .. } | Instr::SetSlot { .. } => "follows a playing sequence",
         Instr::Vector { .. } => "holds copies that already run together",
         Instr::Sum { .. } => "sums",
@@ -998,7 +998,8 @@ fn rename(code: &mut Code, map: &HashMap<Reg, Reg>) {
             op(b);
         }
         Instr::JumpUnless { cond, .. } => op(cond),
-        Instr::InvokeEvent { values, .. } => values.iter_mut().for_each(op),
+        Instr::EventArg { value, .. } => op(value),
+        Instr::InvokeEvent { .. } => {}
         Instr::Halt { id, .. } => {
             if let Some(id) = id {
                 op(id);

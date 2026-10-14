@@ -1135,13 +1135,14 @@ impl Checker {
         // instance. Later events (later steps, repeats, finishing) cannot
         // loop within one sample; replacing an instance can, but never one
         // started in the same sample, so it ends.
-        const AT_START: [EventKind; 6] = [
+        const AT_START: [EventKind; 7] = [
             EventKind::Start,
             EventKind::Bar,
             EventKind::Beat,
             EventKind::Step,
             EventKind::Rest,
             EventKind::NoteOn,
+            EventKind::NoteChange,
         ];
         const AT_STOP: [EventKind; 3] = [EventKind::NoteOff, EventKind::Halted, EventKind::End];
         for j in 0..program.seqs.len() {
@@ -4736,9 +4737,16 @@ const SEQ_SETTINGS: &str =
 /// The type of field `name` of an event payload of kind `kind`.
 fn event_field_type(kind: EventKind, name: &str) -> Option<Type> {
     match (kind, name) {
-        (EventKind::NoteOn | EventKind::NoteOff, "pitch") => Some(Type::Pitch),
-        (EventKind::NoteOn | EventKind::NoteOff, "instance") => Some(Type::Int),
+        (EventKind::NoteOn | EventKind::NoteOff | EventKind::NoteChange, "pitch") => {
+            Some(Type::Pitch)
+        }
+        (EventKind::NoteOn | EventKind::NoteOff | EventKind::NoteChange, "instance") => {
+            Some(Type::Int)
+        }
         (EventKind::NoteOn, "velocity") | (EventKind::NoteOff, "release") => Some(Type::Float),
+        (EventKind::NoteChange, "pressure" | "timbre") => Some(Type::Float),
+        (EventKind::NoteChange, "slide") => Some(Type::Bool),
+        (EventKind::NoteChange, "from") => Some(Type::Pitch),
         // The events sequences make carry whole numbers.
         (kind, name) if kind.is_seq_only() && kind.fields().contains(&name) => Some(Type::Int),
         _ => None,

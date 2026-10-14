@@ -25,7 +25,7 @@ rill main(volume: Gain = -12dB) [Sample; 2] {
         + 0.5
     )
 
-    let voices = [C3, G3, E4]
+    let voices = [C3, G3, D#4]
         |> just(C, 440Hz)
         // |> equal
         |> sine // [Sample; 3]

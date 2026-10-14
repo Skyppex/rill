@@ -66,11 +66,16 @@ pub enum Instr {
     InvokeSeq {
         call: u16,
     },
-    /// Send the declared event `event`, with its payload's values in
+    /// Set value `index` of the next event sent, in
     /// [`EventKind::fields`](crate::event::EventKind::fields) order.
+    EventArg {
+        index: u8,
+        value: Operand,
+    },
+    /// Send the declared event `event`, with the values its
+    /// [`Instr::EventArg`]s set.
     InvokeEvent {
         event: EventId,
-        values: [Operand; 3],
     },
     /// Stop instance `id` of sequence `seq`, or all of them.
     Halt {
@@ -594,6 +599,9 @@ pub enum Mode {
     },
     /// Runs in the copy holding the note.
     Release,
+    /// Runs in the copy holding the note, which takes the new pitch: a
+    /// `note_change`.
+    Held,
 }
 
 /// One `on` handler: the code to run when what it handles happens.
@@ -731,13 +739,8 @@ fn list(s: &mut String, instrs: &[Instr]) {
             Instr::JumpUnless { cond, target } => format!("unless {} goto {target}", op(cond)),
             Instr::Jump { target } => format!("goto {target}"),
             Instr::InvokeSeq { call } => format!("invoke call {call}"),
-            Instr::InvokeEvent { event, values } => format!(
-                "invoke event {} {} {} {}",
-                event.0,
-                op(&values[0]),
-                op(&values[1]),
-                op(&values[2])
-            ),
+            Instr::EventArg { index, value } => format!("event arg {index} = {}", op(value)),
+            Instr::InvokeEvent { event } => format!("invoke event {}", event.0),
             Instr::Halt { seq, id } => {
                 format!("halt seq {seq} {}", id.as_ref().map_or("all".into(), op))
             }
@@ -821,6 +824,8 @@ struct Slot {
     rest_sent: bool,
     /// `finished` has been sent; `end` comes next.
     finishing: bool,
+    /// The `note_change` that follows the `note_on` just sent.
+    change: Option<Payload>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -881,6 +886,9 @@ struct Run {
     /// Per ceiling, the most a value has asked of it, as `f32` bits; read
     /// by [`crate::live::Live`] on another thread.
     wants: std::sync::Arc<[std::sync::atomic::AtomicU32]>,
+    /// The values of the next event a handler sends (see
+    /// [`Instr::EventArg`]).
+    event_args: [f32; crate::event::MAX_FIELDS],
 }
 
 impl Run {
@@ -1273,6 +1281,7 @@ impl Program {
                 delivery: 0,
                 wanted,
                 noise: code.noises.clone(),
+                event_args: [0.0; crate::event::MAX_FIELDS],
                 wants: (0..code.ceilings.len())
                     .map(|_| std::sync::atomic::AtomicU32::new(0))
                     .collect(),
@@ -1343,6 +1352,9 @@ impl Program {
                 }
                 (Mode::Release, Some((pool, copy)), Some(payload)) => {
                     self.release(pool, from, &payload) == Some(copy)
+                }
+                (Mode::Held, Some((pool, copy)), Some(payload)) => {
+                    self.change(pool, from, &payload) == Some(copy)
                 }
                 _ => true,
             };
@@ -1427,6 +1439,39 @@ impl Program {
             voices[c].state = VoiceState::Releasing;
             voices[c].since = self.run.now;
             voices[c].silent = 0;
+        }
+        let pick = copy.map(|c| c as u16);
+        self.run.picks[p] = (self.run.delivery, pick);
+        pick
+    }
+
+    /// The copy of `pool` holding the note `payload` changes, which then
+    /// holds it at its new pitch. Of two holding the same note, the one
+    /// that took it last: the one a `note_on` just claimed.
+    fn change(&mut self, pool: u16, from: Sender, payload: &Payload) -> Option<u16> {
+        let p = usize::from(pool);
+        let (stamp, pick) = self.run.picks[p];
+        if stamp == self.run.delivery {
+            return pick;
+        }
+        let (held, instance) = payload.note()?;
+        let Payload::NoteChange { pitch, .. } = *payload else {
+            return None;
+        };
+        let voices = &mut self.run.voices[p];
+        let copy = voices
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| {
+                v.state == VoiceState::Holding
+                    && v.from == from
+                    && v.pitch == held
+                    && v.instance == instance
+            })
+            .max_by_key(|(_, v)| v.since)
+            .map(|(i, _)| i);
+        if let Some(c) = copy {
+            voices[c].pitch = pitch;
         }
         let pick = copy.map(|c| c as u16);
         self.run.picks[p] = (self.run.delivery, pick);
@@ -1666,6 +1711,10 @@ fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
         if !slot.active {
             return None;
         }
+        // A note's starting values come right after it starts.
+        if let Some(change) = slot.change.take() {
+            return Some(change);
+        }
         let (id, pos, pass) = (slot.id, slot.pos, slot.pass as i32);
         let seq = |kind, values| Some(Payload::Seq { kind, values });
         if let Some(h) = slot.held.iter().position(|&(_, off)| off <= pos + EPS) {
@@ -1750,11 +1799,13 @@ fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
             slot.chord += 1;
             let gate = f64::from(slot.values[GATE].clamp(1e-6, 1.0));
             slot.held.push((pitch, step_at + gate * sb));
-            return Some(Payload::NoteOn {
+            let on = Payload::NoteOn {
                 pitch,
                 velocity: step.velocity.unwrap_or(slot.values[VELOCITY]),
                 instance: id,
-            });
+            };
+            slot.change = on.starting_change();
+            return Some(on);
         }
         slot.next += 1;
         slot.chord = 0;
@@ -2340,10 +2391,12 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
             run_vector(&code.vectors[block as usize], regs, state);
         }
         Instr::InvokeSeq { call } => invoke(call, code, run),
-        Instr::InvokeEvent { event, values } => {
+        Instr::EventArg { index, value } => {
+            run.event_args[usize::from(index)] = val(regs, value);
+        }
+        Instr::InvokeEvent { event } => {
             let kind = code.decls[usize::from(event.0)].kind;
-            let [a, b, c] = values.map(|v| val(regs, v));
-            let payload = Payload::from_values(kind, [a, b, c, 0.0]);
+            let payload = Payload::from_values(kind, run.event_args);
             run.queue
                 .push_back(Pending::To(event, payload, Sender::Host(0)));
         }
@@ -2525,6 +2578,7 @@ fn invoke(call_index: u16, code: &Code, run: &mut Run) {
     slot.step_sent = false;
     slot.rest_sent = false;
     slot.finishing = false;
+    slot.change = None;
     run.send(
         seq,
         Payload::Seq {
@@ -2967,6 +3021,7 @@ fn copy_slot(dst: &mut Slot, src: &Slot) {
     dst.step_sent = src.step_sent;
     dst.rest_sent = src.rest_sent;
     dst.finishing = src.finishing;
+    dst.change = src.change;
     dst.captures.clear();
     let room = dst.captures.capacity();
     dst.captures.extend(src.captures.iter().take(room));

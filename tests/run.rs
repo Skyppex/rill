@@ -217,7 +217,10 @@ fn events_inside_segments_land_on_their_sample_in_stages() {
     let run = |stream: bool| {
         let mut engine = engine_streaming(src, 2, stream);
         let mut all = Vec::new();
-        for (k, at) in [0usize, 1, 37, 63, 64, 65, 200, 255].into_iter().enumerate() {
+        for (k, at) in [0usize, 1, 37, 63, 64, 65, 200, 255]
+            .into_iter()
+            .enumerate()
+        {
             let mut out = [0.0f32; 512];
             let gain = ParamEvent {
                 frame_offset: (at + 13) % 256,
@@ -1593,6 +1596,139 @@ fn claimed_notes_go_to_one_voice_each() {
     // With everything held, the oldest note is stolen.
     key(&mut engine, true, e4);
     assert_eq!(voices(&mut engine), [5.0, 8.0]);
+}
+
+/// Voices that take their pitch from `note_change` only.
+const CHANGING: &str = "
+event keys_on note_on(sender: 1)
+event keys_off note_off(sender: 1)
+event keys_change note_change(sender: 1)
+rill voice() [Sample; 3] {
+    state pitch: Float = 0
+    state gate: Float = 0
+    state slid: Float = 0
+    state press: Float = 0
+    on keys_on claim { gate = 1 }
+    on keys_change(n) {
+        pitch = (n.pitch - C4) / 1st + 1
+        slid = if n.slide { 1 } else { 0 }
+        press = n.pressure
+    }
+    on keys_off release { gate = 0 }
+    return [pitch * gate, slid, press]
+}
+rill main() [Sample; 6] {
+    let v = [voice(); 2]
+    return [v[0][0], v[0][1], v[0][2], v[1][0], v[1][1], v[1][2]]
+}
+";
+
+fn change(engine: &mut Engine, from: f32, pitch: f32, pressure: f32) {
+    engine.send(&Event {
+        sender: 1,
+        channel: 0,
+        payload: Payload::NoteChange {
+            pitch,
+            pressure,
+            timbre: 0.5,
+            slide: true,
+            instance: 0,
+            from,
+        },
+    });
+}
+
+#[test]
+fn a_note_on_brings_its_pitch_in_a_note_change() {
+    let src = "
+        event keys_on note_on(sender: 1)
+        event keys_change note_change(sender: 1)
+        rill main() [Sample; 4] {
+            state pitch: Float = 0
+            state slid: Float = -1
+            state timbre: Float = 0
+            state from: Float = 0
+            on keys_change(n) {
+                pitch = (n.pitch - C4) / 1st + 60
+                slid = if n.slide { 1 } else { 0 }
+                timbre = n.timbre
+                from = (n.from - C4) / 1st + 60
+            }
+            return [pitch, slid, timbre, from]
+        }
+    ";
+    let mut engine = Engine::new(graph(src, 4), config(4)).unwrap();
+    key(&mut engine, true, 62.0);
+    let mut out = [0.0f32; 4];
+    engine.render_interleaved(&mut out);
+    // Its own pitch, not a slide, timbre in the middle.
+    assert_eq!(out, [62.0, 0.0, 0.5, 62.0]);
+}
+
+#[test]
+fn a_note_change_goes_to_the_voice_holding_the_note() {
+    let mut engine = Engine::new(graph(CHANGING, 6), config(6)).unwrap();
+    let frame = |engine: &mut Engine| {
+        let mut out = [0.0f32; 6];
+        engine.render_interleaved(&mut out);
+        out
+    };
+    let (c4, e4, g4) = (60.0, 64.0, 67.0);
+    key(&mut engine, true, c4);
+    key(&mut engine, true, e4);
+    assert_eq!(frame(&mut engine), [1.0, 0.0, 0.0, 5.0, 0.0, 0.0]);
+    // E4 slides to G4 with pressure: only its voice hears it.
+    change(&mut engine, e4, g4, 0.75);
+    assert_eq!(frame(&mut engine), [1.0, 0.0, 0.0, 8.0, 1.0, 0.75]);
+    // The voice now holds G4: a release at G4 finds it, one at E4 does not.
+    key(&mut engine, false, e4);
+    assert_eq!(frame(&mut engine)[3], 8.0);
+    key(&mut engine, false, g4);
+    assert_eq!(frame(&mut engine)[3], 0.0);
+    // A change of a note nobody holds runs nowhere.
+    change(&mut engine, 50.0, 52.0, 1.0);
+    assert_eq!(frame(&mut engine)[2], 0.0);
+}
+
+#[test]
+fn a_sequences_notes_come_with_their_changes() {
+    let src = "
+        seq riff(step: 1/4, tempo: 480bpm) { [C4, E4] }
+        rill voice() Sample {
+            state pitch: Float = 0
+            state changes: Float = 0
+            on riff_note_on claim { }
+            on riff_note_change(n) { pitch = (n.pitch - C4) / 1st + 1; changes = changes + 1 }
+            return pitch * 10 + changes
+        }
+        rill main() [Sample; 2] {
+            on start { invoke riff }
+            return [voice(); 2]
+        }
+    ";
+    // Each voice got its own note's change, once.
+    assert_eq!(render_with(src, 2, 1, Blocks::Fixed(1)), [11.0, 51.0]);
+}
+
+#[test]
+fn a_rill_can_send_a_note_change() {
+    let src = "
+        event keys_change note_change
+        rill main() [Sample; 3] {
+            state pitch: Float = 0
+            state from: Float = 0
+            state press: Float = 0
+            on start { invoke keys_change(pitch: D4, pressure: 0.5) }
+            on keys_change(n) {
+                pitch = (n.pitch - C4) / 1st + 60
+                from = (n.from - C4) / 1st + 60
+                press = n.pressure
+            }
+            return [pitch, from, press]
+        }
+    ";
+    // Without `from`, it changes the note at its own pitch.
+    assert_eq!(render_with(src, 3, 1, Blocks::Fixed(1)), [62.0, 62.0, 0.5]);
 }
 
 #[test]

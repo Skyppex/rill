@@ -25,11 +25,13 @@ rill bass() Sample {
         gate = 1
         accent = n.velocity
     }
+
     on acid_note_change(n) {
         pitch = n.pitch
         // Glide into a slide; jump to a fresh note.
         glide = if n.slide { 60ms } else { 0ms }
     }
+
     on acid_note_off release {
         gate = 0
     }
@@ -38,7 +40,14 @@ rill bass() Sample {
     let semitones = slew((pitch - C2) / 1st, glide, glide)
     let freq = (C2 + semitones * 1st) |> equal
 
-    let sweep = ahdsr(gate, attack: 1ms, decay: 180ms, sustain: 0, release: 30ms)
+    let sweep = ahdsr(
+        gate,
+        attack: 1ms,
+        decay: 180ms,
+        sustain: 0,
+        release: 30ms,
+    )
+
     let cutoff = 180Hz + sweep * (900Hz + accent * 2.5kHz)
     let amp = ahdsr(gate, attack: 2ms, decay: 300ms, sustain: .7, release: 40ms)
 

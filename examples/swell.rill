@@ -24,11 +24,13 @@ rill voice() [Sample; 2] {
     on pads_note_on claim {
         gate = 1
     }
+
     on pads_note_change(n) {
         pitch = n.pitch
         press = n.pressure
         spread = n.timbre
     }
+
     on pads_note_off release {
         gate = 0
     }

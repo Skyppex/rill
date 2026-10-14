@@ -43,10 +43,12 @@ export rill perlin(rate: Freq) Float {
     // From -0.5 to 0.5 around the middle.
     let out = from + (to - from) * fade + 0.5
     let moved = t + rate / RATE
+
     if moved >= 1 {
         behind = ahead
         ahead = next
     }
+
     t = wrap(moved)
     return out
 }

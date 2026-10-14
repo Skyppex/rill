@@ -3156,3 +3156,33 @@ fn reading_an_instance_has_its_own_errors() {
     );
     assert!(e.iter().any(|m| m.contains("only a rill can read it")), "{e:?}");
 }
+
+#[test]
+fn a_frame_of_one_is_its_element() {
+    let value = |src: &str| render(src, 1)[0];
+    assert_eq!(value("rill main() Sample { let x: [Sample; 1] = [0.5]\nreturn x }"), 0.5);
+    assert_eq!(value("rill main() [Sample; 1] { return 0.5 }"), 0.5);
+    assert_eq!(
+        value("rill main() Sample { state s: Sample = 0\ns = [0.25]\nreturn s * 2 }"),
+        0.5
+    );
+    // Into a parameter of either shape, and read back by index.
+    assert_eq!(
+        value("fn g(x: [Sample; 1]) Sample { x[0] * 2 }\nrill main() Sample { return g(0.25) }"),
+        0.5
+    );
+    assert_eq!(
+        value("fn f(x: Sample) Sample { x * 2 }\nrill main() Sample { return f([0.25]) }"),
+        0.5
+    );
+    assert_eq!(
+        value("fn n<N>(x: [Sample; N]) Sample { sum(x) * N }\nrill main() Sample { return n(0.25) }"),
+        0.25
+    );
+    assert_eq!(
+        value("rill main() Sample { let xs: [Sample; 1] = 0.5\nreturn xs[0] + xs }"),
+        1.0
+    );
+    // Two channels are not one.
+    assert!(!errors("rill main() Sample { return [0.5, 0.5] }", 1).is_empty());
+}

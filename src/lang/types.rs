@@ -231,6 +231,8 @@ impl Type {
 ///
 /// `Sample` and `Float` convert both ways, and an unsuffixed literal becomes
 /// any plain number. Units never appear or disappear implicitly.
+/// A frame of one is the same as its element, both ways: `[Sample; 1]` is a
+/// `Sample` (a mono file is one channel).
 pub fn coerces(from: &Type, to: &Type) -> bool {
     if from == to || from.is_wild() || to.is_wild() {
         return true;
@@ -240,7 +242,9 @@ pub fn coerces(from: &Type, to: &Type) -> bool {
         (Type::Float, Type::Sample) | (Type::Sample, Type::Float) => true,
         // A plain number is an amplitude factor, which is what a gain is.
         (Type::Num | Type::Sample | Type::Float, Type::Gain) => true,
-        (Type::Frame(a, n), Type::Frame(b, m)) => n == m && coerces(a, b),
+        (Type::Frame(a, n), Type::Frame(b, m)) if n == m => coerces(a, b),
+        (Type::Frame(a, Size::Const(1)), b) => coerces(a, b),
+        (a, Type::Frame(b, Size::Const(1))) => coerces(a, b),
         // A function fits where it can be called the same way: it accepts
         // what the expected type passes, and returns what it promises.
         (Type::Fn(pa, ra), Type::Fn(pb, rb)) | (Type::Rill(pa, ra), Type::Rill(pb, rb)) => {
@@ -349,7 +353,13 @@ mod tests {
         assert!(!coerces(&Type::Sample, &Type::Int));
         assert!(coerces(&frame(Type::Num, 2), &frame(Type::Sample, 2)));
         assert!(!coerces(&frame(Type::Sample, 2), &frame(Type::Sample, 3)));
-        assert!(!coerces(&Type::Sample, &frame(Type::Sample, 1)));
+        // A frame of one is its element.
+        assert!(coerces(&Type::Sample, &frame(Type::Sample, 1)));
+        assert!(coerces(&frame(Type::Num, 1), &Type::Float));
+        assert!(coerces(&frame(frame(Type::Sample, 2), 1), &frame(Type::Sample, 2)));
+        assert!(coerces(&frame(Type::Sample, 2), &frame(frame(Type::Sample, 2), 1)));
+        assert!(!coerces(&frame(Type::Sample, 2), &Type::Sample));
+        assert!(!coerces(&frame(Type::Freq, 1), &Type::Sample));
     }
 
     #[test]

@@ -4416,8 +4416,11 @@ fn unify(param: &Type, arg: &Type, subst: &mut Subst, generics: &[String]) -> bo
             true
         }
         Type::Frame(pe, psize) => {
-            let Type::Frame(ae, asize) = arg else {
-                return false;
+            // A single value is a frame of one.
+            let one = Size::Const(1);
+            let (ae, asize) = match arg {
+                Type::Frame(ae, asize) => (&**ae, asize),
+                _ => (arg, &one),
             };
             let size_ok = match psize {
                 Size::Var(v) if generics.contains(v) => match subst.sizes.get(v) {
@@ -4431,7 +4434,11 @@ fn unify(param: &Type, arg: &Type, subst: &mut Subst, generics: &[String]) -> bo
             };
             size_ok && unify(pe, ae, subst, generics)
         }
-        _ => coerces(arg, param),
+        // A frame of one is its element.
+        _ => match arg {
+            Type::Frame(ae, Size::Const(1)) => unify(param, ae, subst, generics),
+            _ => coerces(arg, param),
+        },
     }
 }
 

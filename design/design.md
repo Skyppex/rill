@@ -22,7 +22,7 @@ Design principles:
 
 **`Sample`.** A native numeric type the programmer treats as a real number nominally in \[-1.0, 1.0\]. Its storage (f32, i16, i24, i32 fixed-point, u8 on tiny targets) is chosen per target, and conversions happen at I/O. Arithmetic on `Sample` behaves the same everywhere, within the precision of the target.
 
-**Frame.** One `Sample` per channel, written `[Sample; N]`. Mono is `[Sample; 1]`, 7.1 is `[Sample; 8]`. N is part of the type and known at build time.
+**Frame.** One `Sample` per channel, written `[Sample; N]`. Mono is `[Sample; 1]`, 7.1 is `[Sample; 8]`. N is part of the type and known at build time. A frame of one is the same as its element, both ways: a `[Sample; 1]` goes wherever a `Sample` does and the other way round, and a lone value fills a `[Sample; N]` parameter with N = 1.
 
 **State.** Variables declared with `state` inside a rill persist across ticks and callbacks. Only rills have state, so all memory is visible and preallocated.
 

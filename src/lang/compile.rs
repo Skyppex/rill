@@ -1182,6 +1182,11 @@ impl<'a> Compiler<'a> {
         let Some(binding) = self.lookup_mut(name) else {
             return Err(internal(self.span, "assignment to an unknown name"));
         };
+        // A single value is a frame of one.
+        if matches!(binding.val, CVal::Scalar(_)) && index == 0 {
+            binding.val = val;
+            return Ok(());
+        }
         let CVal::Frame(xs) = &mut binding.val else {
             return Err(internal(self.span, "index assignment to a non-frame"));
         };
@@ -1229,6 +1234,12 @@ impl<'a> Compiler<'a> {
         for (name, val) in sizes {
             self.bind(&name, val, false);
         }
+        let args: Vec<CVal> = sig
+            .params
+            .iter()
+            .zip(args)
+            .map(|(p, a)| fit(&p.ty, a))
+            .collect();
         for (p, a) in sig.params.iter().zip(&args) {
             self.bind_sizes(&p.ty, a);
         }
@@ -1404,8 +1415,20 @@ impl<'a> Compiler<'a> {
                             return Err(internal(base.span, "assignment to an unknown name"));
                         };
                         let mutable = b.mutable;
-                        let CVal::Frame(xs) = &b.val else {
-                            return Err(internal(base.span, "index assignment to a non-frame"));
+                        // A single value is a frame of one.
+                        let one;
+                        let xs = match &b.val {
+                            CVal::Frame(xs) => xs,
+                            v @ CVal::Scalar(_) => {
+                                one = [v.clone()];
+                                &one[..]
+                            }
+                            _ => {
+                                return Err(internal(
+                                    base.span,
+                                    "index assignment to a non-frame",
+                                ));
+                            }
                         };
                         let Operand::Const(i) = i else {
                             return Err(Diagnostic::error(
@@ -1578,8 +1601,11 @@ impl<'a> Compiler<'a> {
             ExprKind::Index(base, index) => {
                 let b = self.expr(base)?;
                 let i = self.expr(index)?.scalar();
-                let CVal::Frame(xs) = b else {
-                    return Err(internal(base.span, "indexing a non-frame value"));
+                // A single value is a frame of one.
+                let xs = match b {
+                    CVal::Frame(xs) => xs,
+                    b @ CVal::Scalar(_) => vec![b],
+                    _ => return Err(internal(base.span, "indexing a non-frame value")),
                 };
                 if let Operand::Const(i) = i {
                     return xs.get(i as usize).cloned().ok_or_else(|| {
@@ -2250,6 +2276,12 @@ impl<'a> Compiler<'a> {
         span: Span,
     ) -> CResult<Vec<CVal>> {
         let saved = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
+        let vals: Vec<Option<CVal>> = sig
+            .params
+            .iter()
+            .zip(vals)
+            .map(|(p, v)| v.map(|v| fit(&p.ty, v)))
+            .collect();
         for (p, v) in sig.params.iter().zip(&vals) {
             if let Some(v) = v {
                 self.bind_sizes(&p.ty, v);
@@ -2947,6 +2979,15 @@ fn range_bound(value: f32, span: Span, name: &str) -> CResult<i32> {
 fn zero_tempo(span: Span) -> Diagnostic {
     Diagnostic::error(span, "a tempo is above 0bpm")
         .with_help("at 0bpm the sequence would never move; to stop it, use `halt`")
+}
+
+/// `val` in the shape of `ty`: a single value where a frame is expected is
+/// a frame of one, as the checker allows (`[Sample; 1]` is a `Sample`).
+fn fit(ty: &Type, val: CVal) -> CVal {
+    match (ty, val) {
+        (Type::Frame(elem, _), v @ CVal::Scalar(_)) => CVal::Frame(vec![fit(elem, v)]),
+        (_, v) => v,
+    }
 }
 
 /// Every name `e` reads, in order.

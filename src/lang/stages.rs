@@ -362,6 +362,7 @@ fn visit(code: &Code, instr: &Instr, node: &mut Node) {
         | Instr::Copy { .. }
         | Instr::Select { .. }
         | Instr::Tune { .. }
+        | Instr::AudioRead { .. }
         | Instr::Sum { .. } => {}
         Instr::Noise { .. } => node.loops = true,
         Instr::DelayRead { line, .. } => {

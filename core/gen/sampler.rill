@@ -1,0 +1,82 @@
+// Playing audio files, named as in `const KICK = ./kick.wav`. Both move
+// through the file at `speed`: 2 is an octave up and half as long, as on a
+// tape or a turntable, and 0.5 an octave down. A file with a loop (from its
+// sampler chunk) loops there; any other file loops over its whole length.
+//
+// Where they are is kept as a whole frame and a part of the next, not as a
+// time: one number for a time far into a long file is not exact, so its
+// pitch would wander.
+
+// A time in whole frames at the host rate.
+fn frames(t: Time) Float {
+    round(t * RATE)
+}
+
+// Frame `frame` brought back between frames `start` and `end` once it has
+// gone past either.
+fn wrapped(frame: Float, start: Float, end: Float) Float {
+    let span = end - start
+    if span <= 0 { frame } else { frame - floor((frame - start) / span) * span }
+}
+
+// The file from the start of the program, once or, with `loop`, over and
+// over: `return KICK |> samples()` to hear it.
+export rill samples<N>(
+    audio: Audio<N>,
+    speed: Float = 1,
+    loop: Bool = false,
+) [Sample; N] {
+    state frame: Float = 0
+    state part: Float = 0
+    let out = read(audio, frame, part)
+    part = part + speed
+    let whole = floor(part)
+    part = part - whole
+    frame = frame + whole
+    let start = frames(audio.loop_start)
+    let end = frames(audio.loop_end)
+
+    if loop && (frame >= end || (speed < 0 && frame < start)) {
+        frame = wrapped(frame, start, end)
+    }
+
+    return out
+}
+
+// The file from its start every time `gate` rises above 0, as an envelope
+// follows a gate; silent until then. With `loop` it loops while the gate is
+// held, and plays on to its end once it closes.
+//
+// A gate cannot rise twice in one sample: in a voice pool, a new note goes
+// to another copy, so every hit starts. To start one copy again on every
+// note, read the file yourself and set where you are in the handler.
+export rill play<N>(
+    audio: Audio<N>,
+    gate: Float,
+    speed: Float = 1,
+    loop: Bool = false,
+) [Sample; N] {
+    state frame: Float = round(audio.length * RATE)
+    state part: Float = 0
+    state open: Bool = false
+
+    if gate > 0 && !open {
+        frame = 0
+        part = 0
+    }
+
+    open = gate > 0
+    let out = read(audio, frame, part)
+    part = part + speed
+    let whole = floor(part)
+    part = part - whole
+    frame = frame + whole
+    let start = frames(audio.loop_start)
+    let end = frames(audio.loop_end)
+
+    if loop && open && (frame >= end || (speed < 0 && frame < start)) {
+        frame = wrapped(frame, start, end)
+    }
+
+    return out
+}

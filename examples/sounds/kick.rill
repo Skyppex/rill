@@ -1,0 +1,14 @@
+// The kick `examples/sampler.rill` plays, rendered to `kick.wav` with
+// `rill render examples/sounds/kick.rill -o examples/sounds/kick.wav
+// --seconds .4 --rate 44100 --channels 1 --format i16`.
+
+import @gen/osc
+
+rill main() Sample {
+    state t: Time = 0s
+    t = t + 1 / RATE
+    // A drop in pitch from 160Hz to 45Hz, and a level that falls away.
+    let drop = exp(-t / 30ms)
+    let freq = 45Hz + 115Hz * drop
+    return sine(freq) * exp(-t / 120ms) * .9
+}

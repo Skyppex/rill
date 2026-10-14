@@ -30,6 +30,8 @@ pub enum CVal {
     Frame(Vec<CVal>),
     Event(Vec<(String, Operand)>),
     Fn(FnVal),
+    /// An audio file, known when the program is built: the file itself.
+    Audio(std::path::PathBuf),
 }
 
 /// A function value, known at build time.
@@ -75,7 +77,7 @@ impl CVal {
             CVal::Scalar(o) => out.push(*o),
             CVal::Frame(xs) => xs.iter().for_each(|x| x.collect_operands(out)),
             CVal::Event(fields) => out.extend(fields.iter().map(|(_, o)| *o)),
-            CVal::Fn(_) => {}
+            CVal::Fn(_) | CVal::Audio(_) => {}
         }
     }
 
@@ -83,7 +85,7 @@ impl CVal {
         match self {
             CVal::Scalar(o) => *o,
             CVal::Frame(xs) => xs.first().map_or(Operand::Const(0.0), CVal::scalar),
-            CVal::Event(_) | CVal::Fn(_) => Operand::Const(0.0),
+            CVal::Event(_) | CVal::Fn(_) | CVal::Audio(_) => Operand::Const(0.0),
         }
     }
 
@@ -104,6 +106,7 @@ impl CVal {
                     .collect(),
             ),
             CVal::Fn(f) => CVal::Fn(f.clone()),
+            CVal::Audio(p) => CVal::Audio(p.clone()),
         }
     }
 
@@ -153,6 +156,8 @@ pub struct Defs<'a> {
     /// Values the checker worked out: sequence fields and sizes written as
     /// expressions, by expression id.
     const_values: &'a HashMap<u32, f64>,
+    /// The audio file each path names, as the checker read it.
+    audio: &'a HashMap<u32, std::path::PathBuf>,
     /// The top-level `const`s, filled in by [`const_table`].
     consts: Vec<Option<CVal>>,
 }
@@ -232,6 +237,7 @@ impl<'a> Defs<'a> {
             random: Random::default(),
             raised: HashMap::new(),
             const_values: &checked.const_values,
+            audio: &checked.audio,
             consts: vec![None; program.consts.len()],
             list: defs.zip(&checked.signatures).collect(),
             lambdas,
@@ -287,6 +293,7 @@ impl<'a> Defs<'a> {
 
 fn collect_lambdas<'a>(e: &'a Expr, out: &mut HashMap<u32, &'a Expr>) {
     match &e.kind {
+        ExprKind::Path(_) => {}
         ExprKind::Fn { body, .. } => {
             out.insert(e.id, e);
             collect_lambdas_in_block(body, out);
@@ -438,6 +445,7 @@ pub fn compile_instance(
         stages: Default::default(),
         noises: c.noises,
         delays: c.delays,
+        audios: c.audio_data,
         keys: c.keys,
         ceilings: c.ceilings,
     };
@@ -671,6 +679,10 @@ struct Compiler<'a> {
     align_inner: bool,
     /// Per `noise()` call compiled, its seed.
     noises: Vec<u64>,
+    /// The audio files `read` reads, and their samples at the host rate
+    /// (see [`Code::audios`]).
+    audio_files: Vec<std::path::PathBuf>,
+    audio_data: Vec<std::sync::Arc<[Box<[f32]>]>>,
     /// Per `delay` line, its length in samples.
     delays: Vec<u32>,
     /// Where compiling is, for naming state: the names from the entry rill
@@ -730,6 +742,8 @@ impl<'a> Compiler<'a> {
             loop_names: Vec::new(),
             align_inner: false,
             noises: Vec::new(),
+            audio_files: Vec::new(),
+            audio_data: Vec::new(),
             delays: Vec::new(),
             path: Vec::new(),
             frames: vec![(0, HashMap::new())],
@@ -1084,6 +1098,21 @@ impl<'a> Compiler<'a> {
                 )),
             };
         }
+        // An audio file is fixed when the program is built.
+        if let CVal::Audio(path) = v {
+            return match slot {
+                None => {
+                    *slot = Some(v.clone());
+                    Ok(())
+                }
+                Some(CVal::Audio(prev)) if prev == path => Ok(()),
+                Some(_) => Err(Diagnostic::error(
+                    self.span,
+                    "choosing between audio files while playing is not supported yet",
+                )
+                .with_help("read both and choose between what they give: `if c { read(A, t) } else { read(B, t) }`")),
+            };
+        }
         if slot.is_none() {
             let mut regs = Vec::new();
             for _ in v.operands() {
@@ -1134,6 +1163,9 @@ impl<'a> Compiler<'a> {
             }
             TypeExpr::Fn { span, .. } | TypeExpr::Rill { span, .. } => {
                 Err(internal(*span, "cannot zero-initialize a callable"))
+            }
+            TypeExpr::Audio { span, .. } => {
+                Err(internal(*span, "cannot zero-initialize an audio file"))
             }
         }
     }
@@ -1590,6 +1622,10 @@ impl<'a> Compiler<'a> {
                 ..
             } => self.call(e, callee, sizes, args),
             ExprKind::If { cond, then, els } => self.if_expr(e, cond, then, els.as_deref()),
+            ExprKind::Path(_) => match self.defs.audio.get(&e.id) {
+                Some(path) => Ok(CVal::Audio(path.clone())),
+                None => Err(internal(e.span, "a path the checker did not read")),
+            },
             ExprKind::Block(b) => Ok(self.block(b)?.0.unwrap_or_else(CVal::unit)),
             ExprKind::Frame(elems) => {
                 let mut xs = Vec::new();
@@ -1680,8 +1716,10 @@ impl<'a> Compiler<'a> {
                 Operand::Const(self.defs.const_values[&e.id] as f32),
             )),
             ExprKind::Field(base, field) => {
-                let CVal::Event(fields) = self.expr(base)? else {
-                    return Err(internal(e.span, "field access on a non-event value"));
+                let fields = match self.expr(base)? {
+                    CVal::Event(fields) => fields,
+                    CVal::Audio(path) => return self.audio_field(&path, field),
+                    _ => return Err(internal(e.span, "field access on a non-event value")),
                 };
                 fields
                     .iter()
@@ -2780,6 +2818,51 @@ impl<'a> Compiler<'a> {
     }
 
     /// A prelude function applied to its arguments, in parameter order.
+    /// The index of `path` in [`Code::audios`], read at the host rate the
+    /// first time.
+    fn audio_index(&mut self, span: Span, path: &std::path::Path) -> CResult<u16> {
+        if let Some(i) = self.audio_files.iter().position(|p| p == path) {
+            return Ok(i as u16);
+        }
+        let rate = self.sample_rate.round() as u32;
+        let data = crate::audio::at_rate(path, rate).map_err(|why| {
+            Diagnostic::error(span, format!("cannot read {}: {why}", path.display()))
+        })?;
+        let i = u16::try_from(self.audio_files.len())
+            .map_err(|_| Diagnostic::error(span, "too many audio files"))?;
+        self.audio_files.push(path.to_owned());
+        self.audio_data.push(data);
+        Ok(i)
+    }
+
+    /// `field` of the audio file at `path`: a constant.
+    fn audio_field(&mut self, path: &std::path::Path, field: &Ident) -> CResult<CVal> {
+        let audio = crate::audio::load(path).map_err(|why| {
+            Diagnostic::error(field.span, format!("cannot read {}: {why}", path.display()))
+        })?;
+        let (loop_start, loop_end) = audio.loop_seconds();
+        let value = match field.name.as_str() {
+            "channels" => audio.channels() as f64,
+            "frames" => audio.frames() as f64,
+            "length" => audio.length(),
+            "rate" => f64::from(audio.rate),
+            "loop_start" => loop_start,
+            "loop_end" => loop_end,
+            "root" => match audio.root {
+                Some(root) => f64::from(root),
+                None => {
+                    return Err(Diagnostic::error(
+                        field.span,
+                        format!("{} does not say which note it plays", path.display()),
+                    )
+                    .with_help("it has no sampler chunk with a root note; write the note yourself, as in `C3`"));
+                }
+            },
+            other => return Err(internal(field.span, &format!("unknown audio field `{other}`"))),
+        };
+        Ok(CVal::Scalar(Operand::Const(value as f32)))
+    }
+
     fn builtin(&mut self, span: Span, name: &str, vals: Vec<CVal>) -> CResult<CVal> {
         if let Some(op) = Op1::builtin(name) {
             return self.map1(op, &vals[0]);
@@ -2820,6 +2903,33 @@ impl<'a> Compiler<'a> {
                     ceiling: value,
                 });
                 Ok(CVal::Scalar(Operand::Const(value)))
+            }
+            // At a time, or at a frame (at the host rate) and a part of
+            // one, which stays exact far into a long file.
+            ("read", [CVal::Audio(path), rest @ ..]) => {
+                let audio = self.audio_index(span, path)?;
+                let channels = self.audio_data[usize::from(audio)].len();
+                let (at, part) = match rest {
+                    [time] => {
+                        let rate = Operand::Const(self.sample_rate);
+                        (self.op2(Op2::Mul, time.scalar(), rate)?, Operand::Const(0.0))
+                    }
+                    [frame, part] => (frame.scalar(), part.scalar()),
+                    _ => return Err(internal(span, "`read` with the wrong arguments")),
+                };
+                let mut out = Vec::with_capacity(channels);
+                for channel in 0..channels {
+                    let dst = self.reg()?;
+                    self.emit(Instr::AudioRead {
+                        dst,
+                        audio,
+                        channel: channel as u16,
+                        at,
+                        part,
+                    });
+                    out.push(Operand::Reg(dst));
+                }
+                Ok(CVal::flat_frame(out))
             }
             ("noise", []) => {
                 let source = u16::try_from(self.noises.len())
@@ -2994,7 +3104,7 @@ fn fit(ty: &Type, val: CVal) -> CVal {
 fn names_in(e: &Expr, out: &mut Vec<String>) {
     match &e.kind {
         ExprKind::Name(n) => out.push(n.clone()),
-        ExprKind::Number { .. } | ExprKind::Bool(_) => {}
+        ExprKind::Number { .. } | ExprKind::Bool(_) | ExprKind::Path(_) => {}
         ExprKind::Unary(_, x)
         | ExprKind::Cast(x, _)
         | ExprKind::Field(x, _)

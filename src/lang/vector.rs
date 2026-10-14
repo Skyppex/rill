@@ -292,6 +292,7 @@ fn what(i: &Instr) -> &'static str {
         Instr::InvokeEvent { .. } | Instr::EventArg { .. } => "sends an event",
         Instr::LoadCapture { .. } | Instr::SetSlot { .. } => "follows a playing sequence",
         Instr::SeqRead { .. } => "reads a playing sequence",
+        Instr::AudioRead { .. } => "reads an audio file",
         Instr::Vector { .. } => "holds copies that already run together",
         Instr::Sum { .. } => "sums",
         Instr::Noise { .. } => "calls noise()",
@@ -665,6 +666,38 @@ fn vectorize_pool(
                     want_stride,
                 }
             }
+            Instr::AudioRead { audio, channel, .. } => {
+                if !at.iter().all(|i| {
+                    matches!(**i, Instr::AudioRead { audio: a, channel: c, .. } if a == audio && c == channel)
+                }) {
+                    return Err(Why::Differ);
+                }
+                let at_arg = g
+                    .arg(&ops(&|i| match *i {
+                        Instr::AudioRead { at, .. } => at,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                let part = g
+                    .arg(&ops(&|i| match *i {
+                        Instr::AudioRead { part, .. } => part,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                let d = g
+                    .dst(&dsts(&|i| match *i {
+                        Instr::AudioRead { dst, .. } => dst,
+                        _ => unreachable!(),
+                    }))
+                    .ok_or(Why::Registers)?;
+                VInstr::AudioRead {
+                    d,
+                    audio,
+                    channel,
+                    at: at_arg,
+                    part,
+                }
+            }
             Instr::SeqRead { seq, info, .. } => {
                 if !at.iter().all(
                     |i| matches!(**i, Instr::SeqRead { seq: s, info: f, .. } if s == seq && f == info),
@@ -745,7 +778,8 @@ fn straighten(
             | Instr::Noise { .. }
             | Instr::DelayRead { .. }
             | Instr::DelayWrite { .. }
-            | Instr::SeqRead { .. } => {}
+            | Instr::SeqRead { .. }
+            | Instr::AudioRead { .. } => {}
             other => return Err(Why::Unsupported(what(&other))),
         }
     }
@@ -1038,6 +1072,11 @@ fn rename(code: &mut Code, map: &HashMap<Reg, Reg>) {
             r(dst);
             op(id);
         }
+        Instr::AudioRead { dst, at, part, .. } => {
+            r(dst);
+            op(at);
+            op(part);
+        }
         Instr::DelayWrite { x, .. } | Instr::Want { x, .. } => op(x),
         // Made after renaming (see `opt::sums`), so its registers are
         // already the new ones.
@@ -1101,6 +1140,7 @@ fn rename(code: &mut Code, map: &HashMap<Reg, Reg>) {
                 VInstr::Noise { .. } => vec![],
                 VInstr::DelayRead { time, .. } => vec![time],
                 VInstr::SeqRead { id, .. } => vec![id],
+                VInstr::AudioRead { at, part, .. } => vec![at, part],
                 VInstr::DelayWrite { x, .. } => vec![x],
             };
             for a in args {

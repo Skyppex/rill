@@ -254,6 +254,9 @@ pub enum TypeExpr {
         ret: Box<TypeExpr>,
         span: Span,
     },
+    /// `Audio<N>`: an audio file with `N` channels. Plain `Audio` is
+    /// [`TypeExpr::Named`].
+    Audio { size: SizeExpr, span: Span },
 }
 
 impl TypeExpr {
@@ -262,7 +265,8 @@ impl TypeExpr {
             TypeExpr::Named(id) => id.span,
             TypeExpr::Frame { span, .. }
             | TypeExpr::Fn { span, .. }
-            | TypeExpr::Rill { span, .. } => *span,
+            | TypeExpr::Rill { span, .. }
+            | TypeExpr::Audio { span, .. } => *span,
         }
     }
 }
@@ -399,6 +403,8 @@ pub enum ExprKind {
     },
     Bool(bool),
     Name(String),
+    /// `./kick.wav`: a file, as written; an audio file is an `Audio`.
+    Path(String),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Range {

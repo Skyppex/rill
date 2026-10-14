@@ -119,16 +119,16 @@ fn examples_check_cleanly() {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "rill") {
-            let src = std::fs::read_to_string(&path).unwrap();
-            match lang::compile_entry(&src, "main") {
+            // As files: what they read is next to them.
+            let (map, result) = lang::compile_file_entry(&path, "main", &lang::Disk);
+            match result {
                 Ok((_, checked)) => assert!(
                     checked.warnings.is_empty(),
                     "{path:?}: {:?}",
                     checked.warnings
                 ),
                 Err(diags) => {
-                    let name = path.display().to_string();
-                    let rendered: String = diags.iter().map(|d| d.render(&name, &src)).collect();
+                    let rendered: String = diags.iter().map(|d| map.render(d)).collect();
                     panic!("{rendered}");
                 }
             }

@@ -67,6 +67,9 @@ pub struct Checked {
     /// Per module, the top-level names it can use (one, for a program from
     /// one string).
     pub scopes: Vec<Scope>,
+    /// The audio file each path in an expression names, by expression id:
+    /// the file itself, from the folder of the file the path is written in.
+    pub audio: HashMap<u32, std::path::PathBuf>,
 }
 
 /// What a top-level name stands for.
@@ -236,6 +239,7 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         written_events: 0,
         seq_facts: Vec::new(),
         const_values: HashMap::new(),
+        audio: HashMap::new(),
         event_used: Vec::new(),
         seq_names: program.seqs.iter().map(|s| s.name.name.clone()).collect(),
         seq_steps: program.seqs.iter().map(|s| s.steps.len()).collect(),
@@ -345,6 +349,7 @@ pub fn check_partial(program: &Program) -> (Checked, Vec<Diagnostic>) {
         written_events: c.written_events,
         seq_facts: c.seq_facts,
         const_values: c.const_values,
+        audio: c.audio,
         consts: c
             .const_types
             .into_iter()
@@ -474,6 +479,8 @@ struct Checker {
     written_events: usize,
     seq_facts: Vec<SeqFacts>,
     const_values: HashMap<u32, f64>,
+    /// See [`Checked::audio`].
+    audio: HashMap<u32, std::path::PathBuf>,
 }
 
 /// Something that runs handlers, for the invoke-loop check.
@@ -1612,6 +1619,13 @@ impl Checker {
             }
             TypeExpr::Frame { elem, size, span } => {
                 let elem_ty = self.resolve_type(elem, generics);
+                if matches!(elem_ty.leaf(), Type::Audio(_)) {
+                    let e = self
+                        .error(*span, "frames cannot hold audio files")
+                        .with_help("name each file on its own, as in `const KICK = ./kick.wav`");
+                    self.report(e);
+                    return Type::Error;
+                }
                 if elem_ty.leaf().is_callable() {
                     let e = self
                         .error(*span, "frames cannot hold functions or rills")
@@ -1624,6 +1638,10 @@ impl Checker {
                     None => Type::Error,
                 }
             }
+            TypeExpr::Audio { size, .. } => match self.size(size, generics) {
+                Some(size) => Type::Audio(Some(size)),
+                None => Type::Error,
+            },
             TypeExpr::Fn { params, ret, .. } => {
                 let params = params
                     .iter()
@@ -1656,9 +1674,11 @@ impl Checker {
             "Interval" => Type::Interval,
             "Gain" => Type::Gain,
             "Slope" => Type::Slope,
+            "Audio" => Type::Audio(None),
             other => {
-                const KNOWN: [&str; 9] = [
+                const KNOWN: [&str; 10] = [
                     "Sample", "Float", "Int", "Bool", "Freq", "Pitch", "Time", "Interval", "Gain",
+                    "Audio",
                 ];
                 let mut e = self.error(id.span, format!("unknown type `{other}`"));
                 if let Some(help) = renamed_type(other) {
@@ -1887,13 +1907,15 @@ impl Checker {
                         .with_help("state exists for every tick, so it cannot depend on a branch");
                     self.report(e);
                 }
+                // Typed first: an audio file's fields are constants, which
+                // is_const learns from the types.
+                let t = self.expr(init);
                 if !self.is_const(init) {
                     let e = self
                         .error(init.span, "the initial value of `state` must be a constant")
                         .with_help("state is allocated and initialised before audio starts");
                     self.report(e);
                 }
-                let t = self.expr(init);
                 let bound = match ty {
                     Some(te) => {
                         let declared = self.resolve_type(te, &self.generics());
@@ -1909,6 +1931,12 @@ impl Checker {
                     let e = self
                         .error(*span, "a function or rill cannot be `state`")
                         .with_help("state holds numbers that change between ticks; bind callables with `let`");
+                    self.report(e);
+                }
+                if matches!(bound.leaf(), Type::Audio(_)) {
+                    let e = self
+                        .error(*span, "an audio file cannot be `state`")
+                        .with_help("it is fixed when the program is built; keep where you are in it as `state` instead, as in `state at: Time = 0s`");
                     self.report(e);
                 }
                 self.bind(name, bound, VarKind::State, span.end);
@@ -2165,6 +2193,7 @@ impl Checker {
                 unit.map_or(Type::Num, |u| Type::from_dimension(u.dimension()))
             }
             ExprKind::Bool(_) => Type::Bool,
+            ExprKind::Path(path) => self.audio_path(e, path),
             ExprKind::Name(name) => {
                 if let Some(var) = self.lookup(name).cloned() {
                     self.resolve(e.span, Resolution::Binding(var.id));
@@ -2542,6 +2571,30 @@ impl Checker {
                             Type::Error
                         }
                     }
+                } else if let Type::Audio(channels) = &base_ty {
+                    match audio_field(&field.name) {
+                        Some(t) => {
+                            if let (Type::Int, "channels", Some(Size::Const(n))) =
+                                (&t, field.name.as_str(), channels)
+                            {
+                                self.const_values.insert(e.id, f64::from(*n));
+                            }
+                            t
+                        }
+                        None => {
+                            let has = listing(&AUDIO_FIELDS.iter().map(|(n, _)| *n).collect::<Vec<_>>());
+                            let mut d = self.error(
+                                field.span,
+                                format!("an audio file has no field `{}`", field.name),
+                            );
+                            d = match suggest(&field.name, AUDIO_FIELDS.iter().map(|(n, _)| *n)) {
+                                Some(s) => d.with_help(format!("did you mean `{s}`?")),
+                                None => d.with_help(format!("an audio file has {has}")),
+                            };
+                            self.report(d);
+                            Type::Error
+                        }
+                    }
                 } else if base_ty.is_wild() {
                     Type::Error
                 } else {
@@ -2549,6 +2602,68 @@ impl Checker {
                     self.report(e);
                     Type::Error
                 }
+            }
+        }
+    }
+
+    /// `./kick.wav` as a value: the audio file, read now, so its channels
+    /// are known.
+    fn audio_path(&mut self, e: &Expr, path: &str) -> Type {
+        // `./kick.wav.length`: a path goes on through dots.
+        if let Some((file, field)) = path.rsplit_once('.')
+            && crate::audio::is_audio(file)
+            && audio_field(field).is_some()
+        {
+            let d = self
+                .error(e.span, format!("`{path}` is not an audio file"))
+                .with_help(format!(
+                    "a path goes on through `.`; to read a field, put the path in parentheses: `({file}).{field}`"
+                ));
+            self.report(d);
+            return Type::Error;
+        }
+        if !crate::audio::is_audio(path) {
+            let what = match crate::audio::extension(path) {
+                Some(ext) if ext == "rill" => "a Rill file is imported, not used as a value".to_owned(),
+                Some(ext) => format!("`.{ext}` is not an audio format Rill can read"),
+                None => "a path names an audio file, with its extension".to_owned(),
+            };
+            let d = self
+                .error(e.span, format!("`{path}` is not an audio file"))
+                .with_help(format!(
+                    "{what}; Rill reads {}",
+                    crate::audio::EXTENSIONS
+                        .iter()
+                        .map(|x| format!("`.{x}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            self.report(d);
+            return Type::Error;
+        }
+        // From the folder of the file this is written in, or for a program
+        // without a file, from where Rill runs.
+        let dir = self
+            .modules
+            .files
+            .get(self.module)
+            .and_then(|f| f.path.as_ref())
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_owned)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let file = super::module::normalize(&dir.join(path));
+        match crate::audio::load(&file) {
+            Ok(audio) => {
+                self.audio.insert(e.id, file);
+                Type::Audio(Some(Size::Const(audio.channels() as u32)))
+            }
+            Err(why) => {
+                let d = self
+                    .error(e.span, format!("cannot read `{path}`: {why}"))
+                    .with_help(format!("looked for {}", file.display()));
+                self.report(d);
+                Type::Error
             }
         }
     }
@@ -3317,6 +3432,20 @@ impl Checker {
                 Some(j) => seq_field(&self.seq_facts[j], &field.name)
                     .map(|(_, v)| v)
                     .ok_or(None),
+                // An audio file's channels are in its type.
+                None if field.name == "channels" => {
+                    let ty = match &base.kind {
+                        ExprKind::Name(n) => match self.lookup(n) {
+                            Some(v) => Some(v.ty.clone()),
+                            None => self.const_named(n).map(|i| self.const_types[i].clone()),
+                        },
+                        _ => self.types.get(base.id as usize).cloned(),
+                    };
+                    match ty {
+                        Some(Type::Audio(Some(Size::Const(n)))) => Ok(f64::from(n)),
+                        _ => Err(None),
+                    }
+                }
                 None => Err(None),
             },
             ExprKind::Name(n) => match self.lookup(n) {
@@ -4015,7 +4144,7 @@ impl Checker {
     /// parameters, and prelude functions of those.
     fn is_const(&self, e: &Expr) -> bool {
         match &e.kind {
-            ExprKind::Number { .. } | ExprKind::Bool(_) => true,
+            ExprKind::Number { .. } | ExprKind::Bool(_) | ExprKind::Path(_) => true,
             ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => self.is_const(x),
             ExprKind::Binary(_, a, b) => self.is_const(a) && self.is_const(b),
             ExprKind::Frame(xs) => xs.iter().all(|x| self.is_const(x)),
@@ -4051,7 +4180,12 @@ impl Checker {
                     && !prelude::keeps_state(name)
                     && args.iter().all(|a| self.is_const(&a.value))
             }
-            ExprKind::Field(base, _) => self.seq_of(base).is_some(),
+            // A sequence's fixed fields, and an audio file's, which is
+            // always known when the program is built.
+            ExprKind::Field(base, _) => {
+                self.seq_of(base).is_some()
+                    || matches!(self.types.get(base.id as usize), Some(Type::Audio(_)))
+            }
             ExprKind::If { .. }
             | ExprKind::Block(_)
             | ExprKind::Index(..)
@@ -4433,6 +4567,21 @@ fn unify(param: &Type, arg: &Type, subst: &mut Subst, generics: &[String]) -> bo
                 fixed => fixed == asize,
             };
             size_ok && unify(pe, ae, subst, generics)
+        }
+        Type::Audio(Some(psize)) => {
+            let Type::Audio(Some(asize)) = arg else {
+                return false;
+            };
+            match psize {
+                Size::Var(v) if generics.contains(v) => match subst.sizes.get(v) {
+                    Some(bound) => bound == asize,
+                    None => {
+                        subst.sizes.insert(v.clone(), asize.clone());
+                        true
+                    }
+                },
+                fixed => fixed == asize,
+            }
         }
         // A frame of one is its element.
         _ => match arg {
@@ -4831,6 +4980,31 @@ pub const INSTANCE_FIELDS: &[(&str, &str)] = &[
     ("playing", "Whether it is playing."),
 ];
 
+/// The fields of an audio file, with what each means.
+pub const AUDIO_FIELDS: &[(&str, &str)] = &[
+    ("channels", "How many channels it has: a size, as in `[Sample; KICK.channels]`."),
+    ("frames", "How many frames it has, at its own rate."),
+    ("length", "How long it lasts."),
+    ("rate", "Its own sample rate; it plays at the host's, resampled when built."),
+    (
+        "root",
+        "The note it plays unchanged, from its sampler chunk; an error for a file that does not say.",
+    ),
+    ("loop_start", "Where its loop starts, or `0s` for a file without one."),
+    ("loop_end", "Where its loop ends, or its `length` for a file without one."),
+];
+
+/// The type of field `name` of an audio file.
+pub fn audio_field(name: &str) -> Option<Type> {
+    Some(match name {
+        "channels" | "frames" => Type::Int,
+        "length" | "loop_start" | "loop_end" => Type::Time,
+        "rate" => Type::Freq,
+        "root" => Type::Pitch,
+        _ => return None,
+    })
+}
+
 /// The type of field `name` of an instance of a sequence.
 pub fn instance_field(name: &str) -> Option<Type> {
     Some(match name {
@@ -5011,6 +5185,17 @@ pub fn check_entry(
                 ),
             ),
         );
+    }
+    for (p, ps) in def.params.iter().zip(&sig.params) {
+        if matches!(ps.ty.leaf(), Type::Audio(_)) {
+            errors.push(
+                Diagnostic::error(
+                    p.name.span,
+                    format!("`{}` cannot be an audio file", p.name.name),
+                )
+                .with_help("the entry rill's parameters are live controls, so they hold numbers; name the file with a `const`"),
+            );
+        }
     }
     for (p, ps) in def.params.iter().zip(&sig.params) {
         if ps.ty.is_callable() {

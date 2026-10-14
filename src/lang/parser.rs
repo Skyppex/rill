@@ -494,7 +494,17 @@ impl Parser<'_> {
                 span: self.span_from(open.span),
             });
         }
-        Ok(TypeExpr::Named(self.ident("as a type")?))
+        let name = self.ident("as a type")?;
+        // `Audio<2>`: the channels of an audio file.
+        if name.name == "Audio" && self.eat(TokenKind::Lt).is_some() {
+            let size = self.size()?;
+            self.expect(TokenKind::Gt, "to close the channel count, as in `Audio<2>`")?;
+            return Ok(TypeExpr::Audio {
+                size,
+                span: self.span_from(name.span),
+            });
+        }
+        Ok(TypeExpr::Named(name))
     }
 
     fn block(&mut self) -> PResult<Block> {
@@ -798,6 +808,7 @@ impl Parser<'_> {
         match next.kind {
             TokenKind::Ident
             | TokenKind::Number { .. }
+            | TokenKind::Path
             | TokenKind::LBracket
             | TokenKind::If
             | TokenKind::Fn
@@ -1280,6 +1291,11 @@ impl Parser<'_> {
             TokenKind::True | TokenKind::False => {
                 self.bump();
                 Ok(self.expr_node(ExprKind::Bool(t.kind == TokenKind::True), t.span))
+            }
+            TokenKind::Path => {
+                self.bump();
+                let path = self.text(t).to_owned();
+                Ok(self.expr_node(ExprKind::Path(path), t.span))
             }
             TokenKind::Ident if self.at_invoke() => self.invoke(),
             TokenKind::Ident => {

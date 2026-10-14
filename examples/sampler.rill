@@ -1,0 +1,80 @@
+// A drum machine from audio files: two sequences, and voices that play a
+// file for every note. The files in `sounds/` were made with Rill too; the
+// recipe for each is next to it.
+//
+// A note's pitch sets how fast its file plays: the kick's C2 plays it as it
+// is, D2 a tone higher and shorter. Velocity sets the level.
+
+import @gen/sampler
+import @mix/stereo
+
+const KICK = ./sounds/kick.wav
+const HAT = ./sounds/hat.wav
+
+seq kicks(step: 1/8, tempo: 118bpm, gate: .5, loop: true) {
+    C2, _, _, _, C2, _, _, C2@.6,
+    C2, _, _, _, C2, _, D2@.7, _,
+}
+
+seq hats(step: 1/16, tempo: 118bpm, gate: .5, loop: true) {
+    _, _, C4@.5, _, C4@.9, _, C4@.4, C4@.3,
+    _, _, C4@.5, _, C4@.9, _, D4@.4, C4@.6,
+}
+
+// How fast to play a file for a note, when `root` plays it as it is.
+fn speed(pitch: Pitch, root: Pitch) Float {
+    pow(2, (pitch - root) / 12st)
+}
+
+rill kick() Sample {
+    state gate: Float = 0
+    state level: Float = 0
+    state rate: Float = 1
+
+    on kicks_note_on(n) claim {
+        gate = 1
+        level = n.velocity
+    }
+
+    on kicks_note_change(n) {
+        rate = speed(n.pitch, C2)
+    }
+
+    on kicks_note_off release {
+        gate = 0
+    }
+
+    return play(KICK, gate, rate) * level
+}
+
+rill hat() Sample {
+    state gate: Float = 0
+    state level: Float = 0
+    state rate: Float = 1
+
+    on hats_note_on(n) claim {
+        gate = 1
+        level = n.velocity
+    }
+
+    on hats_note_change(n) {
+        rate = speed(n.pitch, C4)
+    }
+
+    on hats_note_off release {
+        gate = 0
+    }
+
+    return play(HAT, gate, rate) * level
+}
+
+rill main(volume: Gain = -6dB) [Sample; 2] {
+    on start {
+        let _ = invoke kicks
+        let _ = invoke hats
+    }
+
+    let k = sum([kick(); 2])
+    let h = sum([hat(); 4])
+    return [k, k] + pan(h, .3) + volume
+}

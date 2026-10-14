@@ -1,0 +1,11 @@
+// The hi-hat `examples/sampler.rill` plays, rendered to `hat.wav` with
+// `rill render examples/sounds/hat.rill -o examples/sounds/hat.wav
+// --seconds .12 --rate 44100 --channels 1 --format i16 --seed 1`.
+
+import @effects/filter
+
+rill main() Sample {
+    state t: Time = 0s
+    t = t + 1 / RATE
+    return highpass(noise(), 7kHz) * exp(-t / 25ms) * .5
+}

@@ -42,7 +42,10 @@ pub fn lookup(name: &str) -> Vec<Signature> {
     let sig = |params: &[(&str, Type)], ret: Type| Signature {
         kind: DefKind::Prelude,
         name: name.to_owned(),
-        generics: if params.iter().any(|(_, ty)| matches!(ty, Type::Frame(..))) {
+        generics: if params
+            .iter()
+            .any(|(_, ty)| matches!(ty, Type::Frame(..) | Type::Audio(Some(_))))
+        {
             vec!["N".to_owned()]
         } else {
             Vec::new()
@@ -105,6 +108,20 @@ pub fn lookup(name: &str) -> Vec<Signature> {
             ],
             Type::Sample,
         )],
+        // What an audio file holds at a time, one value per channel; or at
+        // a frame (at the host rate) and a part of one, exact far into a
+        // long file.
+        "read" => {
+            let audio = || ("audio", Type::Audio(Some(Size::Var("N".into()))));
+            let ret = || Type::Frame(Box::new(Type::Sample), Size::Var("N".into()));
+            vec![
+                sig(&[audio(), ("at", Type::Time)], ret()),
+                sig(
+                    &[audio(), ("frame", Type::Float), ("part", Type::Float)],
+                    ret(),
+                ),
+            ]
+        }
         _ => Vec::new(),
     }
 }
@@ -190,6 +207,9 @@ pub fn doc(name: &str) -> Option<&'static str> {
         "noise" => {
             "A new random number in [-1, 1) every sample: white noise. Every call has its own sequence, so two voices never share one; the same `--seed` plays the same noise."
         }
+        "read" => {
+            "What `audio` holds at `at`: one value per channel, read between samples, and silence before the start and after the end. `read(KICK, 0s)` is its first frame. The file is resampled to the host rate when the program is built, so a second is a second. `read(audio, frame, part)` reads at whole frame `frame` (at the host rate) plus `part` of one instead: a time far into a long file is not exact as one number, while a whole frame and a part are. Playing a file is moving along it: `@gen/sampler` has `samples` and `play`."
+        }
         "delay" => {
             "What `x` was `time` ago. With a frame of times, several taps from one buffer, each its own stream: `delay(x, [10ms + lfo * 2ms, 25ms])`. Reads between samples are interpolated, so a moving time does not crackle. `max` is the longest any time can be, which sets the buffer's size when the program is built; it can be left out when the times are constants. A frame of channels gets a buffer each. Feed back through `state` for echoes and combs."
         }
@@ -233,6 +253,7 @@ pub const FUNCTIONS: &[&str] = &[
     "ceiling",
     "noise",
     "delay",
+    "read",
 ];
 
 #[cfg(test)]

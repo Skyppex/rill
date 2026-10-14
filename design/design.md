@@ -94,6 +94,7 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `Slope` | A level over an interval: `24dB / 1oct` | `Gain / Interval`; stored in dB per octave, so `6dB / 6st` is `12dB / 1oct`. Times an `Interval`, a `Gain` again |
 | `fn(A, B) R` | A function value | Pure, takes exactly what it declares |
 | `rill(A, B) R` | A rill value | Stateful, lifts like a named rill |
+| `Audio<N>` | An audio file with N channels | Read when the program is built; `Audio` alone takes any N (see Audio files) |
 
 Numbers are written as `440`, `0.5` or `.5`, `48_000`, `1e-3`, with a unit right after where they have one (`440Hz`, `.5s`, `-6dB`).
 
@@ -468,6 +469,58 @@ Rules:
 - Recursion is still not allowed, including through callable values.
 - At build time every call of a callable value is replaced by the callable's body, so callable values cost nothing while playing. A callable chosen while playing becomes a branch between the candidates; only the chosen one runs.
 
+## Audio files
+
+A path is a value, written as it is: `./kick.wav`, `../pads/warm.flac`, `/samples/hit.aiff`. A path to an audio file is an `Audio`, read when the program is built, never while it plays:
+
+```rill
+import @gen/sampler
+
+const KICK = ./sounds/kick.wav
+
+rill main() Sample {
+    return KICK |> samples()
+}
+```
+
+- **Paths** start with `./`, `../` or `/`, are relative to the file they are written in (or for a program without a file, to where Rill runs), and hold letters, digits and `_ . - + /`, so no spaces. A path goes on through `.`, so a field needs parentheses: `(./kick.wav).length`. Imports use the same paths (see Modules).
+- **Formats:** WAV, AIFF, CAF, FLAC, ALAC, MP1/2/3, Vorbis and AAC, in RIFF, AIFF, CAF, OGG, MP4/M4A and Matroska/WebM; the extension says which. Opus is not one of them. Decoding is pure Rust, behind the `audio-files` cargo feature (on by default).
+- **The type** has the channels in it: `./kick.wav` is an `Audio<1>`, a stereo file an `Audio<2>`. A rill takes any file with a size parameter, `rill twice<N>(a: Audio<N>) [Sample; N]`, and `Audio` alone takes any file whose channels it does not need. An audio file is fixed when the program is built, so it cannot be `state`, a frame element, or a parameter of the entry rill.
+- **Rate:** every file is resampled to the host rate when the program is built (a windowed sinc), so a second of the file is a second while playing and its pitch is its own. The rate syntax of rate-changing rills is a different thing: it is relative to the host rate, and does not apply.
+- **Built again only when changed:** a file is kept by path and by when it last changed, so a hot reload of the program does not read it again; replacing the file reloads the program, which plays the new sound.
+
+**Fields**, all constants:
+
+| Field | Type | |
+| --- | --- | --- |
+| `channels` | `Int` | a size: `[Sample; KICK.channels]` |
+| `frames` | `Int` | at its own rate |
+| `length` | `Time` | |
+| `rate` | `Freq` | its own rate, before resampling |
+| `root` | `Pitch` | the note it plays unchanged, from a WAV `smpl` or AIFF `INST` chunk; an error for a file that does not say |
+| `loop_start`, `loop_end` | `Time` | its loop from the same chunks, or `0s` and its `length` |
+
+**Reading** is the prelude's `read(audio, at)`: one value per channel at time `at`, read between samples on a cubic, and silence before the start and after the end. A time far into a long file is not exact as one `f32` number (a minute in, a step of one sample rounds by several percent), so `read(audio, frame, part)` reads at whole frame `frame` at the host rate plus `part` of one, which stays exact. Everything else is built on `read`: playing, reversing, scrubbing, granular, wavetables.
+
+**Playing** is `@gen/sampler`, written in Rill on `read`:
+
+- `samples(audio, speed, loop)` plays the file from the start of the program, once or over and over.
+- `play(audio, gate, speed, loop)` plays it from its start every time `gate` rises above 0, as an envelope follows a gate; with `loop` it loops while the gate is held.
+- `speed` is a stream: 2 is an octave up and half as long, as on a tape. Nothing is stretched; changing pitch and length apart is a later feature.
+
+A voice per note, its speed from the note's pitch, makes a sampler or a drum machine (`examples/sampler.rill`):
+
+```rill
+rill kick() Sample {
+    state gate: Float = 0
+    state rate: Float = 1
+    on kicks_note_on claim { gate = 1 }
+    on kicks_note_change(n) { rate = pow(2, (n.pitch - C2) / 12st) }
+    on kicks_note_off release { gate = 0 }
+    return play(KICK, gate, rate)
+}
+```
+
 ## Modules
 
 A file is a module. A file names the files it uses with `import`, and sees only what they `export`.
@@ -502,7 +555,7 @@ rill main() Sample { return pad(110Hz) + saw(55Hz) * 0.1 }
 
 Two libraries come with the compiler, so every program has them wherever it runs.
 
-**The prelude** is what cannot be written in Rill, or would be much slower in it: the constants `PI`, `TAU` and `RATE`; maths (`sin`, `cos`, `tan`, `tanh`, `exp`, `log`, `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `wrap`, `min`, `max`, `clamp`); `sum` over frames of any size; `random`; the tunings (`equal`, `just`, `pythagorean`, `meantone`); `level` and `amp`; and two that keep state, so only rills can use them: `noise()` and `delay`. It is always there and never imported.
+**The prelude** is what cannot be written in Rill, or would be much slower in it: the constants `PI`, `TAU` and `RATE`; maths (`sin`, `cos`, `tan`, `tanh`, `exp`, `log`, `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `wrap`, `min`, `max`, `clamp`); `sum` over frames of any size; `random`; the tunings (`equal`, `just`, `pythagorean`, `meantone`); `level` and `amp`; `read` for audio files; and two that keep state, so only rills can use them: `noise()` and `delay`. It is always there and never imported.
 
 **`noise()`** is a new random number in [-1, 1) every sample. Every call has its own sequence, seeded from the build's seed, so voices never share one and `--seed` repeats it.
 
@@ -530,6 +583,7 @@ rill echo(x: Sample, time: Time, feedback: Float) Sample {
 
 - **`@gen`**: generators. `@gen/osc` has oscillators in two halves: `phasor(freq, offset)`, a ramp from 0 to 1 per cycle that says where in the cycle you are (not meant to be heard), and the shapes `as_sine`, `as_saw` and `as_square`, which turn a phase into a wave (the saw and square band-limited with `poly_blep`, which is exported for custom shapes). `sine`, `saw` and `square` are the two together: `saw(f)` is `phasor(f) |> as_saw()`. Anything done to the phase in between works for every shape: `warp(phase, width)` moves the middle of the cycle, which is pulse width on a square and a brighter, squeezed wave on a sine or saw.
 - **`@gen/noise`**: `pink()` and `brown()` (white is `noise()`). Instruments, such as a plucked string, are made from these parts, not kept in core (`examples/delay.rill` builds one).
+- **`@gen/sampler`**: `samples` and `play`, which play audio files (see Audio files).
 - **`@effects/env`**: `slew(x, rise, fall)` (smoothing, following, one-pole lowpass) and `ahdsr(gate, attack, hold, decay, sustain, release)` (with `hold: 0s`, the default, an ADSR). Envelopes follow a gate: a `Float` above 0 while a note is held.
 - **`@effects/filter`**: `lowpass`, `highpass`, `bandpass`, `notch`, each `(x, cutoff, resonance, slope, max)`, built from state-variable stages that stay stable under any modulation. `slope` is a stream (`24dB / 1oct`; a slope between whole poles blends the two nearest); `max` is the steepest it will be to start with (48 dB/oct when left out), which sets how many stages are built.
 - **`@effects/dynamics`**: `dynamics(x, threshold, above, below, attack, release)`; `above: 0.25` is 4:1 compression, `above: 0` a limiter, `below: 100` a gate.

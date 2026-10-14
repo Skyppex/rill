@@ -119,8 +119,11 @@ fn examples_are_block_size_invariant() {
         if path.extension().is_none_or(|e| e != "rill") {
             continue;
         }
-        let src = std::fs::read_to_string(&path).unwrap();
-        let reference = render_with(&src, 2, 10_000, Blocks::Fixed(256));
+        let render = |blocks: &Blocks| {
+            let mut engine = example_engine(&path, 2, true);
+            offline::render(&mut engine, 10_000, blocks)
+        };
+        let reference = render(&Blocks::Fixed(256));
         for blocks in [
             Blocks::Fixed(1),
             Blocks::Fixed(1000),
@@ -130,7 +133,7 @@ fn examples_are_block_size_invariant() {
                 seed: 7,
             },
         ] {
-            let got = render_with(&src, 2, 10_000, blocks.clone());
+            let got = render(&blocks);
             assert!(got == reference, "{path:?} differs with {blocks:?}");
         }
     }
@@ -138,6 +141,21 @@ fn examples_are_block_size_invariant() {
 
 /// An engine for `src`, running its tick in stages over segments of
 /// samples, or one sample at a time.
+/// An engine for the example at `path`, built as a file, so what it reads
+/// is next to it.
+fn example_engine(path: &std::path::Path, channels: usize, stream: bool) -> Engine {
+    let options = lang::build::Options {
+        seed: Some(0),
+        stream,
+        ..Default::default()
+    };
+    let (map, result) = lang::load_file(path, &lang::Disk, &config(channels), "main", &options);
+    let (graph, _) = result.unwrap_or_else(|d| {
+        panic!("{}", d.iter().map(|d| map.render(d)).collect::<String>())
+    });
+    Engine::new(graph, config(channels)).unwrap()
+}
+
 fn engine_streaming(src: &str, channels: usize, stream: bool) -> Engine {
     let options = lang::build::Options {
         seed: Some(0),
@@ -158,10 +176,9 @@ fn examples_run_the_same_in_stages_as_sample_by_sample() {
         if path.extension().is_none_or(|e| e != "rill") {
             continue;
         }
-        let src = std::fs::read_to_string(&path).unwrap();
-        let mut engine = engine_streaming(&src, 2, false);
+        let mut engine = example_engine(&path, 2, false);
         let reference = offline::render(&mut engine, 10_000, &Blocks::Fixed(256));
-        let stages = engine_streaming(&src, 2, true).stages();
+        let stages = example_engine(&path, 2, true).stages();
         streamed += usize::from(stages.is_some_and(|s| s.counts().0 > 0));
         for blocks in [
             Blocks::Fixed(1),
@@ -174,7 +191,7 @@ fn examples_run_the_same_in_stages_as_sample_by_sample() {
                 seed: 3,
             },
         ] {
-            let mut engine = engine_streaming(&src, 2, true);
+            let mut engine = example_engine(&path, 2, true);
             let got = offline::render(&mut engine, 10_000, &blocks);
             assert!(got == reference, "{path:?} differs with {blocks:?}");
         }

@@ -125,6 +125,17 @@ pub enum Instr {
         time: Operand,
         want: u16,
     },
+    /// `dst` = channel `channel` of audio file `audio` (see
+    /// [`Code::audios`]) at frame `at` plus `part` of one from its start,
+    /// read between frames (see [`read_audio`]). The two are added in `f64`,
+    /// so a position far into a long file stays exact.
+    AudioRead {
+        dst: Reg,
+        audio: u16,
+        channel: u16,
+        at: Operand,
+        part: Operand,
+    },
     /// Note in ceiling `slot` if `x` goes past `ceiling` (see
     /// [`Code::ceilings`]).
     Want {
@@ -220,6 +231,15 @@ pub enum VInstr {
         time: VArg,
         want: u16,
         want_stride: u16,
+    },
+    /// Lane `k` reads channel `channel` of audio file `audio` at lane `k`
+    /// of `at`, as [`Instr::AudioRead`] does.
+    AudioRead {
+        d: Reg,
+        audio: u16,
+        channel: u16,
+        at: VArg,
+        part: VArg,
     },
     /// Lane `k` reads `info` of the instance of `seq` whose id is lane `k`
     /// of `id`, as [`Instr::SeqRead`] does.
@@ -570,6 +590,9 @@ pub struct Code {
     /// Per delay line ([`Instr::DelayRead`]), its length in samples,
     /// allocated when the program is built.
     pub delays: Vec<u32>,
+    /// Per audio file the program reads (see [`Instr::AudioRead`]), its
+    /// samples at the host rate, one buffer per channel.
+    pub audios: Vec<std::sync::Arc<[Box<[f32]>]>>,
     /// What every piece of state is called, so a new build of the program
     /// can take it over (see [`StateKeys`]).
     pub keys: StateKeys,
@@ -858,6 +881,17 @@ fn list(s: &mut String, instrs: &[Instr]) {
             Instr::SeqRead { dst, seq, info, id } => {
                 format!("r{dst} = {info:?} of seq {seq} instance {}", op(id))
             }
+            Instr::AudioRead {
+                dst,
+                audio,
+                channel,
+                at,
+                part,
+            } => format!(
+                "r{dst} = audio {audio} channel {channel} at {} + {}",
+                op(at),
+                op(part)
+            ),
             Instr::SetSlot {
                 seq,
                 slot,
@@ -1791,6 +1825,7 @@ impl Program {
                         seqs: &code.seqs,
                         slots: &run.slots,
                         at: None,
+                        audios: &code.audios,
                     };
                     run_lanes(block, n, &mut run.regs, state);
                 }
@@ -2166,6 +2201,7 @@ fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
                     seqs: &code.seqs,
                     slots: &run.slots,
                     at: run.at,
+                    audios: &code.audios,
                 };
                 run_vector(&code.vectors[block as usize], regs, state);
             }
@@ -2253,6 +2289,11 @@ fn check_vector(block: &VectorBlock, regs: usize, noises: usize, delays: usize, 
                 arg(id);
                 d
             }
+            VInstr::AudioRead { d, at, part, .. } => {
+                arg(at);
+                arg(part);
+                d
+            }
             VInstr::DelayWrite { line, stride, x } => {
                 arg(x);
                 assert!(stride > 0, "lanes cannot write one delay line");
@@ -2279,6 +2320,8 @@ struct LaneState<'a> {
     seqs: &'a [SeqTable],
     slots: &'a [Vec<Slot>],
     at: Option<usize>,
+    /// The audio files, for [`VInstr::AudioRead`].
+    audios: &'a [std::sync::Arc<[Box<[f32]>]>],
 }
 
 /// Where a vector operand's values come from, settled before a loop runs.
@@ -2385,6 +2428,19 @@ fn run_lanes(block: &VectorBlock, n: usize, regs: &mut [f32], state: LaneState) 
                     state.rate,
                     n,
                 ),
+                VInstr::AudioRead {
+                    d,
+                    audio,
+                    channel,
+                    at,
+                    part,
+                } => {
+                    let (dp, at, part) = (p.add(d as usize), src(at), src(part));
+                    let data = &state.audios[usize::from(audio)][usize::from(channel)];
+                    for k in 0..n {
+                        *dp.add(k) = read_audio(data, at.at(k), part.at(k));
+                    }
+                }
                 VInstr::SeqRead { d, seq, info, id } => {
                     let (dp, id) = (p.add(d as usize), src(id));
                     let seq = usize::from(seq);
@@ -2627,6 +2683,34 @@ fn read_delay(data: &[f32], at: usize, t: f32) -> f32 {
     a + (b - a) * frac
 }
 
+/// `data` at frame `at` plus `part` of one, between frames on a cubic
+/// through the four nearest; silence before the start and from the end on.
+/// A position a hair off a whole frame (as `t * RATE` can be in floating
+/// point) reads that frame exactly.
+fn read_audio(data: &[f32], at: f32, part: f32) -> f32 {
+    let pos = f64::from(at) + f64::from(part);
+    let len = data.len();
+    if !(pos >= 0.0 && pos < len as f64) {
+        return 0.0;
+    }
+    let near = pos.round();
+    if (pos - near).abs() < 1e-3 {
+        return data.get(near as usize).copied().unwrap_or(0.0);
+    }
+    let i = pos.floor() as usize;
+    let t = (pos - pos.floor()) as f32;
+    let x = |k: isize| {
+        let k = i as isize + k;
+        if k < 0 { 0.0 } else { data.get(k as usize).copied().unwrap_or(0.0) }
+    };
+    let (y0, y1, y2, y3) = (x(-1), x(0), x(1), x(2));
+    // Catmull-Rom: through y1 at 0 and y2 at 1.
+    let c1 = 0.5 * (y2 - y0);
+    let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+    ((c3 * t + c2) * t + c1) * t + y1
+}
+
 /// Run one instruction the general way; a jump's target if it jumps.
 fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
     let regs = &mut run.regs[..];
@@ -2670,6 +2754,7 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
                 seqs: &code.seqs,
                 slots: &run.slots,
                 at: run.at,
+                audios: &code.audios,
             };
             run_vector(&code.vectors[block as usize], regs, state);
         }
@@ -2692,6 +2777,16 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
                     stop(run, seq, k, EventKind::Halted);
                 }
             }
+        }
+        Instr::AudioRead {
+            dst,
+            audio,
+            channel,
+            at,
+            part,
+        } => {
+            let data = &code.audios[usize::from(audio)][usize::from(channel)];
+            regs[dst as usize] = read_audio(data, val(regs, at), val(regs, part));
         }
         Instr::SeqRead { dst, seq, info, id } => {
             let seq = usize::from(seq);

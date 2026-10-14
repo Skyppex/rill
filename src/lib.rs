@@ -5,6 +5,7 @@
 //! `device` feature) or offline through a simulated callback loop
 //! ([`offline`]).
 
+pub mod audio;
 pub mod denormal;
 #[cfg(feature = "device")]
 pub mod device;

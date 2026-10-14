@@ -24,6 +24,11 @@ pub enum Type {
     /// How fast a level falls over an interval: `Gain / Interval`, as in
     /// `12dB / 1oct`. Stored in dB per octave. Always a constant.
     Slope,
+    /// An audio file, as in `const KICK = ./kick.wav`: `Audio<2>` for a
+    /// stereo one. The channel count is part of the type, so what `read`
+    /// gives is a frame of known size; `None` is written `Audio` and takes
+    /// any count.
+    Audio(Option<Size>),
     /// What an `on` handler of an event receives, as in `NoteOn` for a
     /// `note_on` event. Never `ControlChange`, whose payload is a `Float`.
     Event(crate::event::EventKind),
@@ -116,6 +121,8 @@ impl fmt::Display for Type {
             Type::Interval => f.write_str("Interval"),
             Type::Gain => f.write_str("Gain"),
             Type::Slope => f.write_str("Slope"),
+            Type::Audio(None) => f.write_str("Audio"),
+            Type::Audio(Some(n)) => write!(f, "Audio<{n}>"),
             Type::Event(kind) => f.write_str(kind.type_name()),
             Type::Num => f.write_str("number"),
             Type::Frame(elem, size) => write!(f, "[{elem}; {size}]"),
@@ -243,6 +250,8 @@ pub fn coerces(from: &Type, to: &Type) -> bool {
         // A plain number is an amplitude factor, which is what a gain is.
         (Type::Num | Type::Sample | Type::Float, Type::Gain) => true,
         (Type::Frame(a, n), Type::Frame(b, m)) if n == m => coerces(a, b),
+        // `Audio` takes a file with any number of channels.
+        (Type::Audio(_), Type::Audio(None)) => true,
         (Type::Frame(a, Size::Const(1)), b) => coerces(a, b),
         (a, Type::Frame(b, Size::Const(1))) => coerces(a, b),
         // A function fits where it can be called the same way: it accepts

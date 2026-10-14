@@ -356,7 +356,7 @@ impl Printer<'_> {
         let ty = self.checked.types[e.id as usize].to_string();
         let typed = |label: Label| label.plain(" : ").ty(&ty);
         match &e.kind {
-            ExprKind::Number { .. } | ExprKind::Bool(_) => {
+            ExprKind::Number { .. } | ExprKind::Bool(_) | ExprKind::Path(_) => {
                 Node::leaf(typed(Label::default().value(self.text(e.span))))
             }
             ExprKind::Name(name) if super::prelude::constant(name).is_some() => {

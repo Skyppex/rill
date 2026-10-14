@@ -371,17 +371,18 @@ impl Live {
                     lang::load_file(path, &lang::Disk, &self.config, &self.entry, &self.options);
                 let result = result.map(|(graph, checked)| {
                     let random = checked.uses_prelude("random");
-                    (graph, checked.warnings, random)
+                    let audio: Vec<PathBuf> = checked.audio.into_values().collect();
+                    (graph, checked.warnings, random, audio)
                 });
                 (sources, result)
             }
             Origin::Text(src) => (
                 SourceMap::single("", src.as_str()),
                 lang::load_with(src, &self.config, &self.entry, &self.options)
-                    .map(|(graph, warnings)| (graph, warnings, false)),
+                    .map(|(graph, warnings)| (graph, warnings, false, Vec::new())),
             ),
         };
-        let (graph, warnings, random) = match result {
+        let (graph, warnings, random, audio) = match result {
             Ok(built) => built,
             Err(errors) => return Err(Failed { sources, errors }),
         };
@@ -390,11 +391,18 @@ impl Live {
             errors: vec![Diagnostic::error(lang::Span::default(), e.to_string())],
         })?;
         let report = engine.plan_takeover(&self.keys);
+        // The audio files it reads count too: replacing `kick.wav` plays
+        // the new sound.
         self.files = sources
             .files
             .iter()
             .filter_map(|f| f.path.clone())
             .collect();
+        for file in audio {
+            if !self.files.contains(&file) {
+                self.files.push(file);
+            }
+        }
         Ok((
             engine,
             Reloaded {

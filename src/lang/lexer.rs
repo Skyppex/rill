@@ -321,7 +321,24 @@ impl<'a> Lexer<'a> {
                 self.push(TokenKind::Eof, start);
                 return Ok(std::mem::take(&mut self.tokens));
             }
-            if c.is_ascii_digit() {
+            // `.5` is a number too, except where a `.` reads a field or
+            // part of a value (`note.velocity`, `xs[0].5` is an error).
+            let fraction = c == b'.'
+                && self.peek(1).is_ascii_digit()
+                && !self.tokens.last().is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        TokenKind::Ident
+                            | TokenKind::Number { .. }
+                            | TokenKind::RParen
+                            | TokenKind::RBracket
+                            | TokenKind::RBrace
+                            | TokenKind::True
+                            | TokenKind::False
+                            | TokenKind::Dot
+                    )
+                });
+            if c.is_ascii_digit() || fraction {
                 let kind = self.number()?;
                 self.push(kind, start);
                 continue;
@@ -572,6 +589,37 @@ mod tests {
             unit,
             integral,
         }
+    }
+
+    #[test]
+    fn fractions_without_a_leading_zero() {
+        let kinds = |src: &str| -> Vec<TokenKind> {
+            lex(src).unwrap().into_iter().map(|t| t.kind).collect()
+        };
+        assert_eq!(kinds(".5"), [num(0.5, None, false), TokenKind::Eof]);
+        assert_eq!(
+            kinds("-.25 * .5Hz"),
+            [
+                TokenKind::Minus,
+                num(0.25, None, false),
+                TokenKind::Star,
+                num(0.5, Some(Unit::Hz), false),
+                TokenKind::Eof
+            ]
+        );
+        // A range, a field and a field after an index read as before.
+        assert_eq!(
+            kinds("0..5"),
+            [
+                num(0.0, None, true),
+                TokenKind::DotDot,
+                num(5.0, None, true),
+                TokenKind::Eof
+            ]
+        );
+        assert_eq!(kinds("n.velocity")[1], TokenKind::Dot);
+        assert_eq!(kinds("x.5")[1], TokenKind::Dot);
+        assert_eq!(kinds("f(x).5")[4], TokenKind::Dot);
     }
 
     #[test]

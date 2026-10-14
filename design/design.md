@@ -95,6 +95,8 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `fn(A, B) R` | A function value | Pure, takes exactly what it declares |
 | `rill(A, B) R` | A rill value | Stateful, lifts like a named rill |
 
+Numbers are written as `440`, `0.5` or `.5`, `48_000`, `1e-3`, with a unit right after where they have one (`440Hz`, `.5s`, `-6dB`).
+
 Plain numbers convert with `as`: `x as Float`, `x as Sample`, `x as Int` (which truncates toward zero). `as` binds tighter than arithmetic, so `a + b as Int` casts only `b`. Units and levels never disappear by a cast: `freq / 1Hz` gives a plain number, and `amp(g)` the factor of a level.
 
 Lifting rules:

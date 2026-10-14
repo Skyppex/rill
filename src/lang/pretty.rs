@@ -554,6 +554,9 @@ impl Printer<'_> {
                 if let Some(v) = &st.velocity {
                     l = l.plain(" ").op("@").value(self.text(v.span));
                 }
+                if let Some((span, _)) = st.flags {
+                    l = l.plain(" ").value(self.text(span));
+                }
                 Node::leaf(l)
             })
             .collect();

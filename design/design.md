@@ -305,7 +305,8 @@ rill main(speed: Freq = 120bpm) Sample {
 }
 ```
 
-- **Steps** are separated by commas: a pitch, a chord (`[G4, B4]`) or a rest (`_`). `@0.5` sets a step's velocity, from 0 to 1. Each note starts with its step and ends `gate` × `step` later.
+- **Steps** are separated by commas: a pitch, a chord (`[G4, B4]`) or a rest (`_`). Each note starts with its step and ends `gate` × `step` later.
+- **A step's values** follow `@` as flags, each a letter and a value from 0 to 1: `v` velocity, `p` pressure, `t` timbre, `r` release. Letters written together share the value after them, so `G3@v.5p1rt.3` is velocity 0.5, pressure 1, and release and timbre 0.3. A bare value is the velocity: `E4@0.5`. Velocity goes with the `note_on`, pressure and timbre with its `note_change`, and release with the `note_off`. On a chord, the values go to every note.
 - **Settings** are all optional:
 
   | Setting | Default | When |
@@ -314,6 +315,7 @@ rill main(speed: Freq = 120bpm) Sample {
   | `step` | `1/8` | fixed; a note value (`3/16` is a dotted eighth) |
   | `tempo` | `120bpm` | per invocation; can follow a stream while playing |
   | `gate`, `velocity` | `0.9`, `0.8` | per invocation |
+  | `pressure`, `timbre`, `release` | `0`, `0.5`, `0.5` | per invocation; for notes that do not give their own |
   | `repeat`, `loop` | `1`, `false` | per invocation |
   | `instances` | `64` | fixed; how many copies can play at once |
 
@@ -368,7 +370,7 @@ For `seq riff`, these events exist without being declared. The name says what ha
 | `bar_count` | `Float` | 1 |
 | `instances` | `Int` | 64 |
 
-Settings an invocation can change (`tempo`, `gate`, `velocity`, `repeat`, `loop`) are not fields.
+Settings an invocation can change (`tempo`, `gate`, `velocity`, `pressure`, `timbre`, `release`, `repeat`, `loop`) are not fields.
 
 ## Voices
 

@@ -868,13 +868,20 @@ impl Parser<'_> {
             } else {
                 Some(self.expr()?)
             };
-            let velocity = match self.eat(TokenKind::At) {
-                Some(_) => Some(self.unary()?),
-                None => None,
+            let mut flags = None;
+            let velocity = if let TokenKind::Flags(values) = self.peek().kind {
+                flags = Some((self.bump().span, values));
+                None
+            } else {
+                match self.eat(TokenKind::At) {
+                    Some(_) => Some(self.unary()?),
+                    None => None,
+                }
             };
             steps.push(Step {
                 notes,
                 velocity,
+                flags,
                 span: self.span_from(at),
             });
             if self.eat(TokenKind::Comma).is_none() {

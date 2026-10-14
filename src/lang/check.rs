@@ -1348,6 +1348,17 @@ impl Checker {
                         self.report(e);
                     }
                 }
+                if let Some((span, values)) = step.flags {
+                    if step.notes.is_none() {
+                        let e = self.error(span, "a rest has no notes to give values to");
+                        self.report(e);
+                    } else if values.iter().flatten().any(|v| !(0.0..=1.0).contains(v)) {
+                        let e = self
+                            .error(span, "a step's values are from 0 to 1")
+                            .with_help("as in `@v.5p1`");
+                        self.report(e);
+                    }
+                }
             }
         }
         self.scopes.pop();
@@ -1370,6 +1381,9 @@ impl Checker {
                 Some("`gate` is a fraction of the step, above 0 and at most 1")
             }
             "velocity" if !(0.0..=1.0).contains(&v) => Some("a velocity is from 0 to 1"),
+            "pressure" if !(0.0..=1.0).contains(&v) => Some("a pressure is from 0 to 1"),
+            "timbre" if !(0.0..=1.0).contains(&v) => Some("a timbre is from 0 to 1"),
+            "release" if !(0.0..=1.0).contains(&v) => Some("a release is from 0 to 1"),
             "repeat" | "instances" if v < 1.0 || v.fract() != 0.0 => {
                 Some("this is a whole number, at least 1")
             }
@@ -4723,7 +4737,7 @@ pub fn fraction(e: &Expr) -> Option<(u32, u32)> {
 pub fn seq_setting(name: &str) -> Option<(Type, bool)> {
     Some(match name {
         "tempo" => (Type::Freq, false),
-        "gate" | "velocity" => (Type::Float, false),
+        "gate" | "velocity" | "pressure" | "timbre" | "release" => (Type::Float, false),
         "repeat" => (Type::Int, false),
         "loop" => (Type::Bool, false),
         "instances" => (Type::Int, true),
@@ -4731,8 +4745,8 @@ pub fn seq_setting(name: &str) -> Option<(Type, bool)> {
     })
 }
 
-const SEQ_SETTINGS: &str =
-    "`meter`, `step`, `tempo`, `gate`, `velocity`, `repeat`, `loop` and `instances`";
+const SEQ_SETTINGS: &str = "`meter`, `step`, `tempo`, `gate`, `velocity`, `pressure`, `timbre`, \
+                            `release`, `repeat`, `loop` and `instances`";
 
 /// The type of field `name` of an event payload of kind `kind`.
 fn event_field_type(kind: EventKind, name: &str) -> Option<Type> {

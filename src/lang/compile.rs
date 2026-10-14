@@ -506,7 +506,7 @@ pub fn seq_tables(
             name: seq.name.name.clone(),
             step_beats: 0.0,
             steps: Vec::new(),
-            settings: [2.0, 0.9, 0.8],
+            settings: [2.0, 0.9, 0.8, 0.0, 0.5, 0.5],
             repeat: 1,
             looping: false,
             instances: 64,
@@ -532,6 +532,9 @@ pub fn seq_tables(
                         "tempo" => table.settings[super::vm::TEMPO] = value,
                         "gate" => table.settings[super::vm::GATE] = value.clamp(1e-6, 1.0),
                         "velocity" => table.settings[super::vm::VELOCITY] = value.clamp(0.0, 1.0),
+                        "pressure" => table.settings[super::vm::PRESSURE] = value.clamp(0.0, 1.0),
+                        "timbre" => table.settings[super::vm::TIMBRE] = value.clamp(0.0, 1.0),
+                        "release" => table.settings[super::vm::RELEASE] = value.clamp(0.0, 1.0),
                         "repeat" => table.repeat = value.max(1.0) as u32,
                         "loop" => table.looping = value != 0.0,
                         "instances" => table.instances = value.clamp(1.0, 65_535.0) as u16,
@@ -557,11 +560,12 @@ pub fn seq_tables(
                 }
                 None => Vec::new(),
             };
-            let velocity = match &st.velocity {
-                Some(v) => Some(c.constant(v)?.clamp(0.0, 1.0)),
-                None => None,
-            };
-            table.steps.push(SeqStep { pitches, velocity });
+            let mut values = st.flags.map_or([None; 4], |(_, v)| v);
+            if let Some(v) = &st.velocity {
+                values[0] = Some(c.constant(v)?);
+            }
+            let values = values.map(|v| v.map(|v| v.clamp(0.0, 1.0)));
+            table.steps.push(SeqStep { pitches, values });
         }
         tables.push(table);
     }
@@ -1824,7 +1828,7 @@ impl<'a> Compiler<'a> {
         };
         let call = self.calls.len() as u16;
         let dst = self.reg()?;
-        let mut settings = [Source::Default; 3];
+        let mut settings = [Source::Default; super::vm::SETTINGS];
         let mut repeat = None;
         let mut looping = None;
         let mut captures: Vec<Operand> = Vec::new();
@@ -1837,6 +1841,9 @@ impl<'a> Compiler<'a> {
                 "tempo" => super::vm::TEMPO,
                 "gate" => super::vm::GATE,
                 "velocity" => super::vm::VELOCITY,
+                "pressure" => super::vm::PRESSURE,
+                "timbre" => super::vm::TIMBRE,
+                "release" => super::vm::RELEASE,
                 "repeat" => {
                     repeat = Some(self.expr(&a.value)?.scalar());
                     continue;

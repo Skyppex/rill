@@ -624,8 +624,9 @@ pub struct SeqTable {
     /// Length of one step in beats.
     pub step_beats: f64,
     pub steps: Vec<SeqStep>,
-    /// Defaults: tempo in beats per second, gate, velocity.
-    pub settings: [f32; 3],
+    /// Defaults, in [`TEMPO`]... [`RELEASE`] order (a tempo in beats per
+    /// second).
+    pub settings: [f32; SETTINGS],
     pub repeat: u32,
     pub looping: bool,
     pub instances: u16,
@@ -637,7 +638,9 @@ pub struct SeqTable {
 pub struct SeqStep {
     /// Empty for a rest.
     pub pitches: Vec<f32>,
-    pub velocity: Option<f32>,
+    /// The step's own velocity, pressure, timbre and release, where it
+    /// gives them (in [`VELOCITY`]... [`RELEASE`] order, from index 0).
+    pub values: [Option<f32>; 4],
 }
 
 /// Index of each followed setting, in [`SeqTable::settings`] and
@@ -645,6 +648,11 @@ pub struct SeqStep {
 pub const TEMPO: usize = 0;
 pub const GATE: usize = 1;
 pub const VELOCITY: usize = 2;
+pub const PRESSURE: usize = 3;
+pub const TIMBRE: usize = 4;
+pub const RELEASE: usize = 5;
+/// How many settings a sequence has that can follow streams.
+pub const SETTINGS: usize = 6;
 
 /// Where a playing sequence takes a setting from.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -670,8 +678,8 @@ pub struct InvokeCall {
     pub step: Option<Operand>,
     /// Receives the instance id.
     pub dst: Reg,
-    /// Tempo, gate and velocity.
-    pub settings: [Source; 3],
+    /// In [`TEMPO`]... [`RELEASE`] order.
+    pub settings: [Source; SETTINGS],
     pub repeat: Option<Operand>,
     pub looping: Option<Operand>,
     /// Values kept with the instance for settings computed per instance.
@@ -779,9 +787,6 @@ fn list(s: &mut String, instrs: &[Instr]) {
     }
 }
 
-/// The release velocity of notes ended by a sequence, as MIDI's default.
-const SEQ_RELEASE: f32 = 0.5;
-
 /// Positions add up tempo / rate every tick, so a step due at 0.5 beats
 /// can be reached as 0.49999999999; this keeps it on its own sample.
 const EPS: f64 = 1e-9;
@@ -807,11 +812,11 @@ struct Slot {
     repeats: u32,
     looping: bool,
     /// Tempo, gate and velocity.
-    values: [f32; 3],
-    sources: [Source; 3],
+    values: [f32; SETTINGS],
+    sources: [Source; SETTINGS],
     captures: Vec<f32>,
-    /// Notes sounding: pitch, and the position their note-off is due.
-    held: Vec<(f32, f64)>,
+    /// Notes sounding.
+    held: Vec<Held>,
     /// The pass it is on, from 1.
     pass: u32,
     /// The step it is on (the last one started), from 0.
@@ -826,6 +831,16 @@ struct Slot {
     finishing: bool,
     /// The `note_change` that follows the `note_on` just sent.
     change: Option<Payload>,
+}
+
+/// A note a sequence instance is sounding.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Held {
+    pitch: f32,
+    /// The position its note-off is due.
+    off: f64,
+    /// The release its note-off has.
+    release: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1512,7 +1527,7 @@ impl Program {
         let rate = f64::from(self.run.rate);
         for slots in &mut self.run.slots {
             for slot in slots.iter_mut().filter(|s| s.active) {
-                for s in 0..3 {
+                for s in 0..SETTINGS {
                     if let Source::Follow(r) = slot.sources[s] {
                         slot.values[s] = self.run.regs[r as usize];
                     }
@@ -1568,7 +1583,7 @@ impl Program {
         let (code, run) = (&self.code, &mut self.run);
         for slots in &mut run.slots {
             for slot in slots.iter_mut().filter(|s| s.active) {
-                for s in 0..3 {
+                for s in 0..SETTINGS {
                     if let Source::Follow(r) = slot.sources[s] {
                         slot.values[s] = match code.input_regs.iter().position(|&x| x == r) {
                             Some(k) => inputs.get(k).at(i),
@@ -1594,7 +1609,7 @@ impl Program {
                 let beat_at = f64::from(slot.beat);
                 let beats_left = beat_at < total - EPS;
                 let steps_left = slot.next < len;
-                if slot.held.iter().any(|&(_, off)| off <= pos)
+                if slot.held.iter().any(|h| h.off <= pos)
                     || (beats_left && beat_at <= pos)
                     || (steps_left && slot.next as f64 * table.step_beats <= pos)
                     || (!beats_left && !steps_left && total <= pos)
@@ -1717,11 +1732,11 @@ fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
         }
         let (id, pos, pass) = (slot.id, slot.pos, slot.pass as i32);
         let seq = |kind, values| Some(Payload::Seq { kind, values });
-        if let Some(h) = slot.held.iter().position(|&(_, off)| off <= pos + EPS) {
-            let (pitch, _) = slot.held.swap_remove(h);
+        if let Some(h) = slot.held.iter().position(|h| h.off <= pos + EPS) {
+            let h = slot.held.swap_remove(h);
             return Some(Payload::NoteOff {
-                pitch,
-                release: SEQ_RELEASE,
+                pitch: h.pitch,
+                release: h.release,
                 instance: id,
             });
         }
@@ -1741,17 +1756,17 @@ fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
                 slot.pass += 1;
                 slot.pos -= total;
                 for h in &mut slot.held {
-                    h.1 -= total;
+                    h.off -= total;
                 }
                 slot.next = 0;
                 slot.chord = 0;
                 slot.beat = 0;
                 return seq(EventKind::Repeated, [id, slot.pass as i32, 0, 0]);
             }
-            if let Some((pitch, _)) = slot.held.pop() {
+            if let Some(h) = slot.held.pop() {
                 return Some(Payload::NoteOff {
-                    pitch,
-                    release: SEQ_RELEASE,
+                    pitch: h.pitch,
+                    release: h.release,
                     instance: id,
                 });
             }
@@ -1798,14 +1813,26 @@ fn next_event(table: &SeqTable, slot: &mut Slot) -> Option<Payload> {
         if let Some(&pitch) = step.pitches.get(slot.chord) {
             slot.chord += 1;
             let gate = f64::from(slot.values[GATE].clamp(1e-6, 1.0));
-            slot.held.push((pitch, step_at + gate * sb));
-            let on = Payload::NoteOn {
+            // The step's own values, else the instance's.
+            let value = |k: usize| step.values[k - VELOCITY].unwrap_or(slot.values[k]);
+            slot.held.push(Held {
                 pitch,
-                velocity: step.velocity.unwrap_or(slot.values[VELOCITY]),
+                off: step_at + gate * sb,
+                release: value(RELEASE),
+            });
+            slot.change = Some(Payload::NoteChange {
+                pitch,
+                pressure: value(PRESSURE),
+                timbre: value(TIMBRE),
+                slide: false,
                 instance: id,
-            };
-            slot.change = on.starting_change();
-            return Some(on);
+                from: pitch,
+            });
+            return Some(Payload::NoteOn {
+                pitch,
+                velocity: value(VELOCITY),
+                instance: id,
+            });
         }
         slot.next += 1;
         slot.chord = 0;
@@ -1823,12 +1850,12 @@ fn stop(run: &mut Run, seq: usize, k: usize, reason: EventKind) {
     slot.active = false;
     let held = slot.held.len();
     for h in 0..held {
-        let pitch = run.slots[seq][k].held[h].0;
+        let Held { pitch, release, .. } = run.slots[seq][k].held[h];
         run.send(
             seq,
             Payload::NoteOff {
                 pitch,
-                release: SEQ_RELEASE,
+                release,
                 instance: id,
             },
         );

@@ -173,6 +173,9 @@ pub struct Step {
     pub notes: Option<Expr>,
     /// `@0.5`
     pub velocity: Option<Expr>,
+    /// `@v.5p1rt.3`: velocity, pressure, timbre and release, in
+    /// [`super::lexer::FLAGS`] order, where given.
+    pub flags: Option<(Span, [Option<f32>; 4])>,
     pub span: Span,
 }
 

@@ -2339,6 +2339,67 @@ fn voices_claim_a_sequences_own_notes() {
     assert_eq!(render_with(src, 3, 1, Blocks::Fixed(1)), [0.5, 0.5, 0.5]);
 }
 
+/// What one voice heard of the notes of `steps` in `seq riff(...)`:
+/// velocity, pressure, timbre and release, after `frames` samples.
+fn note_values(settings: &str, invoke: &str, steps: &str, frames: usize) -> [f32; 4] {
+    let src = format!(
+        "seq riff(step: 1/4, tempo: 480bpm, gate: 0.5{settings}) {{ {steps} }}
+        rill main() [Sample; 4] {{
+            state v: Float = -1
+            state p: Float = -1
+            state t: Float = -1
+            state r: Float = -1
+            on start {{ invoke riff({invoke}) }}
+            on riff_note_on(n) {{ v = n.velocity }}
+            on riff_note_change(n) {{ p = n.pressure; t = n.timbre }}
+            on riff_note_off(n) {{ r = n.release }}
+            return [v, p, t, r]
+        }}"
+    );
+    let out = render_with(&src, 4, frames, Blocks::Fixed(64));
+    out[out.len() - 4..].try_into().unwrap()
+}
+
+#[test]
+fn steps_give_their_notes_values_with_flags() {
+    // A step at 480bpm in quarters is 6000 samples; the note-off comes at
+    // half of it.
+    assert_eq!(
+        note_values("", "", "C4@v.5p1rt.3", 4000),
+        [0.5, 1.0, 0.3, 0.3]
+    );
+    // Without flags: the sequence's defaults.
+    assert_eq!(note_values("", "", "C4", 4000), [0.8, 0.0, 0.5, 0.5]);
+    // A bare value is still the velocity.
+    assert_eq!(note_values("", "", "C4@.25", 4000), [0.25, 0.0, 0.5, 0.5]);
+    // Defaults from the sequence, then from the invocation.
+    let settings = ", pressure: .2, timbre: .7, release: .9";
+    assert_eq!(note_values(settings, "", "C4", 4000), [0.8, 0.2, 0.7, 0.9]);
+    assert_eq!(
+        note_values(settings, "pressure: .4, release: .1", "C4", 4000),
+        [0.8, 0.4, 0.7, 0.1]
+    );
+    // A step's own values win over both.
+    assert_eq!(
+        note_values(settings, "pressure: .4", "C4@p.6", 4000),
+        [0.8, 0.6, 0.7, 0.9]
+    );
+}
+
+#[test]
+fn step_flags_that_make_no_sense() {
+    let src = |steps: &str| {
+        format!(
+            "seq riff {{ {steps} }}\nrill main() Sample {{ on start {{ invoke riff }} return 0 }}"
+        )
+    };
+    let first = |steps: &str| errors(&src(steps), 1).first().cloned().unwrap_or_default();
+    assert_eq!(first("C4@v2"), "a step's values are from 0 to 1");
+    assert_eq!(first("_@p.5"), "a rest has no notes to give values to");
+    assert_eq!(first("C4@v.5v1"), "`v` is given twice");
+    assert!(errors(&src("C4@v.5, [C4, E4]@rt.3, _"), 1).is_empty());
+}
+
 #[test]
 fn restarting_when_finished() {
     // Each run finishes, and its handler starts the next one.

@@ -2,6 +2,10 @@
 
 use super::diag::{Diagnostic, Span};
 
+/// The letters of a step's values (`@v.5p1rt.3`): velocity, pressure,
+/// timbre, release.
+pub const FLAGS: [char; 4] = ['v', 'p', 't', 'r'];
+
 /// Unit suffix on a number literal, as in `440Hz` or `300ms`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
@@ -79,6 +83,9 @@ pub enum TokenKind {
         /// Written without a fraction or exponent.
         integral: bool,
     },
+    /// `@v.5p1rt.3`: a step's values, each flag letter with the value after
+    /// it, in [`FLAGS`] order.
+    Flags([Option<f32>; 4]),
     /// `"lib/osc"`: text in double quotes, on one line, with no escapes.
     /// Only module paths are strings.
     Str,
@@ -141,6 +148,7 @@ impl TokenKind {
             Ident => "a name",
             Str => "a string",
             Number { .. } => "a number",
+            Flags(_) => "a step's values (`@v.5p1`)",
             Fn => "`fn`",
             Rill => "`rill`",
             State => "`state`",
@@ -321,6 +329,19 @@ impl<'a> Lexer<'a> {
                 self.push(TokenKind::Eof, start);
                 return Ok(std::mem::take(&mut self.tokens));
             }
+            if c == b'@' && FLAGS.contains(&(self.peek(1) as char)) {
+                let end = self.pos
+                    + 1
+                    + self.bytes[self.pos + 1..]
+                        .iter()
+                        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'.' || **b == b'_')
+                        .count();
+                if self.bytes[self.pos + 1..end].iter().any(u8::is_ascii_digit) {
+                    let kind = self.flags(end)?;
+                    self.push(kind, start);
+                    continue;
+                }
+            }
             // `.5` is a number too, except where a `.` reads a field or
             // part of a value (`note.velocity`, `xs[0].5` is an error).
             let fraction = c == b'.'
@@ -498,6 +519,79 @@ impl<'a> Lexer<'a> {
     }
 
     /// `48_000`, `0.5`, `1e-3`, each optionally followed by a unit.
+    /// A step's values, `@` to `end`: groups of flag letters, each group
+    /// followed by the value they share (`@v.5p1rt.3`).
+    fn flags(&mut self, end: usize) -> Result<TokenKind, Diagnostic> {
+        let start = self.pos;
+        self.pos += 1; // @
+        let mut values = [None; 4];
+        let mut letters: Vec<(usize, usize)> = Vec::new();
+        let help = "the letters are `v` velocity, `p` pressure, `t` timbre and `r` release, \
+                    each followed by a value, as in `@v.5p1`; letters together share one (`@rt.3`)";
+        while self.pos < end {
+            let c = self.peek(0);
+            if c.is_ascii_alphabetic() {
+                let at = self.pos;
+                self.pos += 1;
+                match FLAGS.iter().position(|&f| f as u8 == c) {
+                    Some(i) => letters.push((i, at)),
+                    None => self.fail(
+                        Diagnostic::error(
+                            Span::new(at, at + 1),
+                            format!("`{}` is not one of a step's values", c as char),
+                        )
+                        .with_help(help),
+                    )?,
+                }
+                continue;
+            }
+            // The value the letters before it share.
+            let from = self.pos;
+            while self.pos < end
+                && (self.peek(0).is_ascii_digit() || matches!(self.peek(0), b'.' | b'_'))
+            {
+                self.pos += 1;
+            }
+            let text: String = self.src[from..self.pos]
+                .chars()
+                .filter(|&c| c != '_')
+                .collect();
+            let value = text.parse::<f64>().ok();
+            if value.is_none() || letters.is_empty() {
+                self.fail(
+                    Diagnostic::error(
+                        Span::new(from, self.pos.max(from + 1)),
+                        "malformed step values",
+                    )
+                    .with_help(help),
+                )?;
+            }
+            for (i, at) in letters.drain(..) {
+                if values[i].is_some() {
+                    self.fail(
+                        Diagnostic::error(
+                            Span::new(at, at + 1),
+                            format!("`{}` is given twice", FLAGS[i]),
+                        )
+                        .with_help(help),
+                    )?;
+                }
+                values[i] = value.map(|v| v as f32);
+            }
+        }
+        if let Some(&(i, at)) = letters.first() {
+            self.fail(
+                Diagnostic::error(
+                    Span::new(at, end),
+                    format!("`{}` needs a value after it", FLAGS[i]),
+                )
+                .with_help(help),
+            )?;
+        }
+        debug_assert!(self.pos >= start);
+        Ok(TokenKind::Flags(values))
+    }
+
     fn number(&mut self) -> Result<TokenKind, Diagnostic> {
         let start = self.pos;
         let digits = |l: &mut Self| {
@@ -589,6 +683,27 @@ mod tests {
             unit,
             integral,
         }
+    }
+
+    #[test]
+    fn step_values() {
+        let first = |src: &str| lex(src).unwrap()[0].kind;
+        assert_eq!(
+            first("@v.5p1rt.3"),
+            TokenKind::Flags([Some(0.5), Some(1.0), Some(0.3), Some(0.3)])
+        );
+        assert_eq!(
+            first("@p0.25"),
+            TokenKind::Flags([None, Some(0.25), None, None])
+        );
+        // Not values: a bare velocity, a name, the output rate.
+        assert_eq!(first("@.5"), TokenKind::At);
+        assert_eq!(first("@soft"), TokenKind::At);
+        assert_eq!(first("@rate"), TokenKind::At);
+        let err = |src: &str| lex(src).unwrap_err().message;
+        assert_eq!(err("@v.5v1"), "`v` is given twice");
+        assert_eq!(err("@v.5p"), "`p` needs a value after it");
+        assert_eq!(err("@v.5x1"), "`x` is not one of a step's values");
     }
 
     #[test]

@@ -165,7 +165,11 @@ pub fn build_with(
                 .params
                 .iter()
                 .zip(defaults)
-                .map(|(p, value)| graph.param(p.name.clone(), value).into())
+                .map(|(p, value)| {
+                    graph
+                        .typed_param(p.name.clone(), value, p.ty.clone())
+                        .into()
+                })
                 .collect::<Vec<Input>>();
             let id = graph.node(ProgramNode::new(code), params);
             (0..channels).map(|c| id.channel(c)).collect()

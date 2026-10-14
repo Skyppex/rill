@@ -44,6 +44,9 @@ pub(crate) struct Entry {
     pub(crate) node: Box<dyn Node>,
     pub(crate) inputs: Vec<Input>,
     pub(crate) control: Option<String>,
+    /// What a control holds, when it is known: values for it can then be
+    /// written with units (see [`crate::lang::value`]).
+    pub(crate) control_type: Option<crate::lang::types::Type>,
 }
 
 /// Where the graph sends audio.
@@ -94,6 +97,7 @@ impl Graph {
             node: Box::new(node),
             inputs: inputs.into_iter().collect(),
             control: None,
+            control_type: None,
         });
         id
     }
@@ -102,6 +106,18 @@ impl Graph {
     pub fn param(&mut self, name: impl Into<String>, initial: f32) -> NodeId {
         let id = self.node(crate::nodes::Param::new(initial), []);
         self.entries[id.0].control = Some(name.into());
+        id
+    }
+
+    /// Add a live parameter control holding values of type `ty`.
+    pub fn typed_param(
+        &mut self,
+        name: impl Into<String>,
+        initial: f32,
+        ty: crate::lang::types::Type,
+    ) -> NodeId {
+        let id = self.param(name, initial);
+        self.entries[id.0].control_type = Some(ty);
         id
     }
 

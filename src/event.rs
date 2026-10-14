@@ -9,6 +9,9 @@
 
 use std::fmt;
 
+use crate::lang::types::Type;
+use crate::lang::value::Value;
+
 /// The kinds of event. The first three can be declared and sent by hosts;
 /// the rest are made by sequences only (see [`EventKind::SEQ`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -298,7 +301,7 @@ pub enum Dispatch {
 pub fn parse_dispatch(
     decls: &[EventDecl],
     target: &str,
-    fields: &[(String, f32)],
+    fields: &[(String, Value)],
 ) -> Result<Dispatch, String> {
     let (kind, to) = match EventKind::from_name(target) {
         Some(kind) => (kind, None),
@@ -317,6 +320,15 @@ pub fn parse_dispatch(
     let mut values = [0.0f32; MAX_FIELDS];
     let (mut sender, mut channel) = (0u32, 0u32);
     for (name, value) in fields {
+        // A pitch is a `Pitch`; every other field a plain number.
+        let ty = if name == "pitch" {
+            Type::Pitch
+        } else {
+            Type::Float
+        };
+        let value = &value
+            .resolve(Some(&ty))
+            .map_err(|e| format!("`{name}`: {e}"))?;
         let whole = |what: &str| {
             if *value >= 0.0 && value.fract() == 0.0 && *value <= u32::MAX as f32 {
                 Ok(*value as u32)
@@ -367,8 +379,10 @@ mod tests {
         }]
     }
 
-    fn fields(xs: &[(&str, f32)]) -> Vec<(String, f32)> {
-        xs.iter().map(|(n, v)| ((*n).to_owned(), *v)).collect()
+    fn fields(xs: &[(&str, f32)]) -> Vec<(String, Value)> {
+        xs.iter()
+            .map(|(n, v)| ((*n).to_owned(), Value::number(f64::from(*v))))
+            .collect()
     }
 
     #[test]
@@ -433,5 +447,14 @@ mod tests {
         assert!(parse_dispatch(&decls(), "keys", &fields(&[("channel", 1.0)])).is_err());
         assert!(parse_dispatch(&decls(), "nope", &[]).is_err());
         assert!(parse_dispatch(&decls(), "note_on", &fields(&[("sender", 1.5)])).is_err());
+        // Fields are written as in the language: a pitch by name, and no
+        // units on a plain number.
+        let written = |f: &str, v: &str| vec![(f.to_owned(), Value::parse(v).unwrap())];
+        assert_eq!(
+            parse_dispatch(&decls(), "keys", &written("pitch", "A4")),
+            parse_dispatch(&decls(), "keys", &fields(&[("pitch", 69.0)]))
+        );
+        let unit = parse_dispatch(&decls(), "keys", &written("velocity", "-6dB")).unwrap_err();
+        assert!(unit.starts_with("`velocity`: "), "{unit}");
     }
 }

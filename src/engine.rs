@@ -125,6 +125,8 @@ pub struct Engine {
     outputs: Vec<Port>,
     /// Live controls by public name and scheduled node slot.
     controls: Vec<(String, usize)>,
+    /// What each control holds, by name, where it is known.
+    control_types: Vec<(String, crate::lang::types::Type)>,
     /// Declared events, indexed by [`EventId`].
     events: Vec<EventDecl>,
     position: u64,
@@ -238,12 +240,16 @@ impl Engine {
         let mut ports = Vec::new();
         let mut port_ranges = Vec::with_capacity(order.len());
         let mut controls = Vec::new();
+        let mut control_types = Vec::new();
         for &i in &order {
             let start = ports.len();
             ports.extend(entries[i].inputs.iter().map(resolve));
             port_ranges.push((start, ports.len()));
             if let Some(name) = &entries[i].control {
                 controls.push((name.clone(), port_ranges.len() - 1));
+                if let Some(ty) = &entries[i].control_type {
+                    control_types.push((name.clone(), ty.clone()));
+                }
             }
         }
         let outputs = outputs.iter().map(resolve).collect();
@@ -267,6 +273,7 @@ impl Engine {
             buffers,
             outputs,
             controls,
+            control_types,
             events,
             position: 0,
             takeover: None,
@@ -396,6 +403,45 @@ impl Engine {
     /// Names of live controls exposed by the graph.
     pub fn params(&self) -> impl Iterator<Item = &str> {
         self.controls.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// What live parameter `name` holds, if that is known (parameters of a
+    /// compiled program), so values for it can be written with units: see
+    /// [`crate::lang::value::Value::resolve`].
+    pub fn param_type(&self, name: &str) -> Option<&crate::lang::types::Type> {
+        self.control_types
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, ty)| ty)
+    }
+
+    /// The value to set live parameter `name` to, as written (`-6dB`):
+    /// checked against the parameter's type, in the units it runs on.
+    pub fn param_value(
+        &self,
+        name: &str,
+        value: &crate::lang::value::Value,
+    ) -> Result<f32, String> {
+        let known = self.params().collect::<Vec<_>>();
+        if !known.contains(&name) {
+            let available = if known.is_empty() {
+                "this program exposes no live parameters".to_owned()
+            } else {
+                format!("available: {}", known.join(", "))
+            };
+            return Err(format!("unknown live parameter `{name}` ({available})"));
+        }
+        value
+            .resolve(self.param_type(name))
+            .map_err(|e| format!("parameter `{name}`: {e}"))
+    }
+
+    /// A note on a value for live parameter `name` that is allowed but
+    /// probably a slip (see [`crate::lang::value::Value::hint`]).
+    pub fn param_hint(&self, name: &str, value: &crate::lang::value::Value) -> Option<String> {
+        value
+            .hint(self.param_type(name))
+            .map(|h| format!("parameter `{name}`: {h}"))
     }
 
     /// Set a live parameter by name. Returns `false` if the graph exposes no

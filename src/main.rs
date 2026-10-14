@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use rill::lang::value::Value;
 use rill::offline::{self, Blocks};
 use rill::wav::{self, WavFormat};
 use rill::{Config, Engine, Graph, ParamEvent, RillEvent, patches};
@@ -169,7 +170,9 @@ enum Format {
 #[derive(Clone, Debug, PartialEq)]
 struct ScheduledParamEvent {
     name: String,
-    value: f32,
+    /// As written; checked against the parameter's type once the program
+    /// is built.
+    value: Value,
     time_seconds: f32,
 }
 
@@ -178,7 +181,7 @@ struct ScheduledRillEvent {
     /// An event kind (`note_on`) or the name of a declared event.
     target: String,
     time_seconds: f32,
-    fields: Vec<(String, f32)>,
+    fields: Vec<(String, Value)>,
 }
 
 fn parse_param_event(input: &str) -> Result<ScheduledParamEvent, String> {
@@ -191,9 +194,7 @@ fn parse_param_event(input: &str) -> Result<ScheduledParamEvent, String> {
     if name.is_empty() {
         return Err("parameter name cannot be empty".to_owned());
     }
-    let value = value
-        .parse::<f32>()
-        .map_err(|_| format!("`{value}` is not a number"))?;
+    let value = Value::parse(value)?;
     let time_seconds = parse_time_seconds(time)?;
     Ok(ScheduledParamEvent {
         name: name.to_owned(),
@@ -213,7 +214,7 @@ fn parse_rill_event(input: &str) -> Result<ScheduledRillEvent, String> {
         return Err("event name cannot be empty".to_owned());
     }
     let time_seconds = parse_time_seconds(time)?;
-    let mut values: Vec<(String, f32)> = Vec::new();
+    let mut values: Vec<(String, Value)> = Vec::new();
     if !fields.is_empty() {
         for field in fields.split(',') {
             let (name, value) = field
@@ -222,20 +223,13 @@ fn parse_rill_event(input: &str) -> Result<ScheduledRillEvent, String> {
             if name.is_empty() {
                 return Err("event field name cannot be empty".to_owned());
             }
-            values.push((name.to_owned(), parse_event_value(value)?));
+            values.push((name.to_owned(), Value::parse(value)?));
         }
     }
     Ok(ScheduledRillEvent {
         target: name.to_owned(),
         time_seconds,
         fields: values,
-    })
-}
-
-fn parse_event_value(input: &str) -> Result<f32, String> {
-    input.parse::<f32>().or_else(|_| {
-        rill::lang::check::pitch_literal(input)
-            .ok_or_else(|| format!("`{input}` is not a number or pitch"))
     })
 }
 
@@ -335,7 +329,9 @@ enum Command {
         /// Request a fixed callback size from the device.
         #[arg(long)]
         buffer: Option<u32>,
-        /// Simulate a live control change, e.g. `gain=0.8@500ms`.
+        /// Simulate a live control change, e.g. `volume=-6dB@500ms` or
+        /// `cutoff=2kHz@1s`. Units are as in Rill and must fit the
+        /// parameter; a plain number is the value as the program holds it.
         #[arg(long = "param-event", value_name = "NAME=VALUE@TIME", value_parser = parse_param_event)]
         param_events: Vec<ScheduledParamEvent>,
         /// Send an event. `note_on@1s:sender=5,channel=1,pitch=A4,velocity=0.8`
@@ -398,7 +394,9 @@ enum Command {
         block: usize,
         #[arg(long, value_enum, default_value_t = Format::F32)]
         format: Format,
-        /// Simulate a live control change, e.g. `gain=0.8@500ms`.
+        /// Simulate a live control change, e.g. `volume=-6dB@500ms` or
+        /// `cutoff=2kHz@1s`. Units are as in Rill and must fit the
+        /// parameter; a plain number is the value as the program holds it.
         #[arg(long = "param-event", value_name = "NAME=VALUE@TIME", value_parser = parse_param_event)]
         param_events: Vec<ScheduledParamEvent>,
         /// Send an event. `note_on@1s:sender=5,channel=1,pitch=A4,velocity=0.8`
@@ -604,15 +602,11 @@ fn render_with_events(
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let channels = engine.config().out_channels;
     let rate = engine.config().sample_rate as f32;
-    let known = engine.params().collect::<Vec<_>>();
+    let mut values = Vec::with_capacity(param_events.len());
     for event in param_events {
-        if !known.contains(&event.name.as_str()) {
-            let available = if known.is_empty() {
-                "this program exposes no live parameters".to_owned()
-            } else {
-                format!("available: {}", known.join(", "))
-            };
-            return Err(format!("unknown live parameter `{}` ({available})", event.name).into());
+        values.push(engine.param_value(&event.name, &event.value)?);
+        if let Some(hint) = engine.param_hint(&event.name, &event.value) {
+            eprintln!("rill: note: {hint}");
         }
         if (event.time_seconds * rate).round() as usize > frames {
             return Err(format!(
@@ -636,9 +630,10 @@ fn render_with_events(
 
     let mut scheduled_params = param_events
         .iter()
-        .map(|e| ((e.time_seconds * rate).round() as usize, e))
+        .zip(values)
+        .map(|(e, v)| ((e.time_seconds * rate).round() as usize, e, v))
         .collect::<Vec<_>>();
-    scheduled_params.sort_by_key(|(frame, _)| *frame);
+    scheduled_params.sort_by_key(|(frame, _, _)| *frame);
     let mut scheduled_rill = rill_events
         .iter()
         .zip(dispatches)
@@ -659,10 +654,10 @@ fn render_with_events(
         }
         let block_param_events = scheduled_params[start_param..next_param]
             .iter()
-            .map(|(frame, event)| ParamEvent {
+            .map(|&(frame, event, value)| ParamEvent {
                 frame_offset: frame - done,
                 name: event.name.as_str(),
-                value: event.value,
+                value,
             })
             .collect::<Vec<_>>();
         let start_rill = next_rill;
@@ -1282,7 +1277,7 @@ mod tests {
             parse_param_event("gain=0.75@500ms").unwrap(),
             ScheduledParamEvent {
                 name: "gain".to_owned(),
-                value: 0.75,
+                value: Value::number(0.75),
                 time_seconds: 0.5,
             }
         );
@@ -1295,7 +1290,56 @@ mod tests {
         assert_eq!(event.time_seconds, 0.25);
         assert_eq!(
             event.fields,
-            [("pitch".to_owned(), 69.0), ("velocity".to_owned(), 1.0)]
+            [
+                ("pitch".to_owned(), Value::Pitch(69.0)),
+                ("velocity".to_owned(), Value::number(1.0))
+            ]
         );
+    }
+
+    #[test]
+    fn values_can_be_written_with_units() {
+        let src = "rill main(volume: Gain = 0dB, cutoff: Freq = 1kHz) [Sample; 2] {
+            let one: Sample = 1.0
+            return [one + volume, cutoff / 1Hz]
+        }";
+        let config = Config {
+            sample_rate: 48_000,
+            max_frames: 64,
+            out_channels: 2,
+        };
+        let engine = || {
+            let (graph, _) = rill::lang::load(src, &config, "main").unwrap();
+            Engine::new(graph, config).unwrap()
+        };
+        let render = |events: &[&str]| {
+            let events: Vec<ScheduledParamEvent> = events
+                .iter()
+                .map(|e| parse_param_event(e).unwrap())
+                .collect();
+            render_with_events(&mut engine(), 4, 64, &events, &[])
+        };
+        // Controls glide to a new value; by the last frame of a long
+        // render they are there.
+        let last = |events: &[&str]| {
+            let events: Vec<ScheduledParamEvent> = events
+                .iter()
+                .map(|e| parse_param_event(e).unwrap())
+                .collect();
+            let out = render_with_events(&mut engine(), 24_000, 64, &events, &[]).unwrap();
+            [out[out.len() - 2], out[out.len() - 1]]
+        };
+        let [volume, cutoff] = last(&["volume=-6dB@0s", "cutoff=2.5kHz@0s"]);
+        assert!((volume - 0.501).abs() < 1e-3, "{volume}");
+        assert!((cutoff - 2500.0).abs() < 1e-2, "{cutoff}");
+        // A plain number is still the value as the program holds it.
+        assert!((last(&["volume=0.25@0s"])[0] - 0.25).abs() < 1e-4);
+        // A unit that does not fit says what would.
+        let wrong = render(&["volume=-6Hz@0s"]).unwrap_err().to_string();
+        assert!(
+            wrong.contains("parameter `volume`") && wrong.contains("`dB`"),
+            "{wrong}"
+        );
+        assert!(render(&["cutoff=-6dB@0s"]).is_err());
     }
 }

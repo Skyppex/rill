@@ -15,6 +15,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
 use crate::engine::{Config, Engine};
 use crate::event::{Dispatch, parse_dispatch};
+use crate::lang::value::Value;
 use crate::live::Player;
 
 /// If no PulseAudio cookie can be found, write an all-zero one to the temp
@@ -67,7 +68,9 @@ pub struct Options {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScheduledParamEvent {
     pub name: String,
-    pub value: f32,
+    /// As written, with a unit if it has one; checked against the
+    /// parameter's type once the program is built.
+    pub value: Value,
     pub time_seconds: f32,
 }
 
@@ -78,7 +81,7 @@ pub struct ScheduledParamEvent {
 pub struct ScheduledRillEvent {
     pub target: String,
     pub time_seconds: f32,
-    pub fields: Vec<(String, f32)>,
+    pub fields: Vec<(String, Value)>,
 }
 
 /// Callback period requested when the caller does not pick one.
@@ -155,8 +158,7 @@ pub fn play(
         out_channels: usize::from(stream_config.channels),
     };
     let player = make_player(&config)?;
-    validate_param_events(player.engine(), &options.param_events)?;
-    let scheduled_params = schedule_param_events(&config, &options.param_events);
+    let scheduled_params = schedule_param_events(player.engine(), &config, &options.param_events)?;
     let scheduled_rill = schedule_rill_events(player.engine(), &config, &options.events)?;
 
     let stream = match format {
@@ -323,35 +325,27 @@ struct ScheduledRillEventAtFrame {
     frame: u64,
 }
 
-fn validate_param_events(engine: &Engine, events: &[ScheduledParamEvent]) -> anyhow::Result<()> {
-    let known = engine.params().collect::<Vec<_>>();
-    for event in events {
-        if !known.contains(&event.name.as_str()) {
-            let available = if known.is_empty() {
-                "this program exposes no live parameters".to_owned()
-            } else {
-                format!("available: {}", known.join(", "))
-            };
-            bail!("unknown live parameter `{}` ({available})", event.name);
-        }
-    }
-    Ok(())
-}
-
 fn schedule_param_events(
+    engine: &Engine,
     config: &Config,
     events: &[ScheduledParamEvent],
-) -> Vec<ScheduledParamEventAtFrame> {
-    let mut scheduled = events
-        .iter()
-        .map(|event| ScheduledParamEventAtFrame {
+) -> anyhow::Result<Vec<ScheduledParamEventAtFrame>> {
+    let mut scheduled = Vec::with_capacity(events.len());
+    for event in events {
+        let value = engine
+            .param_value(&event.name, &event.value)
+            .map_err(anyhow::Error::msg)?;
+        if let Some(hint) = engine.param_hint(&event.name, &event.value) {
+            eprintln!("rill: note: {hint}");
+        }
+        scheduled.push(ScheduledParamEventAtFrame {
             name: event.name.clone(),
-            value: event.value,
+            value,
             frame: (event.time_seconds * config.sample_rate as f32).round() as u64,
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     scheduled.sort_by_key(|event| event.frame);
-    scheduled
+    Ok(scheduled)
 }
 
 fn schedule_rill_events(

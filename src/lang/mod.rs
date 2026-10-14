@@ -34,6 +34,7 @@ pub mod prelude;
 pub mod pretty;
 pub mod stages;
 pub mod types;
+pub mod value;
 pub mod vector;
 pub mod vm;
 

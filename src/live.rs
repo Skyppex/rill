@@ -394,10 +394,13 @@ impl Live {
                     lang::load_file(path, &*self.sources, &self.config, &self.entry, &self.options);
                 let result = result.map(|(graph, checked)| {
                     let random = checked.uses_prelude("random");
+                    // The audio files and images it reads.
                     let audio: Vec<PathBuf> = checked
                         .audio
                         .into_values()
-                        .filter_map(|a| self.sources.watch(&a.path))
+                        .map(|a| a.path)
+                        .chain(checked.images.into_values().map(|i| i.path))
+                        .filter_map(|p| self.sources.watch(&p))
                         .collect();
                     (graph, checked.warnings, random, audio)
                 });

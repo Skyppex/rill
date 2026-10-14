@@ -37,6 +37,7 @@ fn pure_dst(i: &Instr) -> Option<Reg> {
         | Instr::Copy { dst, .. }
         | Instr::SeqRead { dst, .. }
         | Instr::AudioRead { dst, .. }
+        | Instr::ImageRead { dst, .. }
         | Instr::Sum { dst, .. } => Some(dst),
         _ => None,
     }
@@ -50,6 +51,7 @@ fn pure_dst_mut(i: &mut Instr) -> Option<&mut Reg> {
         | Instr::Copy { dst, .. }
         | Instr::SeqRead { dst, .. }
         | Instr::AudioRead { dst, .. }
+        | Instr::ImageRead { dst, .. }
         | Instr::Sum { dst, .. } => Some(dst),
         _ => None,
     }
@@ -68,6 +70,7 @@ pub(crate) fn writes(i: &Instr, f: &mut impl FnMut(Reg)) {
         | Instr::DelayRead { dst, .. }
         | Instr::SeqRead { dst, .. }
         | Instr::AudioRead { dst, .. }
+        | Instr::ImageRead { dst, .. }
         | Instr::Sum { dst, .. } => f(dst),
         Instr::DelayWrite { .. }
         | Instr::Want { .. }
@@ -118,6 +121,10 @@ pub(crate) fn reads(i: &Instr, f: &mut impl FnMut(Reg)) {
         Instr::AudioRead { at, part, .. } => {
             op(at);
             op(part);
+        }
+        Instr::ImageRead { x, y, .. } => {
+            op(x);
+            op(y);
         }
         Instr::DelayWrite { x, .. } => op(x),
         Instr::Jump { .. }
@@ -382,6 +389,10 @@ pub(crate) fn vector_regs(i: &VInstr, f: &mut impl FnMut(VArg)) {
             f(at);
             f(part);
         }
+        VInstr::ImageRead { x, y, .. } => {
+            f(x);
+            f(y);
+        }
         VInstr::DelayWrite { x, .. } => f(x),
         VInstr::Noise { .. } => {}
     }
@@ -398,7 +409,8 @@ pub(crate) fn vector_dst(i: &VInstr) -> Option<Reg> {
         | VInstr::Noise { d, .. }
         | VInstr::DelayRead { d, .. }
         | VInstr::SeqRead { d, .. }
-        | VInstr::AudioRead { d, .. } => Some(d),
+        | VInstr::AudioRead { d, .. }
+        | VInstr::ImageRead { d, .. } => Some(d),
         VInstr::DelayWrite { .. } => None,
     }
 }
@@ -574,7 +586,8 @@ fn set_vector_dst(i: &mut VInstr, to: Reg) {
         | VInstr::Noise { d, .. }
         | VInstr::DelayRead { d, .. }
         | VInstr::SeqRead { d, .. }
-        | VInstr::AudioRead { d, .. } => *d = to,
+        | VInstr::AudioRead { d, .. }
+        | VInstr::ImageRead { d, .. } => *d = to,
         VInstr::DelayWrite { .. } => {}
     }
 }
@@ -605,6 +618,10 @@ fn vector_args_mut(i: &mut VInstr, f: &mut impl FnMut(&mut VArg)) {
         VInstr::AudioRead { at, part, .. } => {
             f(at);
             f(part);
+        }
+        VInstr::ImageRead { x, y, .. } => {
+            f(x);
+            f(y);
         }
         VInstr::DelayWrite { x, .. } => f(x),
         VInstr::Noise { .. } => {}

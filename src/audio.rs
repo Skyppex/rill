@@ -38,7 +38,7 @@ pub fn extension(path: &str) -> Option<String> {
 }
 
 /// A decoded audio file, at its own rate.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Audio {
     /// Its own sample rate.
     pub rate: u32,

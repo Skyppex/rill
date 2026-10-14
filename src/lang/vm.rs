@@ -136,6 +136,16 @@ pub enum Instr {
         at: Operand,
         part: Operand,
     },
+    /// `dst` = channel `channel` (red, green, blue, alpha) of image
+    /// `image` (see [`Code::images`]) at `x`, `y` in pixels (see
+    /// [`crate::images::Image::at`]).
+    ImageRead {
+        dst: Reg,
+        image: u16,
+        channel: u8,
+        x: Operand,
+        y: Operand,
+    },
     /// Note in ceiling `slot` if `x` goes past `ceiling` (see
     /// [`Code::ceilings`]).
     Want {
@@ -240,6 +250,15 @@ pub enum VInstr {
         channel: u16,
         at: VArg,
         part: VArg,
+    },
+    /// Lane `k` reads image `image` as [`Instr::ImageRead`] does, at lane
+    /// `k` of `x` and `y`.
+    ImageRead {
+        d: Reg,
+        image: u16,
+        channel: u8,
+        x: VArg,
+        y: VArg,
     },
     /// Lane `k` reads `info` of the instance of `seq` whose id is lane `k`
     /// of `id`, as [`Instr::SeqRead`] does.
@@ -593,6 +612,8 @@ pub struct Code {
     /// Per audio file the program reads (see [`Instr::AudioRead`]), its
     /// samples at the host rate, one buffer per channel.
     pub audios: Vec<std::sync::Arc<[Box<[f32]>]>>,
+    /// Per image the program reads (see [`Instr::ImageRead`]).
+    pub images: Vec<std::sync::Arc<crate::images::Image>>,
     /// What every piece of state is called, so a new build of the program
     /// can take it over (see [`StateKeys`]).
     pub keys: StateKeys,
@@ -881,6 +902,17 @@ fn list(s: &mut String, instrs: &[Instr]) {
             Instr::SeqRead { dst, seq, info, id } => {
                 format!("r{dst} = {info:?} of seq {seq} instance {}", op(id))
             }
+            Instr::ImageRead {
+                dst,
+                image,
+                channel,
+                x,
+                y,
+            } => format!(
+                "r{dst} = image {image} channel {channel} at {} {}",
+                op(x),
+                op(y)
+            ),
             Instr::AudioRead {
                 dst,
                 audio,
@@ -1826,6 +1858,7 @@ impl Program {
                         slots: &run.slots,
                         at: None,
                         audios: &code.audios,
+                        images: &code.images,
                     };
                     run_lanes(block, n, &mut run.regs, state);
                 }
@@ -2202,6 +2235,7 @@ fn exec(fast: &[Fast], instrs: &[Instr], code: &Code, run: &mut Run) {
                     slots: &run.slots,
                     at: run.at,
                     audios: &code.audios,
+                        images: &code.images,
                 };
                 run_vector(&code.vectors[block as usize], regs, state);
             }
@@ -2289,6 +2323,11 @@ fn check_vector(block: &VectorBlock, regs: usize, noises: usize, delays: usize, 
                 arg(id);
                 d
             }
+            VInstr::ImageRead { d, x, y, .. } => {
+                arg(x);
+                arg(y);
+                d
+            }
             VInstr::AudioRead { d, at, part, .. } => {
                 arg(at);
                 arg(part);
@@ -2322,6 +2361,8 @@ struct LaneState<'a> {
     at: Option<usize>,
     /// The audio files, for [`VInstr::AudioRead`].
     audios: &'a [std::sync::Arc<[Box<[f32]>]>],
+    /// The images, for [`VInstr::ImageRead`].
+    images: &'a [std::sync::Arc<crate::images::Image>],
 }
 
 /// Where a vector operand's values come from, settled before a loop runs.
@@ -2428,6 +2469,19 @@ fn run_lanes(block: &VectorBlock, n: usize, regs: &mut [f32], state: LaneState) 
                     state.rate,
                     n,
                 ),
+                VInstr::ImageRead {
+                    d,
+                    image,
+                    channel,
+                    x,
+                    y,
+                } => {
+                    let (dp, x, y) = (p.add(d as usize), src(x), src(y));
+                    let img = &state.images[usize::from(image)];
+                    for k in 0..n {
+                        *dp.add(k) = img.at(usize::from(channel), x.at(k), y.at(k));
+                    }
+                }
                 VInstr::AudioRead {
                     d,
                     audio,
@@ -2755,6 +2809,7 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
                 slots: &run.slots,
                 at: run.at,
                 audios: &code.audios,
+                        images: &code.images,
             };
             run_vector(&code.vectors[block as usize], regs, state);
         }
@@ -2777,6 +2832,19 @@ fn step(instr: &Instr, code: &Code, run: &mut Run) -> Option<usize> {
                     stop(run, seq, k, EventKind::Halted);
                 }
             }
+        }
+        Instr::ImageRead {
+            dst,
+            image,
+            channel,
+            x,
+            y,
+        } => {
+            regs[dst as usize] = code.images[usize::from(image)].at(
+                usize::from(channel),
+                val(regs, x),
+                val(regs, y),
+            );
         }
         Instr::AudioRead {
             dst,

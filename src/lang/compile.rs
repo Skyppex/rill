@@ -33,6 +33,8 @@ pub enum CVal {
     /// An audio file, known when the program is built, as the checker read
     /// it.
     Audio(crate::audio::AudioRef),
+    /// An image, known when the program is built, as the checker read it.
+    Image(crate::images::ImageRef),
 }
 
 /// A function value, known at build time.
@@ -78,7 +80,7 @@ impl CVal {
             CVal::Scalar(o) => out.push(*o),
             CVal::Frame(xs) => xs.iter().for_each(|x| x.collect_operands(out)),
             CVal::Event(fields) => out.extend(fields.iter().map(|(_, o)| *o)),
-            CVal::Fn(_) | CVal::Audio(_) => {}
+            CVal::Fn(_) | CVal::Audio(_) | CVal::Image(_) => {}
         }
     }
 
@@ -86,7 +88,9 @@ impl CVal {
         match self {
             CVal::Scalar(o) => *o,
             CVal::Frame(xs) => xs.first().map_or(Operand::Const(0.0), CVal::scalar),
-            CVal::Event(_) | CVal::Fn(_) | CVal::Audio(_) => Operand::Const(0.0),
+            CVal::Event(_) | CVal::Fn(_) | CVal::Audio(_) | CVal::Image(_) => {
+                Operand::Const(0.0)
+            }
         }
     }
 
@@ -108,6 +112,7 @@ impl CVal {
             ),
             CVal::Fn(f) => CVal::Fn(f.clone()),
             CVal::Audio(a) => CVal::Audio(a.clone()),
+            CVal::Image(i) => CVal::Image(i.clone()),
         }
     }
 
@@ -159,6 +164,8 @@ pub struct Defs<'a> {
     const_values: &'a HashMap<u32, f64>,
     /// The audio file each path names, as the checker read it.
     audio: &'a HashMap<u32, crate::audio::AudioRef>,
+    /// The image each path names, as the checker read it.
+    images: &'a HashMap<u32, crate::images::ImageRef>,
     /// The top-level `const`s, filled in by [`const_table`].
     consts: Vec<Option<CVal>>,
 }
@@ -239,6 +246,7 @@ impl<'a> Defs<'a> {
             raised: HashMap::new(),
             const_values: &checked.const_values,
             audio: &checked.audio,
+            images: &checked.images,
             consts: vec![None; program.consts.len()],
             list: defs.zip(&checked.signatures).collect(),
             lambdas,
@@ -447,6 +455,7 @@ pub fn compile_instance(
         noises: c.noises,
         delays: c.delays,
         audios: c.audio_data,
+        images: c.image_data,
         keys: c.keys,
         ceilings: c.ceilings,
     };
@@ -684,6 +693,9 @@ struct Compiler<'a> {
     /// (see [`Code::audios`]).
     audio_files: Vec<std::path::PathBuf>,
     audio_data: Vec<std::sync::Arc<[Box<[f32]>]>>,
+    /// The images `pixel` reads (see [`Code::images`]).
+    image_files: Vec<std::path::PathBuf>,
+    image_data: Vec<std::sync::Arc<crate::images::Image>>,
     /// Per `delay` line, its length in samples.
     delays: Vec<u32>,
     /// Where compiling is, for naming state: the names from the entry rill
@@ -745,6 +757,8 @@ impl<'a> Compiler<'a> {
             noises: Vec::new(),
             audio_files: Vec::new(),
             audio_data: Vec::new(),
+            image_files: Vec::new(),
+            image_data: Vec::new(),
             delays: Vec::new(),
             path: Vec::new(),
             frames: vec![(0, HashMap::new())],
@@ -1097,6 +1111,21 @@ impl<'a> Compiler<'a> {
                 .with_help(
                     "choose with an expression instead, as in `return if c { f } else { g }`",
                 )),
+            };
+        }
+        // An image is fixed when the program is built.
+        if let CVal::Image(file) = v {
+            return match slot {
+                None => {
+                    *slot = Some(v.clone());
+                    Ok(())
+                }
+                Some(CVal::Image(prev)) if prev == file => Ok(()),
+                Some(_) => Err(Diagnostic::error(
+                    self.span,
+                    "choosing between images while playing is not supported yet",
+                )
+                .with_help("read both and choose between what they give")),
             };
         }
         // An audio file is fixed when the program is built.
@@ -1623,9 +1652,10 @@ impl<'a> Compiler<'a> {
                 ..
             } => self.call(e, callee, sizes, args),
             ExprKind::If { cond, then, els } => self.if_expr(e, cond, then, els.as_deref()),
-            ExprKind::Path(_) => match self.defs.audio.get(&e.id) {
-                Some(file) => Ok(CVal::Audio(file.clone())),
-                None => Err(internal(e.span, "a path the checker did not read")),
+            ExprKind::Path(_) => match (self.defs.audio.get(&e.id), self.defs.images.get(&e.id)) {
+                (Some(file), _) => Ok(CVal::Audio(file.clone())),
+                (_, Some(file)) => Ok(CVal::Image(file.clone())),
+                _ => Err(internal(e.span, "a path the checker did not read")),
             },
             ExprKind::Block(b) => Ok(self.block(b)?.0.unwrap_or_else(CVal::unit)),
             ExprKind::Frame(elems) => {
@@ -1720,6 +1750,21 @@ impl<'a> Compiler<'a> {
                 let fields = match self.expr(base)? {
                     CVal::Event(fields) => fields,
                     CVal::Audio(file) => return self.audio_field(&file, field),
+                    CVal::Image(file) => {
+                        let image = &file.image;
+                        let value = match field.name.as_str() {
+                            "width" => image.width as f32,
+                            "height" => image.height as f32,
+                            "alpha" => f32::from(u8::from(image.alpha)),
+                            other => {
+                                return Err(internal(
+                                    field.span,
+                                    &format!("unknown image field `{other}`"),
+                                ));
+                            }
+                        };
+                        return Ok(CVal::Scalar(Operand::Const(value)));
+                    }
                     _ => return Err(internal(e.span, "field access on a non-event value")),
                 };
                 fields
@@ -2902,6 +2947,32 @@ impl<'a> Compiler<'a> {
             }
             // At a time, or at a frame (at the host rate) and a part of
             // one, which stays exact far into a long file.
+            ("pixel", [CVal::Image(file), x, y]) => {
+                let image = match self.image_files.iter().position(|p| *p == file.path) {
+                    Some(i) => i as u16,
+                    None => {
+                        let i = u16::try_from(self.image_files.len())
+                            .map_err(|_| Diagnostic::error(span, "too many images"))?;
+                        self.image_files.push(file.path.clone());
+                        self.image_data.push(std::sync::Arc::clone(&file.image));
+                        i
+                    }
+                };
+                let (x, y) = (x.scalar(), y.scalar());
+                let mut out = Vec::with_capacity(4);
+                for channel in 0..4 {
+                    let dst = self.reg()?;
+                    self.emit(Instr::ImageRead {
+                        dst,
+                        image,
+                        channel,
+                        x,
+                        y,
+                    });
+                    out.push(Operand::Reg(dst));
+                }
+                Ok(CVal::flat_frame(out))
+            }
             ("read", [CVal::Audio(file), rest @ ..]) => {
                 let audio = self.audio_index(span, file)?;
                 let channels = self.audio_data[usize::from(audio)].len();

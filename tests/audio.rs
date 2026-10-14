@@ -325,7 +325,7 @@ fn audio_files_have_their_own_errors() {
     let e = errors(&dir, "rill main() Sample { return read(./nothere.wav, 0s) }");
     assert!(e.iter().any(|m| m.starts_with("cannot read `./nothere.wav`")), "{e:?}");
     let e = errors(&dir, "rill main() Sample { return read(./notes.txt, 0s) }");
-    assert_eq!(e, ["`./notes.txt` is not an audio file"]);
+    assert_eq!(e, ["`./notes.txt` is not an audio file or an image"]);
     let e = errors(&dir, "rill main() Sample { state a: Audio = ./x.wav\nreturn 0 }");
     assert!(e.contains(&"an audio file cannot be `state`".to_owned()), "{e:?}");
     let e = errors(&dir, "rill main(a: Audio = ./x.wav) Sample { return 0 }");

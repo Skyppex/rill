@@ -13,6 +13,7 @@ pub mod engine;
 pub mod event;
 pub mod format;
 pub mod graph;
+pub mod images;
 pub mod lang;
 pub mod live;
 pub mod node;

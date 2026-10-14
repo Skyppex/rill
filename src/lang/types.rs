@@ -29,6 +29,10 @@ pub enum Type {
     /// gives is a frame of known size; `None` is written `Audio` and takes
     /// any count.
     Audio(Option<Size>),
+    /// An image, as in `const FACE = ./face.png`. Its width and height,
+    /// when known, so they can be sizes (`FACE.height`); `None` is written
+    /// `Image` and takes any. Shown as `Image` either way.
+    Image(Option<(u32, u32)>),
     /// What an `on` handler of an event receives, as in `NoteOn` for a
     /// `note_on` event. Never `ControlChange`, whose payload is a `Float`.
     Event(crate::event::EventKind),
@@ -123,6 +127,7 @@ impl fmt::Display for Type {
             Type::Slope => f.write_str("Slope"),
             Type::Audio(None) => f.write_str("Audio"),
             Type::Audio(Some(n)) => write!(f, "Audio<{n}>"),
+            Type::Image(_) => f.write_str("Image"),
             Type::Event(kind) => f.write_str(kind.type_name()),
             Type::Num => f.write_str("number"),
             Type::Frame(elem, size) => write!(f, "[{elem}; {size}]"),
@@ -156,6 +161,13 @@ impl fmt::Display for Type {
 }
 
 impl Type {
+    /// A file the program reads in the build stage: an audio file or an
+    /// image. Fixed once built, so never `state`, frame elements or the
+    /// entry rill's parameters.
+    pub fn is_file(&self) -> bool {
+        matches!(self, Type::Audio(_) | Type::Image(_))
+    }
+
     pub fn from_dimension(d: Dimension) -> Type {
         match d {
             Dimension::Frequency => Type::Freq,
@@ -252,6 +264,7 @@ pub fn coerces(from: &Type, to: &Type) -> bool {
         (Type::Frame(a, n), Type::Frame(b, m)) if n == m => coerces(a, b),
         // `Audio` takes a file with any number of channels.
         (Type::Audio(_), Type::Audio(None)) => true,
+        (Type::Image(_), Type::Image(None)) => true,
         (Type::Frame(a, Size::Const(1)), b) => coerces(a, b),
         (a, Type::Frame(b, Size::Const(1))) => coerces(a, b),
         // A function fits where it can be called the same way: it accepts

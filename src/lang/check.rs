@@ -71,6 +71,8 @@ pub struct Checked {
     /// The audio file each path in an expression names, by expression id:
     /// the file itself, from the folder of the file the path is written in.
     pub audio: HashMap<u32, crate::audio::AudioRef>,
+    /// The image each path in an expression names, by expression id.
+    pub images: HashMap<u32, crate::images::ImageRef>,
 }
 
 /// What a top-level name stands for.
@@ -255,6 +257,7 @@ pub fn check_partial_with(program: &Program, sources: &dyn Sources) -> (Checked,
         seq_facts: Vec::new(),
         const_values: HashMap::new(),
         audio: HashMap::new(),
+        images: HashMap::new(),
         event_used: Vec::new(),
         seq_names: program.seqs.iter().map(|s| s.name.name.clone()).collect(),
         seq_steps: program.seqs.iter().map(|s| s.steps.len()).collect(),
@@ -365,6 +368,7 @@ pub fn check_partial_with(program: &Program, sources: &dyn Sources) -> (Checked,
         seq_facts: c.seq_facts,
         const_values: c.const_values,
         audio: c.audio,
+        images: c.images,
         consts: c
             .const_types
             .into_iter()
@@ -498,6 +502,7 @@ struct Checker<'s> {
     const_values: HashMap<u32, f64>,
     /// See [`Checked::audio`].
     audio: HashMap<u32, crate::audio::AudioRef>,
+    images: HashMap<u32, crate::images::ImageRef>,
 }
 
 /// Something that runs handlers, for the invoke-loop check.
@@ -1636,9 +1641,9 @@ impl Checker<'_> {
             }
             TypeExpr::Frame { elem, size, span } => {
                 let elem_ty = self.resolve_type(elem, generics);
-                if matches!(elem_ty.leaf(), Type::Audio(_)) {
+                if elem_ty.leaf().is_file() {
                     let e = self
-                        .error(*span, "frames cannot hold audio files")
+                        .error(*span, "frames cannot hold audio files or images")
                         .with_help("name each file on its own, as in `const KICK = ./kick.wav`");
                     self.report(e);
                     return Type::Error;
@@ -1692,10 +1697,11 @@ impl Checker<'_> {
             "Gain" => Type::Gain,
             "Slope" => Type::Slope,
             "Audio" => Type::Audio(None),
+            "Image" => Type::Image(None),
             other => {
-                const KNOWN: [&str; 10] = [
+                const KNOWN: [&str; 11] = [
                     "Sample", "Float", "Int", "Bool", "Freq", "Pitch", "Time", "Interval", "Gain",
-                    "Audio",
+                    "Audio", "Image",
                 ];
                 let mut e = self.error(id.span, format!("unknown type `{other}`"));
                 if let Some(help) = renamed_type(other) {
@@ -1948,6 +1954,12 @@ impl Checker<'_> {
                     let e = self
                         .error(*span, "a function or rill cannot be `state`")
                         .with_help("state holds numbers that change between ticks; bind callables with `let`");
+                    self.report(e);
+                }
+                if matches!(bound.leaf(), Type::Image(_)) {
+                    let e = self
+                        .error(*span, "an image cannot be `state`")
+                        .with_help("it is fixed when the program is built; keep where you are in it as `state` instead");
                     self.report(e);
                 }
                 if matches!(bound.leaf(), Type::Audio(_)) {
@@ -2210,7 +2222,7 @@ impl Checker<'_> {
                 unit.map_or(Type::Num, |u| Type::from_dimension(u.dimension()))
             }
             ExprKind::Bool(_) => Type::Bool,
-            ExprKind::Path(path) => self.audio_path(e, path),
+            ExprKind::Path(path) => self.file_path(e, path),
             ExprKind::Name(name) => {
                 if let Some(var) = self.lookup(name).cloned() {
                     self.resolve(e.span, Resolution::Binding(var.id));
@@ -2612,6 +2624,34 @@ impl Checker<'_> {
                             Type::Error
                         }
                     }
+                } else if let Type::Image(size) = &base_ty {
+                    match image_field(&field.name) {
+                        Some(t) => {
+                            match (field.name.as_str(), size) {
+                                ("width", Some((w, _))) => {
+                                    self.const_values.insert(e.id, f64::from(*w));
+                                }
+                                ("height", Some((_, h))) => {
+                                    self.const_values.insert(e.id, f64::from(*h));
+                                }
+                                _ => {}
+                            }
+                            t
+                        }
+                        None => {
+                            let has = listing(&IMAGE_FIELDS.iter().map(|(n, _)| *n).collect::<Vec<_>>());
+                            let mut d = self.error(
+                                field.span,
+                                format!("an image has no field `{}`", field.name),
+                            );
+                            d = match suggest(&field.name, IMAGE_FIELDS.iter().map(|(n, _)| *n)) {
+                                Some(s) => d.with_help(format!("did you mean `{s}`?")),
+                                None => d.with_help(format!("an image has {has}")),
+                            };
+                            self.report(d);
+                            Type::Error
+                        }
+                    }
                 } else if base_ty.is_wild() {
                     Type::Error
                 } else {
@@ -2623,37 +2663,41 @@ impl Checker<'_> {
         }
     }
 
-    /// `./kick.wav` as a value: the audio file, read now, so its channels
-    /// are known.
-    fn audio_path(&mut self, e: &Expr, path: &str) -> Type {
+    /// `./kick.wav` or `./face.png` as a value: the audio file or image,
+    /// read now, so its channels or size are known.
+    fn file_path(&mut self, e: &Expr, path: &str) -> Type {
+        let readable = |p: &str| crate::audio::is_audio(p) || crate::images::is_image(p);
         // `./kick.wav.length`: a path goes on through dots.
         if let Some((file, field)) = path.rsplit_once('.')
-            && crate::audio::is_audio(file)
-            && audio_field(field).is_some()
+            && readable(file)
+            && (audio_field(field).is_some() || image_field(field).is_some())
         {
             let d = self
-                .error(e.span, format!("`{path}` is not an audio file"))
+                .error(e.span, format!("`{path}` is not a file Rill can read"))
                 .with_help(format!(
                     "a path goes on through `.`; to read a field, put the path in parentheses: `({file}).{field}`"
                 ));
             self.report(d);
             return Type::Error;
         }
-        if !crate::audio::is_audio(path) {
+        if !readable(path) {
             let what = match crate::audio::extension(path) {
                 Some(ext) if ext == "rill" => "a Rill file is imported, not used as a value".to_owned(),
-                Some(ext) => format!("`.{ext}` is not an audio format Rill can read"),
-                None => "a path names an audio file, with its extension".to_owned(),
+                Some(ext) => format!("`.{ext}` is not a format Rill can read"),
+                None => "a path names a file by its extension".to_owned(),
+            };
+            let list = |exts: &[&str]| {
+                exts.iter()
+                    .map(|x| format!("`.{x}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
             let d = self
-                .error(e.span, format!("`{path}` is not an audio file"))
+                .error(e.span, format!("`{path}` is not an audio file or an image"))
                 .with_help(format!(
-                    "{what}; Rill reads {}",
-                    crate::audio::EXTENSIONS
-                        .iter()
-                        .map(|x| format!("`.{x}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "{what}; Rill reads audio files ({}) and images ({})",
+                    list(crate::audio::EXTENSIONS),
+                    list(crate::images::EXTENSIONS)
                 ));
             self.report(d);
             return Type::Error;
@@ -2670,12 +2714,21 @@ impl Checker<'_> {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         let file = super::module::normalize(&dir.join(path));
-        match crate::audio::load(self.sources, &file) {
-            Ok(audio) => {
+        let read = if crate::audio::is_audio(path) {
+            crate::audio::load(self.sources, &file).map(|audio| {
                 let channels = audio.audio.channels() as u32;
                 self.audio.insert(e.id, audio);
                 Type::Audio(Some(Size::Const(channels)))
-            }
+            })
+        } else {
+            crate::images::load(self.sources, &file).map(|image| {
+                let size = (image.image.width as u32, image.image.height as u32);
+                self.images.insert(e.id, image);
+                Type::Image(Some(size))
+            })
+        };
+        match read {
+            Ok(t) => t,
             Err(why) => {
                 let d = self
                     .error(e.span, format!("cannot read `{path}`: {why}"))
@@ -3464,6 +3517,21 @@ impl Checker<'_> {
                         _ => Err(None),
                     }
                 }
+                // An image's size is in its type.
+                None if matches!(field.name.as_str(), "width" | "height") => {
+                    let ty = match &base.kind {
+                        ExprKind::Name(n) => match self.lookup(n) {
+                            Some(v) => Some(v.ty.clone()),
+                            None => self.const_named(n).map(|i| self.const_types[i].clone()),
+                        },
+                        _ => self.types.get(base.id as usize).cloned(),
+                    };
+                    match (ty, field.name.as_str()) {
+                        (Some(Type::Image(Some((w, _)))), "width") => Ok(f64::from(w)),
+                        (Some(Type::Image(Some((_, h)))), "height") => Ok(f64::from(h)),
+                        _ => Err(None),
+                    }
+                }
                 None => Err(None),
             },
             ExprKind::Name(n) => match self.lookup(n) {
@@ -4202,7 +4270,7 @@ impl Checker<'_> {
             // always known when the program is built.
             ExprKind::Field(base, _) => {
                 self.seq_of(base).is_some()
-                    || matches!(self.types.get(base.id as usize), Some(Type::Audio(_)))
+                    || self.types.get(base.id as usize).is_some_and(Type::is_file)
             }
             ExprKind::If { .. }
             | ExprKind::Block(_)
@@ -5012,6 +5080,22 @@ pub const AUDIO_FIELDS: &[(&str, &str)] = &[
     ("loop_end", "Where its loop ends, or its `length` for a file without one."),
 ];
 
+/// The fields of an image, with what each means.
+pub const IMAGE_FIELDS: &[(&str, &str)] = &[
+    ("width", "How many pixels wide it is: a size."),
+    ("height", "How many pixels high it is: a size."),
+    ("alpha", "Whether it has an alpha channel; without one, alpha is 1."),
+];
+
+/// The type of field `name` of an image.
+pub fn image_field(name: &str) -> Option<Type> {
+    Some(match name {
+        "width" | "height" => Type::Int,
+        "alpha" => Type::Bool,
+        _ => return None,
+    })
+}
+
 /// The type of field `name` of an audio file.
 pub fn audio_field(name: &str) -> Option<Type> {
     Some(match name {
@@ -5205,11 +5289,12 @@ pub fn check_entry(
         );
     }
     for (p, ps) in def.params.iter().zip(&sig.params) {
-        if matches!(ps.ty.leaf(), Type::Audio(_)) {
+        if ps.ty.leaf().is_file() {
+            let what = if matches!(ps.ty.leaf(), Type::Image(_)) { "an image" } else { "an audio file" };
             errors.push(
                 Diagnostic::error(
                     p.name.span,
-                    format!("`{}` cannot be an audio file", p.name.name),
+                    format!("`{}` cannot be {what}", p.name.name),
                 )
                 .with_help("the entry rill's parameters are live controls, so they hold numbers; name the file with a `const`"),
             );

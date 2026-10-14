@@ -54,6 +54,13 @@ pub trait Sources {
         crate::audio::decode_bytes(bytes, path).map(std::sync::Arc::new)
     }
 
+    /// An image, decoded: by default its bytes through the decoder (see
+    /// [`crate::images`]). Override it to hand over pixels from anywhere.
+    fn image(&self, path: &Path) -> Result<std::sync::Arc<crate::images::Image>, String> {
+        let bytes = self.read_bytes(path).map_err(|e| format!("cannot read it: {e}"))?;
+        crate::images::decode_bytes(&bytes, path).map(std::sync::Arc::new)
+    }
+
     /// What to watch for changes to the file at `path`, for hot reload:
     /// the file itself unless said otherwise, or nothing.
     fn watch(&self, path: &Path) -> Option<PathBuf> {

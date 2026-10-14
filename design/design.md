@@ -95,6 +95,7 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `fn(A, B) R` | A function value | Pure, takes exactly what it declares |
 | `rill(A, B) R` | A rill value | Stateful, lifts like a named rill |
 | `Audio<N>` | An audio file with N channels | Read when the program is built; `Audio` alone takes any N (see Audio files) |
+| `Image` | An image | Read when the program is built (see Images) |
 
 Numbers are written as `440`, `0.5` or `.5`, `48_000`, `1e-3`, with a unit right after where they have one (`440Hz`, `.5s`, `-6dB`).
 
@@ -522,6 +523,24 @@ rill kick() Sample {
 }
 ```
 
+## Images
+
+A path to an image is an `Image`, read in the build stage like an audio file and through the same `Sources`:
+
+```rill
+const FACE = ./face.png
+
+rill main() Sample {
+    let red = pixel(FACE, 10.5, 3.5)[0]   // [red, green, blue, alpha]
+    ...
+}
+```
+
+- **Formats:** PNG, JPEG, GIF (the first frame), WebP, BMP, TGA, ICO, QOI, PNM, TIFF, HDR and OpenEXR, all pure Rust (the `image` crate), behind the `images` cargo feature (on by default). Not AVIF, which needs a C library.
+- **Fields:** `width` and `height` (`Int` constants, usable as sizes: `[Float; FACE.height]`) and `alpha` (`Bool`: whether the file has an alpha channel; without one, alpha is 1).
+- **`pixel(image, x, y)`** (prelude, pure) gives red, green, blue and alpha, each 0 to 1. `y` 0 is the top row; a pixel's colour is at its centre (`x + 0.5`), and between centres it is blended from the four nearest; outside the image everything is 0.
+- An image is fixed when the program is built: like an audio file, it cannot be `state`, a frame element, or an entry parameter.
+
 ## Modules
 
 A file is a module. A file names the files it uses with `import`, and sees only what they `export`.
@@ -556,7 +575,7 @@ rill main() Sample { return pad(110Hz) + saw(55Hz) * 0.1 }
 
 Two libraries come with the compiler, so every program has them wherever it runs.
 
-**The prelude** is what cannot be written in Rill, or would be much slower in it: the constants `PI`, `TAU` and `RATE`; maths (`sin`, `cos`, `tan`, `tanh`, `exp`, `log`, `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `wrap`, `min`, `max`, `clamp`); `sum` over frames of any size; `random`; the tunings (`equal`, `just`, `pythagorean`, `meantone`); `level` and `amp`; `read` for audio files; and two that keep state, so only rills can use them: `noise()` and `delay`. It is always there and never imported.
+**The prelude** is what cannot be written in Rill, or would be much slower in it: the constants `PI`, `TAU` and `RATE`; maths (`sin`, `cos`, `tan`, `tanh`, `exp`, `log`, `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `wrap`, `min`, `max`, `clamp`); `sum` over frames of any size; `random`; the tunings (`equal`, `just`, `pythagorean`, `meantone`); `level` and `amp`; `read` for audio files and `pixel` for images; and two that keep state, so only rills can use them: `noise()` and `delay`. It is always there and never imported.
 
 **`noise()`** is a new random number in [-1, 1) every sample. Every call has its own sequence, seeded from the build's seed, so voices never share one and `--seed` repeats it.
 

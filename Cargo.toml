@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["audio-files", "device", "pulseaudio", "watch"]
+default = ["audio-files", "device", "images", "pulseaudio", "watch"]
 # Real-time output through the system audio device (cpal). Without it the
 # crate still builds the engine and the offline WAV renderer.
 device = ["dep:cpal", "dep:anyhow"]
@@ -16,6 +16,10 @@ watch = ["dep:notify"]
 # Load audio files named by paths in a program (`./kick.wav`). Without it, a
 # path to audio is an error that says so.
 audio-files = ["dep:symphonia", "dep:rubato"]
+# Read images named by paths in a program (`./face.png`), and render
+# spectrograms to them. Without it, a path to an image is an error that
+# says so.
+images = ["dep:image", "dep:rustfft"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
@@ -26,6 +30,10 @@ notify = { version = "8.2.0", optional = true }
 # resampling them to the host rate.
 rubato = { version = "0.16", optional = true }
 symphonia = { version = "0.5.4", optional = true, default-features = false, features = ["all"] }
+# Images (`const FACE = ./face.png`), every format pure Rust, and the FFT
+# for drawing spectrograms.
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tga", "ico", "qoi", "pnm", "tiff", "hdr", "exr"] }
+rustfft = { version = "6", optional = true }
 
 # `rill profile` asks the OS how much of a render was spent in the kernel.
 [target.'cfg(unix)'.dependencies]
@@ -33,6 +41,8 @@ libc = "0.2.190"
 
 [dev-dependencies]
 hound = "3.5.1"
+# Tests write images in every format, to read them back.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tga", "ico", "qoi", "pnm", "tiff", "hdr", "exr"] }
 
 # Audio code needs some optimisation to keep up in real time; without it a
 # debug build runs several times slower than release and stutters.

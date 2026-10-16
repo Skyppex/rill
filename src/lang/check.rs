@@ -1576,20 +1576,6 @@ impl Checker<'_> {
         self.sizes.clear();
         self.def_bindings.push((generic_ids, param_ids));
 
-        // A type that failed to resolve may well have used it.
-        let broken = params.iter().any(|p| p.ty.leaf().is_wild()) || ret.leaf().is_wild();
-        for g in &d.generics {
-            let used = broken
-                || params.iter().any(|p| mentions_size(&p.ty, &g.name))
-                || mentions_size(&ret, &g.name);
-            if !used {
-                let e = self
-                    .error(g.span, format!("size `{}` is not used", g.name))
-                    .with_help("use it in a parameter or return type");
-                self.report(e);
-            }
-        }
-
         let rate = match (&d.rate, kind) {
             (Some(r), DefKind::Fn) => {
                 let e = self
@@ -3123,6 +3109,22 @@ impl Checker<'_> {
         if !ok {
             return Type::Error;
         }
+        // A size the arguments do not give (one used only in the body, as
+        // the row count of `painted<256>`) has to be written at the call.
+        let missing: Vec<&String> = sig
+            .generics
+            .iter()
+            .filter(|g| !subst.sizes.contains_key(*g))
+            .collect();
+        if !missing.is_empty() {
+            let list = missing.iter().map(|g| format!("`{g}`")).collect::<Vec<_>>().join(", ");
+            let example = sig.generics.iter().map(|_| "8").collect::<Vec<_>>().join(", ");
+            let d = self
+                .error(span, format!("`{name}` needs its size {list} written here, as nothing it is given says it"))
+                .with_help(format!("as in `{name}<{example}>(...)`"));
+            self.report(d);
+            return Type::Error;
+        }
 
         let ret = substitute(&sig.ret, &subst);
         match lift {
@@ -4463,17 +4465,6 @@ fn contains_param(t: &Type) -> bool {
         Type::Param(_) => true,
         Type::Frame(e, _) => contains_param(e),
         Type::Fn(ps, r) | Type::Rill(ps, r) => ps.iter().any(contains_param) || contains_param(r),
-        _ => false,
-    }
-}
-
-fn mentions_size(t: &Type, name: &str) -> bool {
-    match t {
-        Type::Frame(elem, Size::Var(v)) => v == name || mentions_size(elem, name),
-        Type::Frame(elem, _) => mentions_size(elem, name),
-        Type::Fn(params, ret) | Type::Rill(params, ret) => {
-            params.iter().any(|p| mentions_size(p, name)) || mentions_size(ret, name)
-        }
         _ => false,
     }
 }

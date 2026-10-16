@@ -133,7 +133,7 @@ rill pad() [Sample; 2] {
 - **Where.** At the top level, a `const` belongs to its file and can be used in any order: `CHORD` above uses `ROOT` before it is written. A cycle (`const A = B`, `const B = A`) is an error. In a block, a `const` is scoped to the block, like `let`.
 - **The value** must be constant: numbers with units, pitches, chords and frames, arithmetic, prelude functions of constants (`random()` included), other `const`s, sequence fields and `RATE`. A `fn` or `rill` cannot be used, and a `const` cannot hold a function or rill.
 - **One value.** A top-level `const` is worked out once, so `DETUNE` is the same number everywhere it is used. A `const` in a rill is worked out once per instance: each of `[pad(); 4]` gets its own `random()`. It can use the rill's size parameters.
-- **Sizes.** A `const` holding a whole number of at least 1 is a size: `[Float; VOICES]`, `spread<VOICES>(...)`. One worked out from `RATE` or from a size parameter is not (yet).
+- **Sizes.** A `const` holding a whole number of at least 1 is a size: `[Float; VOICES]`, `spread<VOICES>(...)`. One worked out from `RATE` or from a size parameter is not (yet). A size parameter is usually worked out from the arguments; one only the body uses (how many of something to make) is written at the call, as in `painted<256>(...)`, and leaving it out is an error.
 - A `const` cannot be assigned. A name in a block can shadow a top-level `const`; a top-level `const` cannot take the name of a definition, sequence, event, note (`A`, `C4`), prelude function or prelude constant.
 
 Rate rules:
@@ -540,6 +540,16 @@ rill main() Sample {
 - **Fields:** `width` and `height` (`Int` constants, usable as sizes: `[Float; FACE.height]`) and `alpha` (`Bool`: whether the file has an alpha channel; without one, alpha is 1).
 - **`pixel(image, x, y)`** (prelude, pure) gives red, green, blue and alpha, each 0 to 1. `y` 0 is the top row; a pixel's colour is at its centre (`x + 0.5`), and between centres it is blended from the four nearest; outside the image everything is 0.
 - An image is fixed when the program is built: like an audio file, it cannot be `state`, a frame element, or an entry parameter.
+
+**Playing an image** is `@gen/spectral`, written in Rill on `pixel`: a spectrogram read back. `painted<R>(image, length, low, high, range, mono, loop)` plays `R` rows of it (read evenly from its height, so a tall photo is not a sine per pixel) as `R` sines, `high` at the top to `low` at the bottom, evenly spaced in pitch. Time runs across the width over `length`; brightness is level, white at full and black `range` below (60dB). **Red is the left channel and blue the right**, so greyscale and most photos play in the middle; `mono: true` plays the brightness in both. `painted_rgba<R>` plays red, green, blue and alpha as four channels. Every sine keeps running, so no phase is made up and it sounds clean.
+
+```rill
+import @gen/spectral
+const FACE = ./face.png
+rill main() [Sample; 2] { return painted<256>(FACE, 10s) }
+```
+
+`rill render` draws the other way, sound as a spectrogram, with the same mapping, so a render read back plays a ghost of the song (see the CLI).
 
 ## Modules
 

@@ -212,3 +212,86 @@ fn images_have_their_own_errors() {
     let e = errors(&dir, "rill main() Sample { return pixel(./bad.png, 0, 0)[0] }");
     assert!(e.iter().any(|m| m.starts_with("cannot read `./bad.png`")), "{e:?}");
 }
+
+/// Render `frames` of `src` in `dir`, both channels.
+fn render_stereo(dir: &Path, src: &str, frames: usize) -> [Vec<f32>; 2] {
+    let path = dir.join("song.rill");
+    std::fs::write(&path, src).unwrap();
+    let (map, result) = lang::load_file(
+        &path,
+        &lang::Disk,
+        &config(2),
+        "main",
+        &lang::build::Options::default(),
+    );
+    let (graph, _) = result.unwrap_or_else(|d| {
+        panic!("{}", d.iter().map(|d| map.render(d)).collect::<String>())
+    });
+    let mut engine = Engine::new(graph, config(2)).unwrap();
+    let out = offline::render(&mut engine, frames, &Blocks::Fixed(64));
+    [
+        out.iter().step_by(2).copied().collect(),
+        out.iter().skip(1).step_by(2).copied().collect(),
+    ]
+}
+
+fn rms(x: &[f32]) -> f32 {
+    (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+}
+
+fn crossings(x: &[f32]) -> f32 {
+    let n = x.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+    n as f32 * RATE as f32 / x.len() as f32
+}
+
+/// 32 by 8, black but for row `row` in `colour`.
+fn line(path: &Path, row: u32, colour: [u8; 3]) {
+    image::RgbImage::from_fn(32, 8, |_, y| image::Rgb(if y == row { colour } else { [0; 3] }))
+        .save(path)
+        .unwrap();
+}
+
+#[test]
+fn a_painted_row_plays_at_its_pitch_on_its_side() {
+    let dir = folder("painted");
+    let play = |file: &str, extra: &str| {
+        render_stereo(
+            &dir,
+            &format!(
+                "import @gen/spectral
+                rill main() [Sample; 2] {{ return painted<8>(./{file}, 1s{extra}) }}"
+            ),
+            24_000,
+        )
+    };
+    // Row 2 of 8, from 15kHz down to 50Hz evenly in pitch.
+    let want = 15_000.0 * (50.0f32 / 15_000.0).powf(2.0 / 7.0);
+    line(&dir.join("white.png"), 2, [255, 255, 255]);
+    let [l, r] = play("white.png", "");
+    assert!((crossings(&l) - want).abs() < 3.0, "{} vs {want}", crossings(&l));
+    assert!((rms(&l) - rms(&r)).abs() < 1e-6 && rms(&l) > 0.2);
+    // Red is the left channel, blue the right.
+    line(&dir.join("red.png"), 2, [255, 0, 0]);
+    let [l, r] = play("red.png", "");
+    assert!(rms(&l) > 0.2 && rms(&r) == 0.0);
+    line(&dir.join("blue.png"), 2, [0, 0, 255]);
+    let [l, r] = play("blue.png", "");
+    assert!(rms(&l) == 0.0 && rms(&r) > 0.2);
+    // Mono plays the brightness in both.
+    let [l, r] = play("red.png", ", mono: true");
+    assert!(rms(&l) > 0.0 && rms(&l) == rms(&r));
+}
+
+#[test]
+fn a_size_used_only_in_the_body_is_given_at_the_call() {
+    let dir = folder("sizes");
+    line(&dir.join("x.png"), 0, [255; 3]);
+    let e = errors(
+        &dir,
+        "import @gen/spectral\nrill main() Sample { return painted(./x.png, 1s)[0] }",
+    );
+    assert!(
+        e.iter().any(|m| m.starts_with("`painted` needs its size `R` written here")),
+        "{e:?}"
+    );
+}

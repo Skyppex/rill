@@ -424,9 +424,11 @@ fn generic_sizes_are_inferred() {
         error(&src).0,
         "argument `b` of `swap` expects `[Sample; 2]`, found `[number; 3]`"
     );
+    // A size only the body uses is written at the call.
+    assert_ok("rill f<N>(x: Sample) Sample { return x * N }\nrill main() Sample { return f<3>(1) }");
     assert_eq!(
-        error("rill f<N>(x: Sample) Sample { return x }").0,
-        "size `N` is not used"
+        error("rill f<N>(x: Sample) Sample { return x * N }\nrill main() Sample { return f(1) }").0,
+        "`f` needs its size `N` written here, as nothing it is given says it"
     );
     assert_eq!(
         error("rill f(x: [Sample; M]) Sample { return x[0] }").0,

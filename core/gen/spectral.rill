@@ -1,0 +1,104 @@
+// Images played as sound: a spectrogram read back. Every row is a sine,
+// higher towards the top, and brightness is how loud it is; time runs left
+// to right across the columns. No phase has to be made up: every sine just
+// keeps running, so it sounds clean, like a drawing.
+//
+// `R` is how many rows are played (the image is read at that many, evenly
+// spread), so a tall photo does not mean a sine per pixel:
+// `painted<256>(FACE, 10s)`.
+
+import @gen/osc
+
+// How loud a brightness plays: white at full level, black `range` below,
+// and 0 silent.
+fn loudness(bright: Float, range: Gain) Float {
+    if bright <= 0 { 0 } else { pow(amp(range), bright - 1) }
+}
+
+// The sine of row `row` of `rows`: `high` at the top, `low` at the bottom,
+// evenly spaced in pitch between.
+fn row_freq(row: Int, rows: Int, low: Freq, high: Freq) Freq {
+    let along = if rows == 1 { 0.5 } else { row as Float / (rows - 1) as Float }
+    high * pow(low / high, along)
+}
+
+// Where row `row` of `rows` reads `image`: the middle of its share of the
+// height.
+fn row_y(row: Int, rows: Int, image: Image) Float {
+    (row as Float + 0.5) / rows as Float * image.height as Float
+}
+
+// The image in stereo: red is the left channel and blue the right, so grey
+// (and most of a photo) plays in the middle. With `mono`, the brightness of
+// all three plays in both. The whole width lasts `length`, once or, with
+// `loop`, over and over.
+//
+// The sines add up: the result is scaled by one over the square root of
+// `R`, which keeps a busy image near full level; a sparse drawing is
+// quieter, and can be turned up.
+export rill painted<R>(
+    image: Image,
+    length: Time,
+    low: Freq = 50Hz,
+    high: Freq = 15kHz,
+    range: Gain = 60dB,
+    mono: Bool = false,
+    loop: Bool = false,
+) [Sample; 2] {
+    state t: Time = 0s
+    let x = t / length * image.width as Float
+    let out: [[Sample; 2]; R]
+
+    for row in 0..R {
+        let p = pixel(image, x, row_y(row, R, image))
+        let mean = (p[0] + p[1] + p[2]) / 3
+        let left = loudness(if mono { mean } else { p[0] }, range)
+        let right = loudness(if mono { mean } else { p[2] }, range)
+        let s = sine(row_freq(row, R, low, high))
+        out[row] = [s * left, s * right]
+    }
+
+    t = t + 1 / RATE
+
+    if loop && t >= length {
+        t = t - length
+    }
+
+    return sum(out) / sqrt(R as Float)
+}
+
+// The image as four channels: red, green, blue and alpha. Alpha is a mask
+// in most images, and 1 everywhere in one without alpha, which plays as a
+// full band: use it for images made to be heard.
+export rill painted_rgba<R>(
+    image: Image,
+    length: Time,
+    low: Freq = 50Hz,
+    high: Freq = 15kHz,
+    range: Gain = 60dB,
+    loop: Bool = false,
+) [Sample; 4] {
+    state t: Time = 0s
+    let x = t / length * image.width as Float
+    let out: [[Sample; 4]; R]
+
+    for row in 0..R {
+        let p = pixel(image, x, row_y(row, R, image))
+        let s = sine(row_freq(row, R, low, high))
+
+        out[row] = [
+            s * loudness(p[0], range),
+            s * loudness(p[1], range),
+            s * loudness(p[2], range),
+            s * loudness(p[3], range),
+        ]
+    }
+
+    t = t + 1 / RATE
+
+    if loop && t >= length {
+        t = t - length
+    }
+
+    return sum(out) / sqrt(R as Float)
+}

@@ -20,6 +20,7 @@ pub mod node;
 pub mod nodes;
 pub mod offline;
 pub mod ops;
+pub mod output;
 pub mod patches;
 pub mod wav;
 

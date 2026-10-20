@@ -314,7 +314,8 @@ rill main(speed: Freq = 120bpm) Sample {
 
   ```rill
   seq acid(step: 1/16, gate: .5) { C2~, C2, _, D#2~, F2~, G2, _, C3 }
-  seq pad(step: 1/4) { C3@p.2~, ~@p.6~, ~@p1, _ }   // a note swelling in pressure
+
+  seq pad(step: 1/4) { C3@p.2~, ~@p.6~, ~@p1, _ } // a note swelling in pressure
   ```
 - **A step's values** follow `@` as flags, each a letter and a value from 0 to 1: `v` velocity, `p` pressure, `t` timbre, `r` release. Letters written together share the value after them, so `G3@v.5p1rt.3` is velocity 0.5, pressure 1, and release and timbre 0.3. A bare value is the velocity: `E4@0.5`. Velocity goes with the `note_on`, pressure and timbre with its `note_change`, and release with the `note_off`. On a chord, the values go to every note. On a step that holds notes (a tie, a slide or `~`), `p` and `t` change them with a `note_change`, `r` sets the release of their note-off to come, and `v` is an error: they have started already.
 - **Settings** are all optional:
@@ -516,9 +517,19 @@ A voice per note, its speed from the note's pitch, makes a sampler or a drum mac
 rill kick() Sample {
     state gate: Float = 0
     state rate: Float = 1
-    on kicks_note_on claim { gate = 1 }
-    on kicks_note_change(n) { rate = pow(2, (n.pitch - C2) / 12st) }
-    on kicks_note_off release { gate = 0 }
+
+    on kicks_note_on claim {
+        gate = 1
+    }
+
+    on kicks_note_change(n) {
+        rate = pow(2, (n.pitch - C2) / 12st)
+    }
+
+    on kicks_note_off release {
+        gate = 0
+    }
+
     return play(KICK, gate, rate)
 }
 ```
@@ -545,11 +556,18 @@ rill main() Sample {
 
 ```rill
 import @gen/spectral
+
 const FACE = ./face.png
-rill main() [Sample; 2] { return painted<256>(FACE, 10s) }
+
+rill main() [Sample; 2] {
+    return painted<256>(FACE, 10s)
+}
 ```
 
-`rill render` draws the other way, sound as a spectrogram, with the same mapping, so a render read back plays a ghost of the song (see the CLI).
+`rill render` draws the other way, sound as a spectrogram, with the same mapping, so a render read back plays a ghost of the song. The extension of `--out` says what is written, and options for it follow the last `:` (a character Windows does not allow in file names, so `notes:draft.png` and `C:\out\song.png` stay paths):
+
+- `song.wav`, `song.wav:i16`: sound, as `f32` (the default), `i16` or `i24`.
+- `song.png:1000x500,range=80dB,low=40Hz,high=12kHz,fft=8192,colors=stereo`: a spectrogram, in any image format Rill reads. The size is `WxH`, `W` or `xH` (512 high, a column per 10ms, by default); `range` is how far below full level black is (60dB); `low` and `high` are the bottom and top rows (50Hz, 15kHz); `fft` is the FFT's size (4096, a power of two); `colors` is `stereo` (the default: red the left channel, blue the right, green what they share, so mono is grey), `grey` (the channels mixed), or the colour scales `magma` and `viridis`, which look nice and do not read back as the same sound. JPEGs keep full colour resolution, so stereo is not smeared; PNG is the one for exact round trips.
 
 ## Modules
 

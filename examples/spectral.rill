@@ -1,0 +1,17 @@
+// An image played as sound: a spectrogram read back. Every row of
+// `images/rill.png` is a sine, high at the top and low at the bottom, and
+// time runs left to right over six seconds. Draw it as a spectrogram again
+// to see the word come back:
+//
+//     rill render examples/spectral.rill -o spectral.png:600x256 --seconds 6
+//
+// The red line plays on the left and rises; the blue one plays on the right
+// and falls; the white word plays in the middle.
+
+import @gen/spectral
+
+const PICTURE = ./images/rill.png
+
+rill main(volume: Gain = -6dB) [Sample; 2] {
+    return painted<128>(PICTURE, 6s, loop: true) + volume
+}

@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use rill::lang::value::Value;
 use rill::offline::{self, Blocks};
-use rill::wav::{self, WavFormat};
+use rill::output::Output;
+use rill::wav;
 use rill::{Config, Engine, Graph, ParamEvent, RillEvent, patches};
 
 #[derive(Parser)]
@@ -158,13 +159,6 @@ impl Color {
             }
         }
     }
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum Format {
-    F32,
-    I16,
-    I24,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -375,14 +369,24 @@ enum Command {
         #[arg(long)]
         per_sample: bool,
     },
-    /// Render a Rill file (or a built-in patch) to a WAV file through a
-    /// simulated audio callback.
+    /// Render a Rill file (or a built-in patch) through a simulated audio
+    /// callback, to a WAV file or a spectrogram image.
     Render {
         #[command(flatten)]
         source: SourceArgs,
-        /// Output file.
-        #[arg(short, long)]
-        out: PathBuf,
+        /// Output file; its extension says what is written, and options
+        /// for it follow the last `:`. A WAV takes its sample format:
+        /// `song.wav:i16` (`f32`, the default, `i16` or `i24`). An image
+        /// (png, jpg, webp, gif, bmp, tiff, qoi, ...) is a spectrogram:
+        /// `song.png:1000x500,range=80dB,low=40Hz,high=12kHz,fft=8192,colors=magma`.
+        /// Its size is `WxH`, `W` or `xH` (by default 512 high and a column
+        /// per 10ms); `range` is how far below full level is black (60dB);
+        /// `low` and `high` the bottom and top rows (50Hz, 15kHz), evenly
+        /// spaced in pitch; `colors` is `stereo` (the default: red the left
+        /// channel, blue the right; reads back with `@gen/spectral`),
+        /// `grey`, `magma` or `viridis`.
+        #[arg(short, long, value_name = "FILE[:OPTIONS]", value_parser = rill::output::parse)]
+        out: Output,
         #[arg(long, default_value_t = 2.0)]
         seconds: f32,
         #[arg(long, default_value_t = 48_000)]
@@ -392,8 +396,6 @@ enum Command {
         /// Frames per simulated callback.
         #[arg(long, default_value_t = 256)]
         block: usize,
-        #[arg(long, value_enum, default_value_t = Format::F32)]
-        format: Format,
         /// Simulate a live control change, e.g. `volume=-6dB@500ms` or
         /// `cutoff=2kHz@1s`. Units are as in Rill and must fit the
         /// parameter; a plain number is the value as the program holds it.
@@ -555,7 +557,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             rate,
             channels,
             block,
-            format,
             param_events,
             events,
         } => {
@@ -577,17 +578,26 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 render_with_events(&mut engine, frames, block, &param_events, &events)?
             };
-            let format = match format {
-                Format::F32 => WavFormat::Float32,
-                Format::I16 => WavFormat::Pcm16,
-                Format::I24 => WavFormat::Pcm24,
-            };
-            wav::write_file(&out, rate, channels, format, &samples)?;
-            println!(
-                "rendered {} to {} ({frames} frames)",
-                source.name(),
-                out.display()
-            );
+            match &out {
+                Output::Wav { path, format } => {
+                    wav::write_file(path, rate, channels, *format, &samples)?;
+                    println!(
+                        "rendered {} to {} ({frames} frames)",
+                        source.name(),
+                        path.display()
+                    );
+                }
+                Output::Spectrogram { path, options } => {
+                    let (width, height, pixels) =
+                        rill::output::spectrogram(&samples, usize::from(channels), rate, options);
+                    rill::output::write_image(path, width, height, &pixels)?;
+                    println!(
+                        "drew {} as a spectrogram in {} ({width}x{height})",
+                        source.name(),
+                        path.display()
+                    );
+                }
+            }
         }
     }
     Ok(())

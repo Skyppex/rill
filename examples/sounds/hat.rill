@@ -1,6 +1,6 @@
 // The hi-hat `examples/sampler.rill` plays, rendered to `hat.wav` with
-// `rill render examples/sounds/hat.rill -o examples/sounds/hat.wav
-// --seconds .12 --rate 44100 --channels 1 --format i16 --seed 1`.
+// `rill render examples/sounds/hat.rill -o examples/sounds/hat.wav:i16
+// --seconds .12 --rate 44100 --channels 1 --seed 1`.
 
 import @effects/filter
 

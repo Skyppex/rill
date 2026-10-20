@@ -122,15 +122,6 @@ pub fn lookup(name: &str) -> Vec<Signature> {
                 ),
             ]
         }
-        // Red, green, blue and alpha of an image at a place, 0 to 1.
-        "pixel" => vec![sig(
-            &[
-                ("image", Type::Image(None)),
-                ("x", Type::Float),
-                ("y", Type::Float),
-            ],
-            Type::Frame(Box::new(Type::Float), Size::Const(4)),
-        )],
         _ => Vec::new(),
     }
 }
@@ -216,9 +207,6 @@ pub fn doc(name: &str) -> Option<&'static str> {
         "noise" => {
             "A new random number in [-1, 1) every sample: white noise. Every call has its own sequence, so two voices never share one; the same `--seed` plays the same noise."
         }
-        "pixel" => {
-            "Red, green, blue and alpha of `image` at `x`, `y` in pixels, each 0 to 1: `[r, g, b, a]`. `y` 0 is the top; a pixel's colour is at its centre (`x + 0.5`), and between centres it is blended from the four nearest. Outside the image everything is 0. `@gen/spectral` plays an image as sound with it."
-        }
         "read" => {
             "What `audio` holds at `at`: one value per channel, read between samples, and silence before the start and after the end. `read(KICK, 0s)` is its first frame. The file is resampled to the host rate when the program is built, so a second is a second. `read(audio, frame, part)` reads at whole frame `frame` (at the host rate) plus `part` of one instead: a time far into a long file is not exact as one number, while a whole frame and a part are. Playing a file is moving along it: `@gen/sampler` has `samples` and `play`."
         }
@@ -266,7 +254,6 @@ pub const FUNCTIONS: &[&str] = &[
     "noise",
     "delay",
     "read",
-    "pixel",
 ];
 
 #[cfg(test)]

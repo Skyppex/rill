@@ -369,24 +369,14 @@ enum Command {
         #[arg(long)]
         per_sample: bool,
     },
-    /// Render a Rill file (or a built-in patch) through a simulated audio
-    /// callback, to a WAV file or a spectrogram image.
+    /// Render a Rill file (or a built-in patch) to a WAV file through a
+    /// simulated audio callback.
     Render {
         #[command(flatten)]
         source: SourceArgs,
-        /// Output file; its extension says what is written, and options
-        /// for it follow the last `:`. A WAV takes its sample format:
-        /// `song.wav:i16` (`f32`, the default, `i16` or `i24`). An image
-        /// (png, jpg, webp, gif, bmp, tiff, qoi, ...) is a spectrogram:
-        /// `song.png:1000x500,range=80dB,low=40Hz,high=12kHz,colors=magma`.
-        /// Its size is its resolution: every column is one step in time and
-        /// every row one pitch, `WxH`, `W` or `xH` (by default 512 high and
-        /// a column per 10ms); `range` is how far below full level is black
-        /// (60dB); `low` and `high` the bottom and top rows (20Hz, 20kHz),
-        /// evenly spaced in pitch; `colors` is `stereo` (the default: red
-        /// the left channel, blue the right, green what both have; reads
-        /// back with `@gen/spectral`), `grey`, `magma` or `viridis`.
-        #[arg(short, long, value_name = "FILE[:OPTIONS]", value_parser = rill::output::parse)]
+        /// Output WAV file, with its sample format after a `:`:
+        /// `song.wav:i16` (`f32`, the default, `i16` or `i24`).
+        #[arg(short, long, value_name = "FILE[:FORMAT]", value_parser = rill::output::parse)]
         out: Output,
         #[arg(long, default_value_t = 2.0)]
         seconds: f32,
@@ -579,26 +569,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 render_with_events(&mut engine, frames, block, &param_events, &events)?
             };
-            match &out {
-                Output::Wav { path, format } => {
-                    wav::write_file(path, rate, channels, *format, &samples)?;
-                    println!(
-                        "rendered {} to {} ({frames} frames)",
-                        source.name(),
-                        path.display()
-                    );
-                }
-                Output::Spectrogram { path, options } => {
-                    let (width, height, pixels) =
-                        rill::output::spectrogram(&samples, usize::from(channels), rate, options);
-                    rill::output::write_image(path, width, height, &pixels)?;
-                    println!(
-                        "drew {} as a spectrogram in {} ({width}x{height})",
-                        source.name(),
-                        path.display()
-                    );
-                }
-            }
+            wav::write_file(&out.path, rate, channels, out.format, &samples)?;
+            println!(
+                "rendered {} to {} ({frames} frames)",
+                source.name(),
+                out.path.display()
+            );
         }
     }
     Ok(())

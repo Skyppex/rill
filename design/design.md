@@ -95,7 +95,6 @@ Types describe one tick's value; stream-ness comes from being inside a rill. Eve
 | `fn(A, B) R` | A function value | Pure, takes exactly what it declares |
 | `rill(A, B) R` | A rill value | Stateful, lifts like a named rill |
 | `Audio<N>` | An audio file with N channels | Read when the program is built; `Audio` alone takes any N (see Audio files) |
-| `Image` | An image | Read when the program is built (see Images) |
 
 Numbers are written as `440`, `0.5` or `.5`, `48_000`, `1e-3`, with a unit right after where they have one (`440Hz`, `.5s`, `-6dB`).
 
@@ -133,7 +132,7 @@ rill pad() [Sample; 2] {
 - **Where.** At the top level, a `const` belongs to its file and can be used in any order: `CHORD` above uses `ROOT` before it is written. A cycle (`const A = B`, `const B = A`) is an error. In a block, a `const` is scoped to the block, like `let`.
 - **The value** must be constant: numbers with units, pitches, chords and frames, arithmetic, prelude functions of constants (`random()` included), other `const`s, sequence fields and `RATE`. A `fn` or `rill` cannot be used, and a `const` cannot hold a function or rill.
 - **One value.** A top-level `const` is worked out once, so `DETUNE` is the same number everywhere it is used. A `const` in a rill is worked out once per instance: each of `[pad(); 4]` gets its own `random()`. It can use the rill's size parameters.
-- **Sizes.** A `const` holding a whole number of at least 1 is a size: `[Float; VOICES]`, `spread<VOICES>(...)`. One worked out from `RATE` or from a size parameter is not (yet). A size parameter is usually worked out from the arguments; one only the body uses (how many of something to make) is written at the call, as in `painted<256>(...)`, and leaving it out is an error.
+- **Sizes.** A `const` holding a whole number of at least 1 is a size: `[Float; VOICES]`, `spread<VOICES>(...)`. One worked out from `RATE` or from a size parameter is not (yet). A size parameter is usually worked out from the arguments; one only the body uses (how many of something to make) is written at the call, as in `voices<8>(...)`, and leaving it out is an error.
 - A `const` cannot be assigned. A name in a block can shadow a top-level `const`; a top-level `const` cannot take the name of a definition, sequence, event, note (`A`, `C4`), prelude function or prelude constant.
 
 Rate rules:
@@ -534,40 +533,7 @@ rill kick() Sample {
 }
 ```
 
-## Images
-
-A path to an image is an `Image`, read in the build stage like an audio file and through the same `Sources`:
-
-```rill
-const FACE = ./face.png
-
-rill main() Sample {
-    let red = pixel(FACE, 10.5, 3.5)[0]   // [red, green, blue, alpha]
-    ...
-}
-```
-
-- **Formats:** PNG, JPEG, GIF (the first frame), WebP, BMP, TGA, ICO, QOI, PNM, TIFF, HDR and OpenEXR, all pure Rust (the `image` crate), behind the `images` cargo feature (on by default). Not AVIF, which needs a C library.
-- **Fields:** `width` and `height` (`Int` constants, usable as sizes: `[Float; FACE.height]`) and `alpha` (`Bool`: whether the file has an alpha channel; without one, alpha is 1).
-- **`pixel(image, x, y)`** (prelude, pure) gives red, green, blue and alpha, each 0 to 1. `y` 0 is the top row; a pixel's colour is at its centre (`x + 0.5`), and between centres it is blended from the four nearest; outside the image everything is 0.
-- An image is fixed when the program is built: like an audio file, it cannot be `state`, a frame element, or an entry parameter.
-
-**Playing an image** is `@gen/spectral`, written in Rill on `pixel`: a spectrogram read back, on the grid `rill render` draws one on. **The image's size is its resolution.** Every column is one step in time: the width is spread over `length`, so 100 columns over 2s are 50 steps a second and 2000 are 1000; each column holds for its step and moves to the next over `fade` (2ms; 0s for hard steps). Every row is one sine, `high` at the top to `low` at the bottom (20kHz to 20Hz), evenly spaced in pitch. `painted<R>(image, length, low, high, range, fade, mono, loop)` plays `R` rows; `painted<FACE.height>` plays every one. Brightness is level: white is a full-level sine and black `range` below (60dB), as the renderer draws them, so a drawing with many white rows at once is loud and wants turning down. **Red is the left channel and blue the right**, so greyscale plays in the middle; `mono: true` plays the brightness in both. `painted_rgba<R>` plays red, green, blue and alpha as four channels. No phase is kept: every sine keeps running.
-
-```rill
-import @gen/spectral
-
-const FACE = ./face.png
-
-rill main() [Sample; 2] {
-    return painted<256>(FACE, 10s)
-}
-```
-
-`rill render` draws the other way, sound as a spectrogram, with the same mapping, so a render read back plays a ghost of the song. The extension of `--out` says what is written, and options for it follow the last `:` (a character Windows does not allow in file names, so `notes:draft.png` and `C:\out\song.png` stay paths):
-
-- `song.wav`, `song.wav:i16`: sound, as `f32` (the default), `i16` or `i24`.
-- `song.png:1000x500,range=80dB,low=40Hz,high=12kHz,colors=stereo`: a spectrogram, in any image format Rill reads. The size is `WxH`, `W` or `xH` (512 high, a column per 10ms, by default), and it is the resolution: each row is measured at exactly its pitch over a window centred on each column and exactly one column long (or two of the row's cycles, if a column is shorter than that), so a column holds only its own step and a wider image has finer steps in time. A taller image has more pitches, but a short column cannot tell close low pitches apart, so those rows light up together: sharp time costs pitch at the bottom. `range` is how far below full level black is (60dB); `low` and `high` are the bottom and top rows (20Hz, 20kHz); `colors` is `stereo` (the default: red the left channel, blue the right, green what they share, so mono is grey), `grey` (the channels mixed), or the colour scales `magma` and `viridis`, which look nice and do not read back as the same sound. JPEGs keep full colour resolution, so stereo is not smeared; PNG is the one for exact round trips.
+**Rendering** goes the other way: `rill render song.rill -o song.wav` writes a WAV file. Its sample format follows a `:`, a character Windows does not allow in file names, so `notes:take.wav` and `C:\out\song.wav` stay paths: `song.wav:i16`, or `f32` (the default) or `i24`.
 
 ## Modules
 
@@ -603,7 +569,7 @@ rill main() Sample { return pad(110Hz) + saw(55Hz) * 0.1 }
 
 Two libraries come with the compiler, so every program has them wherever it runs.
 
-**The prelude** is what cannot be written in Rill, or would be much slower in it: the constants `PI`, `TAU` and `RATE`; maths (`sin`, `cos`, `tan`, `tanh`, `exp`, `log`, `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `wrap`, `min`, `max`, `clamp`); `sum` over frames of any size; `random`; the tunings (`equal`, `just`, `pythagorean`, `meantone`); `level` and `amp`; `read` for audio files and `pixel` for images; and two that keep state, so only rills can use them: `noise()` and `delay`. It is always there and never imported.
+**The prelude** is what cannot be written in Rill, or would be much slower in it: the constants `PI`, `TAU` and `RATE`; maths (`sin`, `cos`, `tan`, `tanh`, `exp`, `log`, `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `wrap`, `min`, `max`, `clamp`); `sum` over frames of any size; `random`; the tunings (`equal`, `just`, `pythagorean`, `meantone`); `level` and `amp`; `read` for audio files; and two that keep state, so only rills can use them: `noise()` and `delay`. It is always there and never imported.
 
 **`noise()`** is a new random number in [-1, 1) every sample. Every call has its own sequence, seeded from the build's seed, so voices never share one and `--seed` repeats it.
 

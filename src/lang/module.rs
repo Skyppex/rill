@@ -50,15 +50,10 @@ pub trait Sources {
     /// (see [`crate::audio`]). Give samples from anywhere by overriding it;
     /// then no decoder is needed.
     fn audio(&self, path: &Path) -> Result<std::sync::Arc<crate::audio::Audio>, String> {
-        let bytes = self.read_bytes(path).map_err(|e| format!("cannot read it: {e}"))?;
+        let bytes = self
+            .read_bytes(path)
+            .map_err(|e| format!("cannot read it: {e}"))?;
         crate::audio::decode_bytes(bytes, path).map(std::sync::Arc::new)
-    }
-
-    /// An image, decoded: by default its bytes through the decoder (see
-    /// [`crate::images`]). Override it to hand over pixels from anywhere.
-    fn image(&self, path: &Path) -> Result<std::sync::Arc<crate::images::Image>, String> {
-        let bytes = self.read_bytes(path).map_err(|e| format!("cannot read it: {e}"))?;
-        crate::images::decode_bytes(&bytes, path).map(std::sync::Arc::new)
     }
 
     /// What to watch for changes to the file at `path`, for hot reload:
@@ -488,8 +483,7 @@ fn load_core(l: &mut Loader, name: &str, span: Span) -> Option<usize> {
             ),
         };
         l.diagnostics.push(
-            Diagnostic::error(span, format!("there is no core module `{wanted}`"))
-                .with_help(help),
+            Diagnostic::error(span, format!("there is no core module `{wanted}`")).with_help(help),
         );
         return None;
     };

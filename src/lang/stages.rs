@@ -363,7 +363,6 @@ fn visit(code: &Code, instr: &Instr, node: &mut Node) {
         | Instr::Select { .. }
         | Instr::Tune { .. }
         | Instr::AudioRead { .. }
-        | Instr::ImageRead { .. }
         | Instr::Sum { .. } => {}
         Instr::Noise { .. } => node.loops = true,
         Instr::DelayRead { line, .. } => {

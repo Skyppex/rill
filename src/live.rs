@@ -334,7 +334,13 @@ impl Live {
         options: lang::build::Options,
         sources: Box<dyn lang::Sources + Send + Sync>,
     ) -> Result<(Live, Player, Reloaded), Failed> {
-        Live::start(Origin::File(path.to_owned()), config, entry, options, sources)
+        Live::start(
+            Origin::File(path.to_owned()),
+            config,
+            entry,
+            options,
+            sources,
+        )
     }
 
     /// [`Live::from_file`] for a program in a string.
@@ -390,17 +396,20 @@ impl Live {
     fn build(&mut self) -> Result<(Engine, Reloaded), Failed> {
         let (sources, result) = match &self.origin {
             Origin::File(path) => {
-                let (sources, result) =
-                    lang::load_file(path, &*self.sources, &self.config, &self.entry, &self.options);
+                let (sources, result) = lang::load_file(
+                    path,
+                    &*self.sources,
+                    &self.config,
+                    &self.entry,
+                    &self.options,
+                );
                 let result = result.map(|(graph, checked)| {
                     let random = checked.uses_prelude("random");
-                    // The audio files and images it reads.
+                    // The audio files it reads.
                     let audio: Vec<PathBuf> = checked
                         .audio
                         .into_values()
-                        .map(|a| a.path)
-                        .chain(checked.images.into_values().map(|i| i.path))
-                        .filter_map(|p| self.sources.watch(&p))
+                        .filter_map(|a| self.sources.watch(&a.path))
                         .collect();
                     (graph, checked.warnings, random, audio)
                 });

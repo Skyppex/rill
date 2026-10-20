@@ -378,13 +378,14 @@ enum Command {
         /// for it follow the last `:`. A WAV takes its sample format:
         /// `song.wav:i16` (`f32`, the default, `i16` or `i24`). An image
         /// (png, jpg, webp, gif, bmp, tiff, qoi, ...) is a spectrogram:
-        /// `song.png:1000x500,range=80dB,low=40Hz,high=12kHz,fft=8192,colors=magma`.
-        /// Its size is `WxH`, `W` or `xH` (by default 512 high and a column
-        /// per 10ms); `range` is how far below full level is black (60dB);
-        /// `low` and `high` the bottom and top rows (50Hz, 15kHz), evenly
-        /// spaced in pitch; `colors` is `stereo` (the default: red the left
-        /// channel, blue the right; reads back with `@gen/spectral`),
-        /// `grey`, `magma` or `viridis`.
+        /// `song.png:1000x500,range=80dB,low=40Hz,high=12kHz,colors=magma`.
+        /// Its size is its resolution: every column is one step in time and
+        /// every row one pitch, `WxH`, `W` or `xH` (by default 512 high and
+        /// a column per 10ms); `range` is how far below full level is black
+        /// (60dB); `low` and `high` the bottom and top rows (20Hz, 20kHz),
+        /// evenly spaced in pitch; `colors` is `stereo` (the default: red
+        /// the left channel, blue the right, green what both have; reads
+        /// back with `@gen/spectral`), `grey`, `magma` or `viridis`.
         #[arg(short, long, value_name = "FILE[:OPTIONS]", value_parser = rill::output::parse)]
         out: Output,
         #[arg(long, default_value_t = 2.0)]

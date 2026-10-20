@@ -1156,7 +1156,6 @@ dependencies = [
  "libc",
  "notify",
  "rubato",
- "rustfft",
  "symphonia",
 ]
 

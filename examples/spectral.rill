@@ -10,8 +10,8 @@
 
 import @gen/spectral
 
-const PICTURE = ./images/rill.png
+const PICTURE = ../images/subtractive.png
 
 rill main(volume: Gain = -6dB) [Sample; 2] {
-    return painted<128>(PICTURE, 6s, loop: true) + volume
+    return painted<128>(PICTURE, 2s, loop: true) + volume
 }

@@ -73,11 +73,27 @@ rill pairs(
 
     for j in 0..(ceil(most / 2) as Int) {
         let before = (j * 2) as Float
-        let k = if j == 0 { damping(resonance) } else { sqrt(2.0) }
+
+        let k = if j == 0 {
+            damping(resonance)
+        } else {
+            sqrt(2.0)
+        }
+
         let two = svf(y, cutoff, k)
         let one = one_pole(y, cutoff)
-        let odd = if high { one[1] } else { one[0] }
-        let even = if high { two[2] } else { two[0] }
+
+        let odd = if high {
+            one[1]
+        } else {
+            one[0]
+        }
+
+        let even = if high {
+            two[2]
+        } else {
+            two[0]
+        }
 
         below = if lo == before + 1 {
             odd
@@ -124,10 +140,27 @@ rill bands(
 
     for j in 0..(most as Int) {
         let before = j as Float
-        let k = if j == 0 { damping(resonance) } else { sqrt(2.0) }
+
+        let k = if j == 0 {
+            damping(resonance)
+        } else {
+            sqrt(2.0)
+        }
+
         let band = svf(y, cutoff, k)[1] * k
-        below = if lo == before + 1 { band } else { below }
-        above = if lo + 1 == before + 1 { band } else { above }
+
+        below = if lo == before + 1 {
+            band
+        } else {
+            below
+        }
+
+        above = if lo + 1 == before + 1 {
+            band
+        } else {
+            above
+        }
+
         y = band
     }
 
@@ -179,4 +212,76 @@ export rill notch(
     max: Slope = 48dB / 1oct,
 ) Sample {
     return x - bands(x, cutoff, resonance, slope, max)
+}
+
+// Passes everything at the same level and moves only the phase: a quarter
+// turn per pole at `cutoff`, less below it and more above. Several poles
+// swept together and mixed with the dry sound make a phaser; `resonance`
+// makes the first pair turn more sharply. `poles` must be constant.
+export rill allpass(
+    x: Sample,
+    cutoff: Freq,
+    resonance: Float = 0,
+    poles: Int = 1,
+) Sample {
+    let y = x
+
+    for j in 0..(poles / 2) {
+        let k = if j == 0 {
+            damping(resonance)
+        } else {
+            sqrt(2.0)
+        }
+
+        let s = svf(y, cutoff, k)
+        y = y - 2 * k * s[1]
+    }
+
+    let one = one_pole(y, cutoff)
+
+    return if poles % 2 == 1 {
+        one[0] - one[1]
+    } else {
+        y
+    }
+}
+
+// One section of `hilbert`: a second-order allpass in two-sample steps, `a`
+// its coefficient.
+rill allpass_z2(x: Sample, a: Float) Sample {
+    state x1: Sample = 0
+    state x2: Sample = 0
+    state y1: Sample = 0
+    state y2: Sample = 0
+    let y = a * a * (x + y2) - x2
+    x2 = x1
+    x1 = x
+    y2 = y1
+    y1 = y
+    return y
+}
+
+// `x` as a pair `[i, q]` a quarter turn apart at every frequency: `q` is
+// `i` turned back by 90°, so a cosine gives a sine. The basis of frequency
+// shifting and single-sideband modulation. Two chains of allpasses (Olli
+// Niemitalo's design), within a degree of 90° from 30Hz to 15kHz; both come
+// out a little late.
+export rill hilbert(x: Sample) [Sample; 2] {
+    state late: Sample = 0
+
+    let a = x
+        |> allpass_z2(0.6923878)
+        |> allpass_z2(0.9360654322959)
+        |> allpass_z2(0.9882295226860)
+        |> allpass_z2(0.9987488452737)
+
+    let b = x
+        |> allpass_z2(0.4021921162426)
+        |> allpass_z2(0.8561710882420)
+        |> allpass_z2(0.9722909545651)
+        |> allpass_z2(0.9952884791278)
+
+    let i = late
+    late = a
+    return [i, -b]
 }

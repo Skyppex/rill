@@ -1,10 +1,291 @@
+// One rill for each helper in `@gen/mod`; play one by name, as in
+// `rill play examples/modulation.rill --entry fm1`.
+
 import @gen/osc
 import @gen/mod
+import @effects/filter
 
-rill main() Sample {
-    let lfo = sine(2Hz) / 2 + 0.5
+// Vibrato: the pitch swings 10Hz either way, twice a second.
+rill fm1() Sample {
+    let lfo = sine(2Hz) * 10
 
-    return lfo |> fm(50) -> (signal) {
+    let result = lfo |> fm() -> (signal) {
         sine(440Hz + signal * 1Hz)
     }
+
+    return result
+}
+
+// Through-zero FM: an audible modulator pushes the frequency below 0, so the
+// carrier runs backward for part of each cycle.
+rill fm2() Sample {
+    let result = sine(110Hz) |> fm() -> (signal) {
+        sine(110Hz + signal * 300Hz)
+    }
+
+    return result * 0.3
+}
+
+// A siren: an octave up and down, evenly in pitch.
+rill exp_fm1() Sample {
+    let result = sine(0.5Hz) |> exp_fm(1oct) -> (ratio) {
+        saw(220Hz * ratio)
+    }
+
+    return result * 0.2
+}
+
+// DX-style electric piano: a modulator an octave up pushing the phase.
+rill pm1() Sample {
+    let result = sine(440Hz) |> pm(0.25) -> (offset) {
+        sine(220Hz, offset)
+    }
+
+    return result * 0.3
+}
+
+// Tremolo, half deep, five times a second.
+rill am1() Sample {
+    let result = sine(5Hz) |> am(0.5) -> {
+        saw(220Hz)
+    }
+
+    return result * 0.2
+}
+
+// A bell: two unrelated frequencies multiplied.
+rill rm1() Sample {
+    let result = sine(307Hz) |> rm() -> {
+        sine(220Hz)
+    }
+
+    return result * 0.3
+}
+
+// A slow sweep of a square's pulse width.
+rill pwm1() Sample {
+    let result = sine(0.3Hz) |> pwm() -> (width) {
+        phasor(110Hz) |> warp(width) |> as_square()
+    }
+
+    return result * 0.2
+}
+
+// The classic sync lead: the synced saw's own pitch sweeps, the note stays.
+rill sync1() Sample {
+    let sweep = sine(0.25Hz) * 200Hz + 400Hz
+
+    let result = saw(110Hz) |> sync(sweep) -> (phase) {
+        as_saw(phase)
+    }
+
+    return result * 0.2
+}
+
+// A chorus: the voice mixed with itself, a few milliseconds late and moving.
+rill delay_mod1() Sample {
+    let voice = saw(220Hz)
+
+    let late = sine(0.8Hz) |> delay_mod(8ms, 3ms) -> {
+        voice
+    }
+
+    return (voice + late) * 0.15
+}
+
+// A saw gated by a low square.
+rill chop1() Sample {
+    let result = square(4Hz) |> chop() -> {
+        saw(220Hz)
+    }
+
+    return result * 0.2
+}
+
+// A saw flipped upside down by an audible sine: harsh and bright.
+rill chop2() Sample {
+    let result = sine(150Hz) |> chop(flip: true) -> {
+        saw(220Hz)
+    }
+
+    return result * 0.2
+}
+
+// A sine faded in and out 110 times a second by a ramp: a formant-like buzz.
+rill window1() Sample {
+    let result = saw(110Hz) |> window() -> {
+        sine(880Hz)
+    }
+
+    return result * 0.3
+}
+
+// Reversing soft sync: a smoother cousin of `sync1`.
+rill flip_sync1() Sample {
+    let result = saw(110Hz) |> flip_sync(370Hz) -> (phase) {
+        as_sine(phase)
+    }
+
+    return result * 0.3
+}
+
+// Threshold soft sync: only restarts near the start of its own cycle.
+rill soft_sync1() Sample {
+    let result = saw(110Hz) |> soft_sync(370Hz, 0.2) -> (phase) {
+        as_saw(phase)
+    }
+
+    return result * 0.2
+}
+
+// A sine driven harder and softer into a clipper.
+rill shape1() Sample {
+    let result = sine(0.5Hz) |> shape(4, 3) -> {
+        sine(110Hz)
+    }
+
+    return result * 0.3
+}
+
+// West Coast folding, moved at audio rate.
+rill fold1() Sample {
+    let result = sine(55Hz) |> fold(3, 2) -> {
+        sine(110Hz)
+    }
+
+    return result * 0.3
+}
+
+// A clipper pushed up and down, so it clips more on one side than the
+// other.
+rill bias1() Sample {
+    let result = sine(0.5Hz) |> bias(0.5, 3) -> {
+        sine(110Hz)
+    }
+
+    return result * 0.2
+}
+
+// A phaser: four allpass poles swept two octaves either side of 1kHz, mixed
+// with the dry saw.
+rill allpass_mod1() Sample {
+    let voice = saw(110Hz)
+
+    let swept = sine(0.3Hz) |> allpass_mod(1kHz, 2oct) -> {
+        voice
+    }
+
+    return (voice + swept) * 0.15
+}
+
+// A sample rate swept down and up, aliasing as it goes.
+rill downsample1() Sample {
+    let result = sine(1Hz) |> downsample(4kHz, 3kHz) -> {
+        saw(220Hz)
+    }
+
+    return result * 0.2
+}
+
+// Bits from 3 to 9 and back.
+rill crush1() Sample {
+    let result = sine(0.3Hz) |> crush(6, 3) -> {
+        sine(220Hz)
+    }
+
+    return result * 0.3
+}
+
+// Two squares XORed.
+rill xor1() Sample {
+    let result = square(307Hz) |> xor() -> {
+        square(220Hz)
+    }
+
+    return result * 0.15
+}
+
+// A sine turned into a square whose width follows a slow LFO.
+rill compare1() Sample {
+    let result = sine(0.3Hz) |> compare() -> {
+        sine(110Hz)
+    }
+
+    return result * 0.15
+}
+
+// Only the upper sideband: a saw's harmonics all moved up 100Hz, so they no
+// longer line up.
+rill ssb1() Sample {
+    let result = sine(100Hz) |> ssb() -> {
+        saw(220Hz)
+    }
+
+    return result * 0.15
+}
+
+// The sidebands swinging from upper only, through both, to lower only.
+rill ssb2() Sample {
+    let balance = sine(0.2Hz)
+
+    let result = sine(100Hz) |> ssb(balance) -> {
+        saw(220Hz)
+    }
+
+    return result * 0.15
+}
+
+// A saw shifted up 30Hz: detuned and metallic.
+rill freq_shift1() Sample {
+    return (saw(220Hz) |> freq_shift(30Hz)) * 0.2
+}
+
+// Feedback rising from a sine to nearly a saw and back.
+rill feedback_fm1() Sample {
+    let amount = sine(0.2Hz) * 0.75 + 0.75
+    return (110Hz |> feedback_fm(amount)) * 0.3
+}
+
+// A formant sweeping between 400Hz and 1.6kHz over a 110Hz drone.
+rill paf1() Sample {
+    let formant = sine(0.3Hz) * 600Hz + 1kHz
+    return (110Hz |> paf(formant, 300Hz)) * 0.3
+}
+
+// Pulsars of a sine, with their formant sweeping.
+rill pulsar1() Sample {
+    let formant = sine(0.3Hz) * 600Hz + 1kHz
+
+    let result = 110Hz |> pulsar(formant) -> (phase) {
+        as_sine(phase)
+    }
+
+    return result * 0.5
+}
+
+// A nasal VOSIM buzz, its offset taken away.
+rill vosim1() Sample {
+    return (110Hz |> vosim(880Hz) |> highpass(20Hz)) * 0.3
+}
+
+// An "ah": three FOF formants at the vowel's peaks.
+rill fof1() Sample {
+    let a = 110Hz |> fof(650Hz, 80Hz)
+    let b = (110Hz |> fof(1080Hz, 90Hz)) * 0.5
+    let c = (110Hz |> fof(2650Hz, 120Hz)) * 0.4
+    return (a + b + c) * 0.3
+}
+
+rill main() Sample {
+    return sine(1Hz)
+        |> fm() -> (signal) {
+            sine(2Hz + signal * 1Hz)
+        }
+        |> am() -> {
+            sine(110Hz)
+        }
+
+    // |> fm() -> (signal) {
+    //     sine(440Hz + signal * 220Hz)
+    // }
 }

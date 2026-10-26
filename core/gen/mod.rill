@@ -1,16 +1,459 @@
-// Modulation: one signal shaping another. The helpers take and give plain
-// signals; what the signal becomes (a pitch, a phase, a level) is written
-// where it is used, in the closure after `->`:
+// Modulation: one signal shaping another. Every helper takes the modulator
+// first and the carrier last, so the carrier can be written as a closure
+// after `->`:
 //
 //     lfo |> fm() -> (signal) {
 //         sine(440Hz + signal * 1Hz)
 //     }
+//
+// The helpers work on plain numbers; what a number becomes (a frequency, a
+// phase, a pulse width) is written in the closure.
+//
+// Every modulator goes from -1 to 1, as an oscillator does, so one can be
+// piped straight in. How far it moves things is a setting of the helper
+// (`depth`, `index`) or is written in the closure (`signal * 10Hz`), never
+// scaled into the modulator itself.
+//
+// The generators at the end (`feedback_fm`, `paf`, `pulsar`, `vosim`, `fof`,
+// `wavetable`) have no outside modulator; they take a frequency first, as
+// oscillators do.
 
-// `carrier` scaled by `width`, handed to `generator`.
-export rill fm(
-    carrier: Sample,
-    width: Float = 1,
-    generator: rill(Sample) Sample,
+import @gen/osc
+import @effects/filter
+import @util/control
+
+// Standard frequency modulation
+// `modulator` handed to `carrier`. Through-zero FM comes for free: a
+// negative frequency runs `phasor` (and so every oscillator) backward.
+export rill fm(modulator: Sample, carrier: rill(Sample) Sample) Sample {
+    return carrier(modulator)
+}
+
+// Exponential FM: `carrier` gets a ratio to multiply its frequency by, up
+// `depth` at a modulator of 1 and down `depth` at -1. The pitch moves evenly,
+// so the average frequency drifts up as `depth` grows, as on an analog synth:
+// `lfo |> exp_fm(1oct) -> (ratio) { saw(110Hz * ratio) }`.
+export rill exp_fm(
+    modulator: Sample,
+    depth: Interval = 1oct,
+    carrier: rill(Float) Sample,
 ) Sample {
-    return generator(carrier * width)
+    return carrier(pow(2, modulator * depth / 1oct))
+}
+
+// Phase modulation: `carrier` gets how far to push its phase, in cycles, up
+// to `index` either way. What DX-style "FM" does; the pitch never drifts:
+// `lfo |> pm(0.3) -> (offset) { sine(440Hz, offset) }`.
+export rill pm(
+    modulator: Sample,
+    index: Float = 1,
+    carrier: rill(Float) Sample,
+) Sample {
+    return carrier(modulator * index)
+}
+
+// Amplitude modulation: `carrier` made quieter and louder. At `depth` 1 it
+// goes from silent to full, at 0 nothing changes. Slow, it is tremolo; at
+// audio rate it adds sidebands either side of the carrier:
+// `lfo |> am(0.5) -> { saw(220Hz) }`.
+export rill am(
+    modulator: Sample,
+    depth: Float = 1,
+    carrier: rill() Sample,
+) Sample {
+    return carrier() * (1 - depth * (0.5 - modulator / 2))
+}
+
+// Ring modulation: `carrier` times `modulator`. Only the sidebands are left,
+// not the carrier, which gives bells and clangs:
+// `sine(300Hz) |> rm() -> { saw(220Hz) }`.
+export rill rm(modulator: Sample, carrier: rill() Sample) Sample {
+    return carrier() * modulator
+}
+
+// Single-sideband modulation: like `rm`, but with control over which
+// sideband is left. At `balance` 1 only the sum of the two frequencies,
+// at -1 only the difference, at 0 both, which is ring modulation. Moving
+// sidebands up or down evenly gives inharmonic, unmirrored spectra:
+// `sine(100Hz) |> ssb() -> { saw(220Hz) }`.
+export rill ssb(
+    modulator: Sample,
+    balance: Float = 1,
+    carrier: rill() Sample,
+) Sample {
+    let m = hilbert(modulator)
+    let c = hilbert(carrier())
+    return m[0] * c[0] - clamp(balance, -1, 1) * m[1] * c[1]
+}
+
+// Frequency shifting: every frequency in `x` moved by `shift` (down if it is
+// negative), so harmonics stop being multiples of one another: a metallic,
+// detuned sound, or a slow phasing at a few Hz. Single-sideband modulation
+// by a sine at `shift`: `saw(220Hz) |> freq_shift(30Hz)`.
+export rill freq_shift(x: Sample, shift: Freq) Sample {
+    let iq = hilbert(x)
+    let turn = phasor(shift) * TAU
+    return iq[0] * cos(turn) - iq[1] * sin(turn)
+}
+
+// Pulse width modulation: `carrier` gets a pulse width, `width` moved up to
+// `depth` either way and kept between 0.01 and 0.99:
+// `lfo |> pwm() -> (w) { phasor(110Hz) |> warp(w) |> as_square() }`.
+export rill pwm(
+    modulator: Sample,
+    width: Float = 0.5,
+    depth: Float = 0.4,
+    carrier: rill(Float) Sample,
+) Sample {
+    return carrier(clamp(width + modulator * depth, 0.01, 0.99))
+}
+
+// Hard sync: `carrier` gets a phase going at `freq` that
+// starts again whenever `modulator` rises through 0. The carrier keeps the
+// modulator's pitch, with peaks where its own `freq` falls:
+// `saw(110Hz) |> sync(370Hz) -> (phase) { as_saw(phase) }`.
+export rill sync(
+    modulator: Sample,
+    freq: Freq,
+    carrier: rill(Float) Sample,
+) Sample {
+    state phase: Float = 0
+
+    if rising(modulator) {
+        phase = 0
+    }
+
+    let out = phase
+    phase = wrap(phase + freq / RATE)
+    return carrier(out)
+}
+
+// Delay-time modulation: `carrier` heard `time` late, moved up to `depth`
+// either way. Slow and alone it is vibrato; mixed with the carrier, a chorus
+// or a flanger; at audio rate, phase modulation of any sound. `max` is the
+// longest the delay gets: `lfo |> delay_mod(5ms, 2ms) -> { voice }`.
+export rill delay_mod(
+    modulator: Sample,
+    time: Time = 5ms,
+    depth: Time = 2ms,
+    max: Time = 50ms,
+    carrier: rill() Sample,
+) Sample {
+    return delay(carrier(), time + modulator * depth, max: max)
+}
+
+// Chopping: `carrier` let through while `modulator` is above 0 and silenced
+// below it, or with `flip`, turned upside down below it. A harsh, bright
+// relative of ring modulation:
+// `sine(80Hz) |> chop(flip: true) -> { saw(220Hz) }`.
+export rill chop(
+    modulator: Sample,
+    flip: Bool = false,
+    carrier: rill() Sample,
+) Sample {
+    let x = carrier()
+
+    return if modulator > 0 {
+        x
+    } else if flip {
+        -x
+    } else {
+        0
+    }
+}
+
+// Window modulation: `carrier` faded in and out by a smooth window (a raised
+// cosine), full at a modulator of 0 and silent at -1 and 1. A ramp makes it
+// periodic, a shaped kind of AM: `saw(110Hz) |> window() -> { sine(880Hz) }`.
+export rill window(modulator: Sample, carrier: rill() Sample) Sample {
+    return carrier() * (0.5 + 0.5 * cos(PI * clamp(modulator, -1, 1)))
+}
+
+// Reversing soft sync: like `sync`, but the phase turns round each time
+// `modulator` rises through 0 instead of starting again, so the carrier
+// never jumps: `saw(110Hz) |> flip_sync(370Hz) -> (phase) { as_sine(phase) }`.
+export rill flip_sync(
+    modulator: Sample,
+    freq: Freq,
+    carrier: rill(Float) Sample,
+) Sample {
+    state phase: Float = 0
+    state direction: Float = 1
+
+    if rising(modulator) {
+        direction = -direction
+    }
+
+    let out = phase
+    phase = wrap(phase + direction * freq / RATE)
+    return carrier(out)
+}
+
+// Threshold soft sync: like `sync`, but the phase only starts again if it
+// is within `window` of a cycle of its own start. Gentler than hard sync,
+// and prone to subharmonics:
+// `saw(110Hz) |> soft_sync(370Hz, 0.2) -> (phase) { as_saw(phase) }`.
+export rill soft_sync(
+    modulator: Sample,
+    freq: Freq,
+    window: Float = 0.1,
+    carrier: rill(Float) Sample,
+) Sample {
+    state phase: Float = 0
+
+    if rising(modulator) && (phase < window || phase > 1 - window) {
+        phase = 0
+    }
+
+    let out = phase
+    phase = wrap(phase + freq / RATE)
+    return carrier(out)
+}
+
+// Waveshaping: `carrier` driven into a soft clipper (`tanh`) by `drive`,
+// moved up to `depth` either way. More drive is more harmonics:
+// `lfo |> shape(4, 3) -> { sine(110Hz) }`.
+export rill shape(
+    modulator: Sample,
+    drive: Float = 2,
+    depth: Float = 1,
+    carrier: rill() Sample,
+) Sample {
+    return tanh(carrier() * max(drive + modulator * depth, 0))
+}
+
+// Wavefolding: `carrier` turned up by `amount`, moved up to `depth` either
+// way, with what goes past 1 or -1 folded back in. West Coast timbres, rich
+// when moved at audio rate: `sine(55Hz) |> fold(3, 2) -> { sine(110Hz) }`.
+export rill fold(
+    modulator: Sample,
+    amount: Float = 2,
+    depth: Float = 1,
+    carrier: rill() Sample,
+) Sample {
+    let x = carrier() * max(amount + modulator * depth, 0)
+    // A triangle through (-1, -1), (0, 0) and (1, 1), reflecting beyond.
+    return 1 - abs(wrap((x + 1) / 4) * 4 - 2)
+}
+
+// Bias modulation: `carrier` pushed up or down by up to `depth` before a
+// soft clipper at `drive`, so it clips more on one side than the other:
+// uneven, moving harmonics. The push alone is taken away again after, so it
+// adds no thump: `lfo |> bias(0.5, 3) -> { sine(110Hz) }`.
+export rill bias(
+    modulator: Sample,
+    depth: Float = 0.5,
+    drive: Float = 2,
+    carrier: rill() Sample,
+) Sample {
+    let offset = modulator * depth
+    return tanh((carrier() + offset) * drive) - tanh(offset * drive)
+}
+
+// Allpass modulation: `carrier` through `allpass` at `cutoff`, swept
+// `depth` up and down. The level stays; only the phase moves, like PM
+// with a filter's character. Mixed with the dry sound, a phaser:
+// `lfo |> allpass_mod(1kHz, 2oct) -> { voice }`.
+export rill allpass_mod(
+    modulator: Sample,
+    cutoff: Freq = 1kHz,
+    depth: Interval = 2oct,
+    poles: Int = 4,
+    carrier: rill() Sample,
+) Sample {
+    let swept = cutoff * pow(2, modulator * depth / 1oct)
+    return allpass(carrier(), swept, poles: poles)
+}
+
+// Sample-rate modulation: `carrier` held between samples taken `rate` times
+// a second, moved up to `depth` either way. Lower rates fold the top back
+// down as aliasing: `lfo |> downsample(4kHz, 3kHz) -> { saw(220Hz) }`.
+export rill downsample(
+    modulator: Sample,
+    rate: Freq = 4kHz,
+    depth: Freq = 2kHz,
+    carrier: rill() Sample,
+) Sample {
+    state phase: Float = 1
+    state held: Sample = 0
+    let x = carrier()
+    phase = phase + max(rate + modulator * depth, 0Hz) / RATE
+
+    if phase >= 1 {
+        held = x
+        phase = wrap(phase)
+    }
+
+    return held
+}
+
+// Bit-depth modulation: `carrier` rounded to `bits` bits, moved up to
+// `depth` either way; fewer bits, coarser steps and more grit. Bits need not
+// be whole: `lfo |> crush(6, 3) -> { sine(220Hz) }`.
+export rill crush(
+    modulator: Sample,
+    bits: Float = 8,
+    depth: Float = 4,
+    carrier: rill() Sample,
+) Sample {
+    let steps = pow(2, max(bits + modulator * depth, 1) - 1)
+    return round(carrier() * steps) / steps
+}
+
+// Logic modulation: `modulator` and `carrier` as square waves (high above
+// 0, low below), XORed: high when exactly one of them is. The XOR of two
+// squares sounds much like ring modulation of them:
+// `square(300Hz) |> xor() -> { square(220Hz) }`.
+export rill xor(modulator: Sample, carrier: rill() Sample) Sample {
+    let x = carrier()
+
+    return if (modulator > 0) != (x > 0) {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+// Comparator: 1 while `carrier` is above `modulator`, -1 while below. A
+// square whose width follows the modulator, from any waveform; pulse width
+// modulation of anything: `lfo |> compare() -> { sine(110Hz) }`.
+export rill compare(modulator: Sample, carrier: rill() Sample) Sample {
+    return if carrier() > modulator {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+// Feedback FM: a sine at `freq` modulating its own phase by `amount` times
+// its last output (two samples averaged, as on the DX7, so it settles).
+// From a sine at 0 to nearly a saw around 1.2, and noise far above:
+// `110Hz |> feedback_fm(1.2)`.
+export rill feedback_fm(freq: Freq, amount: Float = 1) Sample {
+    state last: Sample = 0
+    state before: Sample = 0
+    let y = sin(TAU * phasor(freq) + amount * (last + before) / 2)
+    before = last
+    last = y
+    return y
+}
+
+// Phase-aligned formant (Puckette): harmonics of `freq` with a peak at
+// `formant`, about `bandwidth` wide, like a resonance that moves with no
+// filter and no clicks. Each cycle is a bell around its start times the
+// two harmonics either side of `formant`, blended:
+// `110Hz |> paf(880Hz, 300Hz)`.
+export rill paf(freq: Freq, formant: Freq, bandwidth: Freq = 200Hz) Sample {
+    let f = max(freq, 1Hz)
+    let p = phasor(f)
+    let ratio = max(formant / f, 0)
+    let k = floor(ratio)
+    let blend = ratio - k
+    let low = cos(TAU * k * p)
+    let high = cos(TAU * (k + 1) * p)
+    let width = bandwidth / f * sin(PI * p)
+    return exp(-width * width) * (low + (high - low) * blend)
+}
+
+// Pulsar synthesis: `freq` times a second, one short pulse (a pulsaret)
+// lasting one cycle of `formant`, then silence until the next. `carrier`
+// shapes the pulse from its phase (0 to 1) and a smooth window fades it in
+// and out; the pulse's length sets a peak at `formant`, which should be at
+// least `freq`: `110Hz |> pulsar(880Hz) -> (phase) { as_sine(phase) }`.
+export rill pulsar(
+    freq: Freq,
+    formant: Freq,
+    carrier: rill(Float) Sample,
+) Sample {
+    let t = min(phasor(freq) * formant / max(freq, 1Hz), 1)
+    return carrier(t) * (0.5 - 0.5 * cos(TAU * t))
+}
+
+// VOSIM: `freq` times a second, `pulses` sine-squared pulses at `formant`,
+// each `decay` times the one before, then silence until the next. A vocal,
+// nasal buzz with a peak at `formant`. It only goes from 0 to 1, as the
+// original does; a highpass takes the offset away:
+// `110Hz |> vosim(880Hz)`.
+export rill vosim(
+    freq: Freq,
+    formant: Freq,
+    decay: Float = 0.8,
+    pulses: Int = 3,
+) Sample {
+    let t = phasor(freq) * formant / max(freq, 1Hz)
+    let n = floor(t)
+    let s = sin(PI * t)
+
+    return if n < pulses as Float {
+        pow(decay, n) * s * s
+    } else {
+        0
+    }
+}
+
+// One grain of `fof`, `t` after it started.
+fn grain(t: Time, formant: Freq, bandwidth: Freq, attack: Time) Float {
+    let rise = if t < attack {
+        0.5 - 0.5 * cos(PI * t / attack)
+    } else {
+        1
+    }
+
+    rise * exp(-PI * bandwidth * t) * sin(TAU * formant * t)
+}
+
+// FOF (formant wave function): `freq` times a second a grain starts: a sine
+// at `formant`, rising over `attack` and dying away so its peak is
+// `bandwidth` wide. One per formant of a voice, summed, makes vowels:
+// `110Hz |> fof(650Hz, 80Hz)`. A grain lasts two cycles at most.
+export rill fof(
+    freq: Freq,
+    formant: Freq,
+    bandwidth: Freq = 100Hz,
+    attack: Time = 3ms,
+) Sample {
+    // How long ago each of two grains started; they take turns.
+    state a: Time = 1s
+    state b: Time = 1s
+    state turn: Bool = false
+    state last: Float = 1
+    let p = phasor(freq)
+
+    if p < last {
+        if turn {
+            a = 0s
+        } else {
+            b = 0s
+        }
+
+        turn = !turn
+    }
+
+    last = p
+    let first = grain(a, formant, bandwidth, attack)
+    let second = grain(b, formant, bandwidth, attack)
+    a = min(a + 1 / RATE, 1s)
+    b = min(b + 1 / RATE, 1s)
+    return first + second
+}
+
+// A wavetable oscillator: `table` holds `cycles` single-cycle waves one after
+// another, and `position` (0 to 1) picks one, blending the two nearest.
+// Swept at audio rate it adds sidebands like FM or AM:
+// `110Hz |> wavetable(./table.wav, 4, position: lfo / 2 + 0.5)`.
+export rill wavetable(
+    freq: Freq,
+    table: Audio<1>,
+    cycles: Int,
+    position: Float = 0,
+) Sample {
+    let p = phasor(freq)
+    let n = cycles as Float
+    let at = clamp(position, 0, 1) * (n - 1)
+    let lo = floor(at)
+    let hi = min(lo + 1, n - 1)
+    let cycle = table.length / n
+    let a = read(table, (lo + p) * cycle)[0]
+    let b = read(table, (hi + p) * cycle)[0]
+    return a + (b - a) * (at - lo)
 }

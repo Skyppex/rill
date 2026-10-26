@@ -1,0 +1,24 @@
+// The wavetable `examples/modulation.rill` plays: four single-cycle waves of
+// 2048 samples one after another (sine, triangle, saw, square), rendered to
+// `table.wav` with `rill render examples/sounds/table.rill -o
+// examples/sounds/table.wav --seconds 0.1706667 --rate 48000 --channels 1`.
+
+rill main() Sample {
+    state n: Float = 0
+    // Which wave, and how far through it.
+    let wave = floor(n / 2048)
+    let p = wrap(n / 2048)
+    n = n + 1
+
+    return if wave < 1 {
+        sin(p * TAU)
+    } else if wave < 2 {
+        1 - 4 * abs(p - 0.5)
+    } else if wave < 3 {
+        p * 2 - 1
+    } else if p < 0.5 {
+        1.0
+    } else {
+        -1.0
+    }
+}

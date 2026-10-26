@@ -119,8 +119,16 @@ fn examples_check_cleanly() {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "rill") {
-            // As files: what they read is next to them.
-            let (map, result) = lang::compile_file_entry(&path, "main", &lang::Disk);
+            // As files: what they read is next to them. A file without a
+            // `main` holds several programs, each played with `--entry`.
+            let has_main = std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("rill main(");
+            let (map, result) = if has_main {
+                lang::compile_file_entry(&path, "main", &lang::Disk)
+            } else {
+                lang::compile_file(&path, &lang::Disk)
+            };
             match result {
                 Ok((_, checked)) => assert!(
                     checked.warnings.is_empty(),

@@ -1,0 +1,16 @@
+// Modulation: one signal shaping another. The helpers take and give plain
+// signals; what the signal becomes (a pitch, a phase, a level) is written
+// where it is used, in the closure after `->`:
+//
+//     lfo |> fm() -> (signal) {
+//         sine(440Hz + signal * 1Hz)
+//     }
+
+// `carrier` scaled by `width`, handed to `generator`.
+export rill fm(
+    carrier: Sample,
+    width: Float = 1,
+    generator: rill(Sample) Sample,
+) Sample {
+    return generator(carrier * width)
+}

@@ -425,7 +425,9 @@ fn generic_sizes_are_inferred() {
         "argument `b` of `swap` expects `[Sample; 2]`, found `[number; 3]`"
     );
     // A size only the body uses is written at the call.
-    assert_ok("rill f<N>(x: Sample) Sample { return x * N }\nrill main() Sample { return f<3>(1) }");
+    assert_ok(
+        "rill f<N>(x: Sample) Sample { return x * N }\nrill main() Sample { return f<3>(1) }",
+    );
     assert_eq!(
         error("rill f<N>(x: Sample) Sample { return x * N }\nrill main() Sample { return f(1) }").0,
         "`f` needs its size `N` written here, as nothing it is given says it"
@@ -908,6 +910,80 @@ fn functions_are_values() {
         )[0]
         .0,
         "`t` cannot be a function or rill"
+    );
+}
+
+#[test]
+fn anonymous_rills_and_trailing_closures() {
+    let defs = "
+        rill fm(carrier: Sample, width: Float = 1, generator: rill(Sample) Sample) Sample {
+            return generator(carrier * width)
+        }
+        rill fresh(g: rill() Sample) Sample { return g() }
+        fn shape(x: Float, f: fn(Float) Float) Float { f(x) }
+    ";
+    let with = |stmts: &str| format!("{SINE}\n{defs}\n{}", body(stmts));
+
+    assert_eq!(
+        type_of(
+            &with("let o = rill(s: Sample) { sine(440Hz + s * 1Hz) }"),
+            "o"
+        ),
+        Type::Rill(vec![Type::Sample], Box::new(Type::Sample))
+    );
+    // The closure takes the kind of the parameter it goes to.
+    assert_eq!(
+        type_of(&with("let o = shape(0.5) -> (x) { x * x }"), "o"),
+        Type::Float
+    );
+    assert_ok(&with(
+        "let lfo = sine(2Hz)
+         let a = lfo |> fm() -> (signal) {
+             sine(440Hz + signal * 1Hz)
+         }
+         let b = lfo |> fm -> (s) { sine(220Hz + s * 1Hz) } |> peak
+         let c = fm(lfo, 2) -> (s) { s }
+         let d = fresh -> { sine(110Hz) }
+         let o: rill(Sample) Sample = rill(s) { sine(330Hz + s * 1Hz) }
+         let e = lfo |> fm(generator: o)",
+    ));
+
+    for (stmts, msg) in [
+        (
+            "let a = 1 |> peak -> (s) { s }",
+            "the closure after `->` goes to `peak`'s last parameter, but `release` is a `Time`, not a fn or rill",
+        ),
+        (
+            "let a = shape(0.5) -> (x) { sine(x * 1Hz) }",
+            "an anonymous fn cannot call rill `sine`",
+        ),
+        (
+            "let a = 1 |> fm -> (s) {
+                 state n: Sample = 0
+                 s
+             }",
+            "an anonymous rill cannot keep `state`",
+        ),
+        (
+            "let a = fm(1, generator: rill(s) { s }) -> (s) { s }",
+            "argument `generator` is given more than once",
+        ),
+        ("let o = rill(s) { s }", "cannot tell the type of `s`"),
+    ] {
+        assert_eq!(error(&with(stmts)).0, msg, "{stmts}");
+    }
+
+    let src = format!(
+        "{SINE}\n{}",
+        "fn f(x: Float) Float {
+            let g = rill(s: Sample) Sample { s }
+            x
+        }
+        rill main() Sample { return f(1) }"
+    );
+    assert_eq!(
+        error(&src).0,
+        "an anonymous rill can only be made inside a rill"
     );
 }
 
@@ -1886,7 +1962,10 @@ fn sequence_fields() {
     assert_eq!(h.unwrap(), "did you mean `step_count`?");
     let (m, h) = error(&format!("{RIFF}\n{}", body("let x = riff.tempo")));
     assert_eq!(m, "sequence `riff` has no field `tempo`");
-    assert!(h.unwrap().starts_with("every instance has its own: `riff[id].tempo`"));
+    assert!(
+        h.unwrap()
+            .starts_with("every instance has its own: `riff[id].tempo`")
+    );
     let (m, h) = error(&format!("{RIFF}\n{}", body("let x = riff.swing")));
     assert_eq!(m, "sequence `riff` has no field `swing`");
     assert!(h.unwrap().starts_with("a sequence has `step_count`"));

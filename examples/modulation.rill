@@ -1,0 +1,10 @@
+import @gen/osc
+import @gen/mod
+
+rill main() Sample {
+    let lfo = sine(2Hz) / 2 + 0.5
+
+    return lfo |> fm(50) -> (signal) {
+        sine(440Hz + signal * 1Hz)
+    }
+}

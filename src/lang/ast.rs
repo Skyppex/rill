@@ -256,7 +256,10 @@ pub enum TypeExpr {
     },
     /// `Audio<N>`: an audio file with `N` channels. Plain `Audio` is
     /// [`TypeExpr::Named`].
-    Audio { size: SizeExpr, span: Span },
+    Audio {
+        size: SizeExpr,
+        span: Span,
+    },
 }
 
 impl TypeExpr {
@@ -435,8 +438,10 @@ pub enum ExprKind {
     Field(Box<Expr>, Ident),
     /// `x as Float`
     Cast(Box<Expr>, TypeExpr),
-    /// An anonymous fn: `fn(p) { ... }` or `fn(p: Pitch) Freq { ... }`.
+    /// An anonymous fn or rill: `fn(p) { ... }`, `fn(p: Pitch) Freq { ... }`,
+    /// `rill(x) { ... }`, or the closure after a call's `->`.
     Fn {
+        kind: LambdaKind,
         params: Vec<FnParam>,
         ret: Option<TypeExpr>,
         body: Block,
@@ -457,6 +462,18 @@ pub enum ExprKind {
     },
 }
 
+/// What an anonymous callable is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LambdaKind {
+    /// `fn(p) { ... }`: pure.
+    Fn,
+    /// `rill(x) { ... }`: can call rills.
+    Rill,
+    /// `f() -> (x) { ... }`: a fn or a rill, as the parameter it goes to
+    /// says.
+    Trailing,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Arg {
     pub name: Option<Ident>,
@@ -464,6 +481,9 @@ pub struct Arg {
     /// call that runs per element.
     pub each: Option<Span>,
     pub value: Expr,
+    /// Written after the call's `->`: it goes to the callee's last
+    /// parameter.
+    pub trailing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

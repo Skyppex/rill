@@ -440,7 +440,7 @@ rill lead() Sample {
 
 ## Functions and rills as values
 
-Fns and rills are values: they can be bound with `let`, passed to fns and rills, returned from fns, and chosen while playing. Anonymous fns use the named syntax without the name; there are no anonymous rills.
+Fns and rills are values: they can be bound with `let`, passed to fns and rills, returned from fns, and chosen while playing. Anonymous fns and rills use the named syntax without the name.
 
 ```rill
 fn a432(p: Pitch) Freq { 432Hz * pow(2, (p - A4) / 12st) }
@@ -465,10 +465,34 @@ Rules:
 - Function types are written `fn(A, B) R`; rill types are written `rill(A, B) R`. They cannot be `state`, frame elements, event fields or the entry rill's parameters.
 - An anonymous fn's parameter and return types can be left out when the surroundings say what they are (a parameter of function type, an annotated `let`, a `return`, or a fn's declared return type). Otherwise they are required.
 - Anonymous fns capture what they use, by value, at the point they are made. They are fns, so they are pure: they read what they capture but cannot change it, and cannot call rills.
+- An anonymous rill, `rill(x) { ... }`, captures the same way and can call rills; every place it is called has its own state for them. It can only be made in a rill, and has no `state` or event handlers of its own: for those, write a named rill.
 - A named fn or rill can be used where a callable type with fewer parameters is expected, if its remaining parameters have defaults. A prelude function that works on several types (`sin`) needs an expected type to pick one.
 - A rill value still behaves like a rill call: it can only be called from a rill, it lifts over extra frame layers, and every call site has its own state.
 - Recursion is still not allowed, including through callable values.
 - At build time every call of a callable value is replaced by the callable's body, so callable values cost nothing while playing. A callable chosen while playing becomes a branch between the candidates; only the chosen one runs.
+
+### Trailing closures
+
+A closure written after a call's `->` goes to the callee's last parameter, which must be a fn or rill type. It is a rill or a fn as that parameter's type says, and takes its parameter types from it:
+
+```rill
+rill fm(carrier: Sample, width: Float = 1, generator: rill(Sample) Sample) Sample {
+    return generator(carrier * width)
+}
+
+rill main() Sample {
+    let lfo = sine(2Hz) / 2 + 0.5
+
+    return lfo |> fm() -> (signal) {
+        sine(440Hz + signal * 1Hz)
+    }
+}
+```
+
+- It goes to the last parameter by name, so parameters with defaults before it can be left out (`width` above). A callable value's parameters have no names; there it is the last argument.
+- Empty parentheses can go: `lfo |> fm -> (s) { ... }`. A closure with no parameters is `-> { ... }`.
+- It ends the call, so piping goes on after it: `lfo |> fm -> (s) { ... } |> lowpass(1kHz)`.
+- The `->` must be on the same line as the call.
 
 ## Audio files
 

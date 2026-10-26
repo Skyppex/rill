@@ -2471,9 +2471,16 @@ impl<'a> Compiler<'a> {
                 self.patch(skip_else);
                 Ok(result.unwrap_or_else(CVal::unit))
             }
-            FnVal::Named(_) | FnVal::Lambda { .. } => {
-                Err(internal(span, "rill value without a rill definition"))
+            // An anonymous rill: inlined here like a named one, so the
+            // rills it calls get state of their own at this call.
+            FnVal::Lambda { id, captured } => {
+                let lambda = self
+                    .defs
+                    .lambda(*id)
+                    .ok_or_else(|| internal(span, "unknown anonymous rill"))?;
+                self.inline_lambda(lambda, captured.clone(), vals)
             }
+            FnVal::Named(_) => Err(internal(span, "rill value without a rill definition")),
         }
     }
 
@@ -3054,6 +3061,7 @@ fn order_arg_refs<'e>(sig: &Signature, args: &'e [Arg]) -> Vec<Option<&'e Arg>> 
     for (i, a) in args.iter().enumerate() {
         let pi = match &a.name {
             Some(n) => sig.params.iter().position(|p| p.name == n.name),
+            None if a.trailing => sig.params.len().checked_sub(1),
             None => Some(i),
         };
         if let Some(pi) = pi {

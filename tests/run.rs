@@ -825,6 +825,32 @@ fn captured_values_can_change_over_time() {
 }
 
 #[test]
+fn trailing_closures_play_like_the_code_written_out() {
+    // `twice` calls its closure twice: each call is its own `sine`, with
+    // its own phase, so the two add up to one sine at double the level.
+    let closures = format!(
+        "{SINE}
+        rill twice(x: Sample, g: rill(Sample) Sample) Sample {{
+            return (g(x) + g(x)) / 2
+        }}
+        rill main() Sample {{
+            let a = sine(3Hz) |> twice -> (s) {{ sine(440Hz + s * 50Hz) }}
+            let b = sine(5Hz) |> twice -> (s) {{ sine(660Hz + s * 50Hz) }}
+            return a + b
+        }}"
+    );
+    let direct = format!(
+        "{SINE}
+        rill main() Sample {{
+            let a = sine(440Hz + sine(3Hz) * 50Hz)
+            let b = sine(660Hz + sine(5Hz) * 50Hz)
+            return a + b
+        }}"
+    );
+    assert_eq!(render(&closures, 256), render(&direct, 256));
+}
+
+#[test]
 fn ratio_tunings_put_a4_on_the_reference() {
     let src = "
         rill main() [Sample; 4] {

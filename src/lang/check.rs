@@ -1891,7 +1891,12 @@ impl Checker<'_> {
                 init,
                 span,
             } => {
-                if self.place != Place::Rill {
+                if self.place == Place::Rill && self.lambda_floor.is_some() {
+                    let e = self
+                        .error(*span, "an anonymous rill cannot keep `state`")
+                        .with_help("the rills it calls keep theirs; for state of its own, make it a named rill");
+                    self.report(e);
+                } else if self.place != Place::Rill {
                     let mut e = self.error(*span, "`state` is only allowed in rills");
                     if self.place == Place::Fn {
                         e = e.with_help(
@@ -1974,9 +1979,14 @@ impl Checker<'_> {
                 );
                 match self.lookup(&name.name).cloned() {
                     Some(_) if captured => {
+                        let word = if self.place == Place::Rill {
+                            "rill"
+                        } else {
+                            "fn"
+                        };
                         let e = self
-                            .error(name.span, format!("an anonymous fn cannot change `{}`", name.name))
-                            .with_help("fns are pure, including anonymous ones: they can read what they capture, but not change it");
+                            .error(name.span, format!("an anonymous {word} cannot change `{}`", name.name))
+                            .with_help("anonymous fns and rills can read what they capture, but not change it");
                         self.report(e);
                     }
                     Some(var)
@@ -2048,6 +2058,13 @@ impl Checker<'_> {
             } => {
                 if self.place != Place::Rill {
                     let e = self.error(s.span(), "event handlers are only allowed in rills");
+                    self.report(e);
+                    return (Type::Unit, false);
+                }
+                if self.lambda_floor.is_some() {
+                    let e = self
+                        .error(s.span(), "an anonymous rill cannot have event handlers")
+                        .with_help("handle the event in a named rill and pass what it sets in");
                     self.report(e);
                     return (Type::Unit, false);
                 }
@@ -2429,7 +2446,12 @@ impl Checker<'_> {
                     }
                 }
             }
-            ExprKind::Fn { params, ret, body } => self.lambda(e, params, ret.as_ref(), body, None),
+            ExprKind::Fn {
+                kind,
+                params,
+                ret,
+                body,
+            } => self.lambda(e, *kind, params, ret.as_ref(), body, None),
             ExprKind::Repeat(x, n) => {
                 let t = self.expr(x);
                 let generics = self.generics();
@@ -2819,6 +2841,28 @@ impl Checker<'_> {
         let mut seen_named = false;
         for (ai, arg) in args.iter().enumerate() {
             let pi = match &arg.name {
+                // A trailing closure goes to the last parameter, so the
+                // ones before it with defaults can be left out.
+                None if arg.trailing => match sig.params.last() {
+                    Some(p) if p.ty.is_callable() => sig.params.len() - 1,
+                    last => {
+                        let msg = match last {
+                            Some(p) => format!(
+                                "the closure after `->` goes to `{name}`'s last parameter, but `{}` is a `{}`, not a fn or rill",
+                                p.name, p.ty
+                            ),
+                            None => format!(
+                                "`{name}` takes no arguments, so it has nowhere to put the closure after `->`"
+                            ),
+                        };
+                        let d = self
+                            .error(arg.value.span, msg)
+                            .with_help(format!("`{sig}`"));
+                        self.report(d);
+                        ok = false;
+                        continue;
+                    }
+                },
                 None => {
                     if seen_named {
                         let d = self.error(
@@ -3932,9 +3976,15 @@ impl Checker<'_> {
     fn expr_expect(&mut self, e: &Expr, expected: Option<&Type>) -> Type {
         let expected = expected.filter(|t| t.is_callable());
         let t = match (&e.kind, expected) {
-            (ExprKind::Fn { params, ret, body }, _) => {
-                self.lambda(e, params, ret.as_ref(), body, expected)
-            }
+            (
+                ExprKind::Fn {
+                    kind,
+                    params,
+                    ret,
+                    body,
+                },
+                _,
+            ) => self.lambda(e, *kind, params, ret.as_ref(), body, expected),
             (ExprKind::Name(name), Some(exp))
                 if self.lookup(name).is_none()
                     && (self.def_named(name).is_some() || !prelude::lookup(name).is_empty()) =>
@@ -4030,19 +4080,32 @@ impl Checker<'_> {
         }
     }
 
-    /// An anonymous fn. Parameter types come from annotations or, failing
-    /// that, from `expected`; the return type from an annotation, `expected`
-    /// or the body.
+    /// An anonymous fn or rill. Parameter types come from annotations or,
+    /// failing that, from `expected`; the return type from an annotation,
+    /// `expected` or the body. A trailing closure is a rill when `expected`
+    /// is a rill type, else a fn.
     fn lambda(
         &mut self,
         e: &Expr,
+        kind: LambdaKind,
         params: &[FnParam],
         ret: Option<&TypeExpr>,
         body: &Block,
         expected: Option<&Type>,
     ) -> Type {
+        let rill = match kind {
+            LambdaKind::Fn => false,
+            LambdaKind::Rill => true,
+            // With nowhere to go (an error already said so), take whatever
+            // it is made in, so its body is checked without further noise.
+            LambdaKind::Trailing => match expected {
+                Some(t) => matches!(t, Type::Rill(..)),
+                None => self.place == Place::Rill,
+            },
+        };
+        let word = if rill { "rill" } else { "fn" };
         let (eps, eret) = match expected {
-            Some(Type::Fn(ps, r)) => (Some(ps.clone()), Some((**r).clone())),
+            Some(Type::Fn(ps, r) | Type::Rill(ps, r)) => (Some(ps.clone()), Some((**r).clone())),
             _ => (None, None),
         };
         if let Some(eps) = &eps
@@ -4051,11 +4114,17 @@ impl Checker<'_> {
             let d = self.error(
                 e.span,
                 format!(
-                    "this fn takes {} parameter(s), but `{}` is expected here",
+                    "this {word} takes {} parameter(s), but `{}` is expected here",
                     params.len(),
                     expected.unwrap()
                 ),
             );
+            self.report(d);
+        }
+        if rill && self.place == Place::Fn {
+            let d = self
+                .error(e.span, "an anonymous rill can only be made inside a rill")
+                .with_help("fns are pure, so they cannot call one; make the enclosing fn a rill");
             self.report(d);
         }
 
@@ -4066,6 +4135,8 @@ impl Checker<'_> {
             let ty = match (&p.ty, eps.as_ref().and_then(|ps| ps.get(i))) {
                 (Some(te), _) => self.resolve_type(te, &generics),
                 (None, Some(t)) => t.clone(),
+                // Only when the call already said it has nowhere to go.
+                (None, None) if kind == LambdaKind::Trailing => Type::Error,
                 (None, None) => {
                     let d = self
                         .error(
@@ -4097,8 +4168,10 @@ impl Checker<'_> {
         }
         let declared = ret.map(|te| self.resolve_type(te, &generics)).or(eret);
 
-        // The body is a fn body: pure, with its own return type.
-        let saved_place = std::mem::replace(&mut self.place, Place::Fn);
+        // A fn body is pure; a rill body can call rills. Either has its
+        // own return type.
+        let place = if rill { Place::Rill } else { Place::Fn };
+        let saved_place = std::mem::replace(&mut self.place, place);
         let saved_ret = std::mem::replace(&mut self.ret, declared.clone().unwrap_or(Type::Error));
         let saved_event = std::mem::replace(&mut self.in_event, false);
         let saved_floor = self.lambda_floor.replace(self.scopes.len());
@@ -4119,7 +4192,7 @@ impl Checker<'_> {
                     let at = body.stmts.last().map_or(body.span, Stmt::span);
                     let d = self.error(
                         at,
-                        format!("this fn should return `{r}`, but its body produces `{t}`"),
+                        format!("this {word} should return `{r}`, but its body produces `{t}`"),
                     );
                     self.report(d);
                 }
@@ -4127,14 +4200,19 @@ impl Checker<'_> {
             }
             None if diverges => {
                 let d = self
-                    .error(e.span, "cannot tell what this fn returns")
-                    .with_help("annotate it, as in `fn(p: Pitch) Freq { ... }`");
+                    .error(e.span, format!("cannot tell what this {word} returns"))
+                    .with_help(format!(
+                        "annotate it, as in `{word}(p: Pitch) Freq {{ ... }}`"
+                    ));
                 self.report(d);
                 Type::Error
             }
             None => t.settle(),
         };
-        Type::Fn(param_types, Box::new(ret))
+        match rill {
+            true => Type::Rill(param_types, Box::new(ret)),
+            false => Type::Fn(param_types, Box::new(ret)),
+        }
     }
 
     /// `x as to`. Plain numbers convert between `Sample`, `Float` and

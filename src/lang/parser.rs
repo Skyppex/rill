@@ -498,7 +498,10 @@ impl Parser<'_> {
         // `Audio<2>`: the channels of an audio file.
         if name.name == "Audio" && self.eat(TokenKind::Lt).is_some() {
             let size = self.size()?;
-            self.expect(TokenKind::Gt, "to close the channel count, as in `Audio<2>`")?;
+            self.expect(
+                TokenKind::Gt,
+                "to close the channel count, as in `Audio<2>`",
+            )?;
             return Ok(TypeExpr::Audio {
                 size,
                 span: self.span_from(name.span),
@@ -1047,10 +1050,12 @@ impl Parser<'_> {
                 name: None,
                 each: None,
                 value: lhs,
+                trailing: false,
             }];
             if self.at(TokenKind::LParen) && !self.peek().newline_before {
                 args.extend(self.args()?);
             }
+            self.trailing(&mut args)?;
             let span = args[0].value.span.to(Span {
                 start: callee.span.start,
                 end: self.prev_end(),
@@ -1192,7 +1197,12 @@ impl Parser<'_> {
                 None
             };
             let value = self.expr()?;
-            args.push(Arg { name, each, value });
+            args.push(Arg {
+                name,
+                each,
+                value,
+                trailing: false,
+            });
             if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
@@ -1305,8 +1315,10 @@ impl Parser<'_> {
                 } else {
                     Vec::new()
                 };
-                if self.at(TokenKind::LParen) && !self.peek().newline_before {
-                    let args = self.args()?;
+                let parens = self.at(TokenKind::LParen) && !self.peek().newline_before;
+                if parens || self.at_trailing() {
+                    let mut args = if parens { self.args()? } else { Vec::new() };
+                    self.trailing(&mut args)?;
                     let span = self.span_from(name.span);
                     Ok(self.expr_node(
                         ExprKind::Call {
@@ -1365,7 +1377,7 @@ impl Parser<'_> {
                 Ok(self.expr_node(ExprKind::Frame(elems), span))
             }
             TokenKind::If => self.if_expr(),
-            TokenKind::Fn => self.lambda(),
+            TokenKind::Fn | TokenKind::Rill => self.lambda(),
             TokenKind::LBrace => {
                 let block = self.block()?;
                 let span = block.span;
@@ -1451,21 +1463,47 @@ impl Parser<'_> {
         ))
     }
 
-    /// `fn(p) { ... }`: a fn without a name.
+    /// `fn(p) { ... }` or `rill(x) { ... }`: a fn or rill without a name.
     fn lambda(&mut self) -> PResult<Expr> {
-        let start = self.bump().span;
+        let t = self.bump();
+        let (kind, word) = match t.kind {
+            TokenKind::Rill => (LambdaKind::Rill, "rill"),
+            _ => (LambdaKind::Fn, "fn"),
+        };
         if self.at(TokenKind::Ident) {
             let name = self.ident("")?;
             return Err(Diagnostic::error(
                 name.span,
-                "a fn with a name can only be defined at the top level",
+                format!("a {word} with a name can only be defined at the top level"),
             )
             .with_help(format!(
-                "leave the name out for an anonymous fn, as in `let {} = fn(x) {{ ... }}`",
+                "leave the name out for an anonymous {word}, as in `let {} = {word}(x) {{ ... }}`",
                 name.name
             )));
         }
-        self.expect(TokenKind::LParen, "after `fn`")?;
+        self.expect(TokenKind::LParen, &format!("after `{word}`"))?;
+        let params = self.lambda_params()?;
+        self.no_arrow(&format!("{word}(p: Pitch) Freq {{ ... }}"))?;
+        let ret = match self.at(TokenKind::LBrace) {
+            true => None,
+            false => Some(self.ty()?),
+        };
+        let body = self.block()?;
+        let span = self.span_from(t.span);
+        Ok(self.expr_node(
+            ExprKind::Fn {
+                kind,
+                params,
+                ret,
+                body,
+            },
+            span,
+        ))
+    }
+
+    /// The parameters of an anonymous fn or rill, after its `(`, through
+    /// the `)`.
+    fn lambda_params(&mut self) -> PResult<Vec<FnParam>> {
         self.nest += 1;
         let mut params = Vec::new();
         while !self.at(TokenKind::RParen) {
@@ -1481,14 +1519,48 @@ impl Parser<'_> {
         }
         self.expect(TokenKind::RParen, "to close the parameter list")?;
         self.nest -= 1;
-        self.no_arrow("fn(p: Pitch) Freq { ... }")?;
-        let ret = match self.at(TokenKind::LBrace) {
-            true => None,
-            false => Some(self.ty()?),
+        Ok(params)
+    }
+
+    /// At the `->` of a trailing closure, on the same line as its call.
+    fn at_trailing(&self) -> bool {
+        self.at(TokenKind::Arrow) && !self.peek().newline_before
+    }
+
+    /// `-> (x) { ... }` or `-> { ... }` after a call: a closure for the
+    /// callee's last parameter, added to `args`.
+    fn trailing(&mut self, args: &mut Vec<Arg>) -> PResult<()> {
+        if !self.at_trailing() {
+            return Ok(());
+        }
+        let start = self.bump().span;
+        let params = match self.eat(TokenKind::LParen) {
+            Some(_) => self.lambda_params()?,
+            None => Vec::new(),
         };
+        if !self.at(TokenKind::LBrace) {
+            return Err(self
+                .unexpected("`{` to start the closure's body")
+                .with_help("a trailing closure is `-> (x) { ... }`"));
+        }
         let body = self.block()?;
         let span = self.span_from(start);
-        Ok(self.expr_node(ExprKind::Fn { params, ret, body }, span))
+        let value = self.expr_node(
+            ExprKind::Fn {
+                kind: LambdaKind::Trailing,
+                params,
+                ret: None,
+                body,
+            },
+            span,
+        );
+        args.push(Arg {
+            name: None,
+            each: None,
+            value,
+            trailing: true,
+        });
+        Ok(())
     }
 
     fn if_expr(&mut self) -> PResult<Expr> {

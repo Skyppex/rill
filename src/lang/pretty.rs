@@ -421,6 +421,9 @@ impl Printer<'_> {
                         if a.each.is_some() {
                             prefixed = prefixed.kw("each").plain(" ");
                         }
+                        if a.trailing {
+                            prefixed = prefixed.op("->").plain(" ");
+                        }
                         prefixed.0.append(&mut node.label.0);
                         node.label = prefixed;
                         node
@@ -467,9 +470,10 @@ impl Printer<'_> {
             ExprKind::Fn { params, body, .. } => {
                 // Parameter types are shown as checked, including ones the
                 // source leaves out.
-                let param_types = match &self.checked.types[e.id as usize] {
-                    super::types::Type::Fn(ps, _) => ps.clone(),
-                    _ => Vec::new(),
+                let (word, param_types) = match &self.checked.types[e.id as usize] {
+                    super::types::Type::Fn(ps, _) => ("fn", ps.clone()),
+                    super::types::Type::Rill(ps, _) => ("rill", ps.clone()),
+                    _ => ("fn", Vec::new()),
                 };
                 let mut children: Vec<Node> = params
                     .iter()
@@ -488,7 +492,7 @@ impl Printer<'_> {
                     })
                     .collect();
                 children.push(self.block(prop("body"), body));
-                Node::new(typed(kw("fn")), children)
+                Node::new(typed(kw(word)), children)
             }
             ExprKind::Repeat(x, n) => Node::new(
                 typed(prop("repeat").plain(" ").value(self.text(n.span()))),

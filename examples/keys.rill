@@ -1,0 +1,69 @@
+// Play it from the computer's keys: `rill play examples/keys.rill`, then
+// type. The keys are laid out as FL Studio's typing keyboard: `z` to `/`
+// play from C4, `q` to `]` from C5, and Enter stops.
+//
+// `rill play` sends a key going down as a `note_on` from sender 0, and a key
+// coming up as a `note_off`. In a terminal that never says when a key comes
+// up, a note ends once its key stops repeating.
+
+import @gen/osc
+import @effects/env
+import @effects/filter
+import @effects/delay
+import @mix/stereo
+
+event keys_on note_on(sender: 0)
+event keys_off note_off(sender: 0)
+
+rill voice() [Sample; 2] {
+    state pitch: Pitch = C4
+    state gate: Float = 0
+    state level: Float = 0
+
+    // Each key down takes a voice of its own, so chords ring together.
+    on keys_on(note) claim {
+        pitch = note.pitch
+        level = note.velocity
+        gate = 1
+    }
+
+    on keys_off release {
+        gate = 0
+    }
+
+    let freq = pitch |> equal
+    let osc = saw(freq) + saw(freq * 1.004, offset: 0.4)
+
+    // The filter opens on every key and settles back while it is held.
+    let sweep = ahdsr(
+        gate,
+        attack: 5ms,
+        decay: 400ms,
+        sustain: 0.3,
+        release: 300ms,
+    )
+
+    let shaped = lowpass(osc, 400Hz + sweep * 4kHz * level, resonance: 0.3)
+
+    let amp = ahdsr(
+        gate,
+        attack: 5ms,
+        decay: 200ms,
+        sustain: 0.7,
+        release: 300ms,
+    )
+
+    // Lower notes a little to the left, higher ones to the right.
+    return pan(shaped * amp * level * 0.3, (pitch - C5) / 12st * 0.4)
+}
+
+rill main(volume: Gain = -9dB) [Sample; 2] {
+    let synth = sum([voice(); 8])
+
+    let space = [
+        comb(synth[0], 283ms, feedback: 0.35, tone: 2kHz),
+        comb(synth[1], 377ms, feedback: 0.35, tone: 2kHz),
+    ]
+
+    return synth + space * 0.25 + volume
+}

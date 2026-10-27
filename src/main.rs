@@ -441,7 +441,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 events: events.iter().map(Into::into).collect(),
             };
             let mut live = None;
-            let playback = rill::device::play(
+            let mut playback = rill::device::play(
                 |config| match &source.source {
                     Some(path) => {
                         let (l, player) = start_live(&source, path, config)?;
@@ -467,10 +467,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 playback.config.out_channels,
                 playback.format
             );
-            if seconds.is_none() {
-                println!("press Enter to stop");
-            }
-            control(live.as_mut(), seconds, !no_watch)?;
+            control(live.as_mut(), seconds, !no_watch, playback.events())?;
             drop(playback);
         }
         Command::Core { module: None } => {
@@ -1033,14 +1030,15 @@ fn start_live(
     }
 }
 
-/// While playing: reload when the program's files change (if `watch`),
-/// grow ceilings when values outgrow them, and stop after `seconds` or when
-/// Enter is pressed.
+/// While playing: play notes from the keys when stdin is a terminal, reload
+/// when the program's files change (if `watch`), grow ceilings when values
+/// outgrow them, and stop after `seconds` or when Enter is pressed.
 #[cfg(feature = "device")]
 fn control(
     mut live: Option<&mut rill::live::Live>,
     seconds: Option<f32>,
     watch: bool,
+    events: Option<rill::inbox::Sender>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -1057,7 +1055,14 @@ fn control(
     }
     let (tx, rx) = mpsc::channel();
     let deadline = seconds.map(|s| Instant::now() + Duration::from_secs_f32(s));
-    if deadline.is_none() {
+    let keys = play_keys(events, {
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Message::Stop);
+        }
+    });
+    if keys.is_none() && deadline.is_none() {
+        println!("press Enter to stop");
         let tx = tx.clone();
         std::thread::spawn(move || {
             let _ = std::io::stdin().read_line(&mut String::new());
@@ -1136,6 +1141,40 @@ fn control(
             }
         }
     }
+}
+
+/// When stdin is a terminal, play notes from its keys into `events`, laid
+/// out as FL Studio's typing keyboard, until Enter, which calls `stop`.
+#[cfg(all(feature = "device", unix))]
+fn play_keys(
+    events: Option<rill::inbox::Sender>,
+    stop: impl FnOnce() + Send + 'static,
+) -> Option<rill::keyboard::Session> {
+    use std::io::IsTerminal;
+    let events = events.filter(|_| std::io::stdin().is_terminal())?;
+    match rill::keyboard::Session::start(events, stop) {
+        Ok(keys) => {
+            println!("play notes on the keys: z to / from C4, q to ] from C5; Enter stops");
+            if !keys.releases() {
+                println!(
+                    "(this terminal does not say when keys come up; a note ends when its key stops repeating)"
+                );
+            }
+            Some(keys)
+        }
+        Err(err) => {
+            eprintln!("rill: warning: cannot read keys from the terminal: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(all(feature = "device", not(unix)))]
+fn play_keys(
+    _events: Option<rill::inbox::Sender>,
+    _stop: impl FnOnce() + Send + 'static,
+) -> Option<()> {
+    None
 }
 
 /// The ceilings raised so far, briefly.

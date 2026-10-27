@@ -15,6 +15,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
 use crate::engine::{Config, Engine};
 use crate::event::{Dispatch, parse_dispatch};
+use crate::inbox;
 use crate::lang::value::Value;
 use crate::live::Player;
 
@@ -99,6 +100,19 @@ pub struct Playback {
     pub format: SampleFormat,
     /// Frames per callback requested from the device, if any.
     pub buffer_frames: Option<u32>,
+    events: Option<inbox::Sender>,
+}
+
+/// Events the audio thread can have waiting at once.
+const INBOX: usize = 256;
+
+impl Playback {
+    /// Where to send events while playing; each reaches the program at the
+    /// start of the next callback. There is one sender, handed over the
+    /// first time this is called.
+    pub fn events(&mut self) -> Option<inbox::Sender> {
+        self.events.take()
+    }
 }
 
 fn host(name: Option<&str>) -> anyhow::Result<cpal::Host> {
@@ -160,6 +174,7 @@ pub fn play(
     let player = make_player(&config)?;
     let scheduled_params = schedule_param_events(player.engine(), &config, &options.param_events)?;
     let scheduled_rill = schedule_rill_events(player.engine(), &config, &options.events)?;
+    let (events, inbox) = inbox::channel(INBOX);
 
     let stream = match format {
         SampleFormat::F32 => build::<f32>(
@@ -168,6 +183,7 @@ pub fn play(
             player,
             scheduled_params,
             scheduled_rill,
+            inbox,
         ),
         SampleFormat::F64 => build::<f64>(
             &device,
@@ -175,6 +191,7 @@ pub fn play(
             player,
             scheduled_params,
             scheduled_rill,
+            inbox,
         ),
         SampleFormat::I8 => build::<i8>(
             &device,
@@ -182,6 +199,7 @@ pub fn play(
             player,
             scheduled_params,
             scheduled_rill,
+            inbox,
         ),
         SampleFormat::I16 => build::<i16>(
             &device,
@@ -189,6 +207,7 @@ pub fn play(
             player,
             scheduled_params,
             scheduled_rill,
+            inbox,
         ),
         SampleFormat::I24 => build::<cpal::I24>(
             &device,
@@ -196,6 +215,7 @@ pub fn play(
             player,
             scheduled_params,
             scheduled_rill,
+            inbox,
         ),
         SampleFormat::I32 => build::<i32>(
             &device,
@@ -203,6 +223,7 @@ pub fn play(
             player,
             scheduled_params,
             scheduled_rill,
+            inbox,
         ),
         SampleFormat::U8 => build::<u8>(
             &device,
@@ -210,6 +231,7 @@ pub fn play(
             player,
             scheduled_params,
             scheduled_rill,
+            inbox,
         ),
         SampleFormat::U16 => build::<u16>(
             &device,
@@ -217,6 +239,7 @@ pub fn play(
             player,
             scheduled_params,
             scheduled_rill,
+            inbox,
         ),
         SampleFormat::U32 => build::<u32>(
             &device,
@@ -224,6 +247,7 @@ pub fn play(
             player,
             scheduled_params,
             scheduled_rill,
+            inbox,
         ),
         other => bail!("unsupported device sample format {other}"),
     }?;
@@ -235,6 +259,7 @@ pub fn play(
         config,
         format,
         buffer_frames,
+        events: Some(events),
     })
 }
 
@@ -244,6 +269,7 @@ fn build<T>(
     mut engine: Player,
     scheduled: Vec<ScheduledParamEventAtFrame>,
     rill_events: Vec<ScheduledRillEventAtFrame>,
+    mut inbox: inbox::Receiver,
 ) -> anyhow::Result<cpal::Stream>
 where
     T: SizedSample + FromSample<f32>,
@@ -254,6 +280,9 @@ where
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            while let Some(dispatch) = inbox.recv() {
+                engine.dispatch(&dispatch);
+            }
             if scheduled.is_empty() && rill_events.is_empty() {
                 engine.render_interleaved_with(data, T::from_sample);
                 return;

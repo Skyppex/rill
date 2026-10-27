@@ -267,6 +267,8 @@ Rules:
 - A declaration nothing handles is a warning.
 - `on start { ... }` is built in: it runs once, before the first sample, in every rill instance that has it.
 
+**Playing from the computer's keys.** `rill play` in a terminal turns its keys into notes, laid out as FL Studio's typing keyboard: `z` to `/` are the white and black keys from C4 (`z s x d c v g b h n j m`, then `, l . ; /`), and `q` to `]` the same from C5 (`q 2 w 3 e r 5 t 6 y 7 u`, then `i 9 o 0 p [ = ]`). Each key down is a `note_on` (velocity 100/127) from sender 0 on channel 0, and each key up a `note_off` (release 64/127); Enter stops. Most terminals never say when a key comes up, so a note ends once its key stops repeating (with waits learned from the keyboard's repeat delay and rate), and keys that went down within 100ms of each other are a chord, held while the last of them repeats, since only the last key held repeats. A terminal that speaks the kitty keyboard protocol (kitty, Ghostty, foot, and WezTerm with `enable_kitty_keyboard`) does say, and `rill play` asks it to. Events reach the audio thread through a fixed queue, read at the start of every callback, so nothing there allocates or waits.
+
 ## Sequences
 
 A sequence is a pattern of notes that plays only when the program says so, at its own tempo and meter. Several can play at once. It makes no sound itself: while it plays, it makes events named after it, which handlers react to.
@@ -476,7 +478,11 @@ Rules:
 A closure written after a call's `->` goes to the callee's last parameter, which must be a fn or rill type. It is a rill or a fn as that parameter's type says, and takes its parameter types from it:
 
 ```rill
-rill fm(carrier: Sample, width: Float = 1, generator: rill(Sample) Sample) Sample {
+rill fm(
+    carrier: Sample,
+    width: Float = 1,
+    generator: rill(Sample) Sample,
+) Sample {
     return generator(carrier * width)
 }
 
